@@ -39,19 +39,21 @@
 
 #include "gld_log.h"
 #include "gldirect5.h"
+#include "mesa_compat.h"
 
-#include "glheader.h"
-#include "context.h"
-#include "colormac.h"
-#include "depth.h"
-#include "extensions.h"
-#include "macros.h"
-#include "matrix.h"
-#include "mtypes.h"
-#include "texformat.h"
-#include "texstore.h"
-#include "teximage.h"
-#include "api_arrayelt.h"
+// TODO: Mesa includes removed - replaced by mesa_compat.h shim
+// #include "glheader.h"
+// #include "context.h"
+// #include "colormac.h"
+// #include "depth.h"
+// #include "extensions.h"
+// #include "macros.h"
+// #include "matrix.h"
+// #include "mtypes.h"
+// #include "texformat.h"
+// #include "texstore.h"
+// #include "teximage.h"
+// #include "api_arrayelt.h"
 
 extern BOOL gldSwapBuffers(HDC hDC);
 
@@ -957,7 +959,14 @@ void gld_ClipPlane_DX9(
     GLD_driver_dx9  *gld    = GLD_GET_DX9_DRIVER(gldCtx);
 	GLint			p		= plane - (GLint)GL_CLIP_PLANE0;
 
-	_GLD_DX9_DEV(SetClipPlane(gld->pDev, p, ctx->Transform._ClipUserPlane[p]));
+	{
+		float clipPlane[4];
+		clipPlane[0] = (float)ctx->Transform._ClipUserPlane[p][0];
+		clipPlane[1] = (float)ctx->Transform._ClipUserPlane[p][1];
+		clipPlane[2] = (float)ctx->Transform._ClipUserPlane[p][2];
+		clipPlane[3] = (float)ctx->Transform._ClipUserPlane[p][3];
+		_GLD_DX9_DEV(SetClipPlane(gld->pDev, p, clipPlane));
+	}
 }
  
 //---------------------------------------------------------------------------

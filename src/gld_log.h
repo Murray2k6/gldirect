@@ -53,17 +53,19 @@ typedef enum {
 
 // Denotes type of message sent to the logging functions
 typedef enum {
-	GLDLOG_INFO					= 0,			// Information only
-	GLDLOG_WARN					= 1,			// Warning only
-	GLDLOG_ERROR				= 2,			// Notify user of an error
-	GLDLOG_CRITICAL				= 3,			// Exceptionally severe error
-	GLDLOG_SYSTEM				= 4,			// System message. Not an error
+	GLDLOG_DEBUG				= 0,			// Debug-level detail
+	GLDLOG_INFO					= 1,			// Information only
+	GLDLOG_WARN					= 2,			// Warning only
+	GLDLOG_ERROR				= 3,			// Notify user of an error
+	GLDLOG_CRITICAL				= 4,			// Exceptionally severe error
+	GLDLOG_SYSTEM				= 5,			// System message. Not an error
 												// but must always be printed.
 	GLDLOG_SEVERITY_FORCE_DWORD	= 0x7fffffff,	// Make enum dword
 } GLDLOG_severityType;
 
 // The message that will be output to the log
 static const char *gldLogSeverityMessages[] = {
+	"DBG",	// Debug
 	"INF",	// Info
 	"WRN",	// Warn
 	"ERR",	// Error
@@ -84,6 +86,7 @@ void gldLogError(GLDLOG_severityType severity, LPSTR message, HRESULT hResult);
 void gldLogPrintf(GLDLOG_severityType severity, LPSTR message, ...);
 void gldLogWarnOption(BOOL bWarnOption);
 void gldLogPathOption(LPSTR szPath);
+void gldLogSetVerbosity(LPSTR szVerbosity);
 
 #ifdef  __cplusplus
 }

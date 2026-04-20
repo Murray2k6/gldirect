@@ -38,9 +38,8 @@
 #include "gld_context.h"
 
 #include "gld_driver.h"
+#include "mesa_compat.h"
 
-extern void _gld_mesa_warning(GLcontext *, char *);
-extern void _gld_mesa_fatal(GLcontext *, char *);
 void gldExitDriver(void);
 BOOL gldValidate();
 
@@ -160,7 +159,7 @@ LONG __stdcall GLD_EventWndProc(HWND hwnd,UINT msg,WPARAM wParam,LPARAM lParam);
 BOOL gldIsValidContext(
 	HGLRC a)
 {
-	return ((int)a > 0 && (int)a <= GLD_MAX_CONTEXTS);
+	return ((int)(INT_PTR)a > 0 && (int)(INT_PTR)a <= GLD_MAX_CONTEXTS);
 }
 
 // ***********************************************************************
@@ -170,7 +169,7 @@ GLD_ctx* gldGetContextAddress(
 	const HGLRC a)
 {
 	if (gldIsValidContext(a))
-		return &ctxlist[(int)a-1];
+		return &ctxlist[(int)(INT_PTR)a-1];
 	return NULL;
 }
 
@@ -311,7 +310,7 @@ void gldDeleteContextState()
 	for (i=0; i<GLD_MAX_CONTEXTS; i++) {
 		if (ctxlist[i].bAllocated == TRUE) {
 			gldLogPrintf(GLDLOG_WARN, "** Context %i not deleted - cleaning up.", (i+1));
-			gldDeleteContext((HGLRC)(i+1));
+			gldDeleteContext((HGLRC)(INT_PTR)(i+1));
 		}
 	}
 
@@ -355,21 +354,21 @@ __except(EXCEPTION_EXECUTE_HANDLER) {
 // ***********************************************************************
 
 // Application Window message handler interception
-static LONG __stdcall gldWndProc(
+static LRESULT __stdcall gldWndProc(
 	HWND hwnd,
 	UINT msg,
 	WPARAM wParam,
 	LPARAM lParam)
 {
 	GLD_ctx* 	lpCtx = NULL;
-	LONG 		lpfnWndProc = 0L;
+	LONG_PTR 	lpfnWndProc = 0;
 	int  		i;
 //	HGLRC 		hGLRC;
 	RECT 		rect;
 	PAINTSTRUCT	ps;
     BOOL        bQuit = FALSE;
     BOOL        bMain = FALSE;
-    LONG        rc;
+    LRESULT     rc;
 
     // Get the window's message handler *before* it is unhooked in WM_DESTROY
 
@@ -429,7 +428,7 @@ static LONG __stdcall gldWndProc(
         bQuit = TRUE;
 		if (lpCtx && lpCtx->bAllocated) {
 			gldLogPrintf(GLDLOG_WARN, "WM_DESTROY detected for HWND=%X, HDC=%X, HGLRC=%d", hwnd, lpCtx->hDC, i+1);
-			gldDeleteContext((HGLRC)(i+1));
+			gldDeleteContext((HGLRC)(INT_PTR)(i+1));
 		}
 		break;
 #if 0
@@ -549,13 +548,6 @@ BOOL gldCreateContextBuffers(
 
 	const PIXELFORMATDESCRIPTOR	*lpPFD = &lpCtx->lpPF->pfd;
 
-	// Vars for Mesa visual
-	DWORD				dwDepthBits		= 0;
-	DWORD				dwStencilBits	= 0;
-	DWORD				dwAlphaBits		= 0;
-	DWORD				bAlphaSW		= GL_FALSE;
-	DWORD				bDouble			= GL_FALSE;
-
 	BOOL				bFullScrnWin	= FALSE;	// fullscreen-size window ?
 	DWORD				dwMemoryType 	= (bFallback) ? DDSCAPS_SYSTEMMEMORY : glb.dwMemoryType;
 	BOOL				bBogusWindow	= FALSE;	// non-drawable window ?
@@ -662,87 +654,76 @@ BOOL gldCreateContextBuffers(
 							lpCtx->bFullscreen ? "fullscreen" : "windowed");
 
 	//
-	//	Now create the Mesa context
+	//	Initialise the GLD_glContext (replaces Mesa context/visual/framebuffer)
 	//
+	{
+		GLD_glContext *gl46 = &lpCtx->gl46Ctx;
 
-	// Create the Mesa visual
-	if (lpPFD->cDepthBits)
-		dwDepthBits = 16;
-	if (lpPFD->cStencilBits)
-		dwStencilBits = 8;
-	if (lpPFD->cAlphaBits) {
-		dwAlphaBits = 8;
-		bAlphaSW = GL_TRUE;
-	}
-	if (lpPFD->dwFlags & PFD_DOUBLEBUFFER)
-		bDouble = GL_TRUE;
-//	lpCtx->EmulateSingle =
-//		(lpPFD->dwFlags & PFD_DOUBLEBUFFER) ? FALSE : TRUE;
+		// Zero the GL context struct
+		ZeroMemory(gl46, sizeof(GLD_glContext));
 
-	lpCtx->glVis = _mesa_create_visual(
-		GL_TRUE,				// RGB mode
-		bDouble,				// double buffer
-		GL_FALSE,				// stereo
-		lpPFD->cRedBits,
-		lpPFD->cGreenBits,
-		lpPFD->cBlueBits,
-		dwAlphaBits,
-		0,						// index bits
-		dwDepthBits,
-		dwStencilBits,
-		lpPFD->cAccumRedBits,	// accum bits
-		lpPFD->cAccumGreenBits,	// accum bits
-		lpPFD->cAccumBlueBits,	// accum bits
-		lpPFD->cAccumAlphaBits,	// accum alpha bits
-		1						// num samples
-		);
+		// Cache window/DC handles in the GL context
+		gl46->hDC  = lpCtx->hDC;
+		gl46->hWnd = lpCtx->hWnd;
+		gl46->hRC  = NULL; // Will be set by Context_Manager (task 3.2)
 
-	if (lpCtx->glVis == NULL) {
-		gldLogMessage(GLDLOG_CRITICAL_OR_WARN, "gl_create_visual failed\n");
-		goto return_with_error;
-	}
+		// Initialise viewport to match window dimensions
+		gl46->viewportX      = 0;
+		gl46->viewportY      = 0;
+		gl46->viewportWidth  = (GLsizei)lpCtx->dwWidth;
+		gl46->viewportHeight = (GLsizei)lpCtx->dwHeight;
+		gl46->depthRangeNear = 0.0f;
+		gl46->depthRangeFar  = 1.0f;
 
-	lpCtx->glCtx = _mesa_create_context(lpCtx->glVis, NULL, (void *)lpCtx, GL_TRUE);
+		// Default clear values
+		gl46->clearColor[0] = 0.0f;
+		gl46->clearColor[1] = 0.0f;
+		gl46->clearColor[2] = 0.0f;
+		gl46->clearColor[3] = 0.0f;
+		gl46->clearDepth    = 1.0f;
+		gl46->clearStencil  = 0;
 
-	if (lpCtx->glCtx == NULL) {
-		gldLogMessage(GLDLOG_CRITICAL_OR_WARN, "gl_create_context failed\n");
-		goto return_with_error;
-	}
+		// No active GL objects yet
+		gl46->activeShaderProgram = 0;
+		gl46->activeVAO           = 0;
+		gl46->activeFBO           = 0;
 
-	// Initialise Scissor rectangle.
-	// Mesa should do this, but does not!
-	// Mesa sets scissor:x,y,width,height all to zero,
-	// GL spec states that scissor rect should be same as newly created render buffer.
-	lpCtx->glCtx->Scissor.Width		= lpCtx->dwWidth;
-	lpCtx->glCtx->Scissor.Height	= lpCtx->dwHeight;
+		// Per-context caches will be allocated by their respective modules
+		gl46->bufferCache       = NULL;
+		gl46->textureCache      = NULL;
+		gl46->renderTargetCache = NULL;
+		gl46->shaderCache       = NULL;
+		gl46->fixedFuncCache    = NULL;
 
-
-	// Create the Mesa framebuffer
-	lpCtx->glBuffer = _mesa_create_framebuffer(
-		lpCtx->glVis,
-		lpCtx->glVis->depthBits > 0,
-		lpCtx->glVis->stencilBits > 0,
-		lpCtx->glVis->accumRedBits > 0,
-		GL_FALSE //swalpha
-		);
-
-	if (lpCtx->glBuffer == NULL) {
-		gldLogMessage(GLDLOG_CRITICAL_OR_WARN, "gl_create_framebuffer failed\n");
-		goto return_with_error;
+		// Clip control and version will be set during context creation (task 3.2)
+		gl46->bClipControlAvailable = FALSE;
+		gl46->glVersionMajor = 0;
+		gl46->glVersionMinor = 0;
 	}
 
-	// Disable Mesa TnL codepath
-/*
-	// Init Mesa internals
-	_swrast_CreateContext( lpCtx->glCtx );
-	_ac_CreateContext( lpCtx->glCtx );
-	_tnl_CreateContext( lpCtx->glCtx );
-	_swsetup_CreateContext( lpCtx->glCtx );
-*/
+	//
+	// Allocate the legacy Mesa GLcontext for the DX9 backend
+	//
+	{
+		GLcontext *mesaCtx = (GLcontext *)calloc(1, sizeof(GLcontext));
+		lpCtx->glCtx = mesaCtx;
+		if (mesaCtx) {
+			mesaCtx->Driver.CurrentExecPrimitive = PRIM_OUTSIDE_BEGIN_END;
+			mesaCtx->Driver.CurrentSavePrimitive = PRIM_OUTSIDE_BEGIN_END;
+			mesaCtx->DriverCtx = lpCtx; // Back-pointer for GLD_GET_CONTEXT()
+		}
+		// Allocate a legacy GLframebuffer for the DX9 backend
+		lpCtx->glBuffer = (GLframebuffer *)calloc(1, sizeof(GLframebuffer));
+		if (lpCtx->glBuffer) {
+			lpCtx->glBuffer->Width = lpCtx->dwWidth;
+			lpCtx->glBuffer->Height = lpCtx->dwHeight;
+		}
+	}
+
+	// Stencil support based on pixel format
+	lpCtx->bStencil = (lpPFD->cStencilBits > 0) ? TRUE : FALSE;
+
 	_gldDriver.InitialiseMesa(lpCtx);
-	
-	lpCtx->glCtx->imports.warning	= _gld_mesa_warning;
-	lpCtx->glCtx->imports.fatal		= _gld_mesa_fatal;
 
 	// ** If we have made it to here then we can enable rendering **
 	lpCtx->bCanRender = TRUE;
@@ -762,14 +743,6 @@ return_with_error:
 	// This is critical for secondary devices.
 
 	lpCtx->bCanRender = FALSE;
-
-	// Destroy the Mesa context
-	if (lpCtx->glBuffer)
-		_mesa_destroy_framebuffer(lpCtx->glBuffer);
-	if (lpCtx->glCtx)
-		_mesa_destroy_context(lpCtx->glCtx);
-	if (lpCtx->glVis)
-		_mesa_destroy_visual(lpCtx->glVis);
 
 	// Destroy driver data
 	_gldDriver.DestroyDrawable(lpCtx);
@@ -800,7 +773,7 @@ HGLRC gldCreateContext(
 	DWORD				dwThreadId = GetCurrentThreadId();
     char                szMsg[256];
     HWND                hWnd;
-    LONG                lpfnWndProc;
+    LONG_PTR            lpfnWndProc;
 
 	// Validate license
 	if (!gldValidate())
@@ -820,7 +793,7 @@ HGLRC gldCreateContext(
 			if (/*glb.bFullscreen && */ctxlist[i].bFullscreen)
 				break;
 		} else {
-			hGLRC = (HGLRC)(i+1);
+			hGLRC = (HGLRC)(INT_PTR)(i+1);
 			break;
 		}
 	}
@@ -880,10 +853,10 @@ HGLRC gldCreateContext(
     hWnd = lpCtx->hWnd;
     if (hWnd) {
 		// Only hook individual window handler once if not hooked before.
-		lpfnWndProc = GetWindowLong(hWnd, GWL_WNDPROC);
-		if (lpfnWndProc != (LONG)gldWndProc) {
+		lpfnWndProc = GetWindowLongPtr(hWnd, GWLP_WNDPROC);
+		if (lpfnWndProc != (LONG_PTR)gldWndProc) {
 			lpCtx->lpfnWndProc = lpfnWndProc;
-			SetWindowLong(hWnd, GWL_WNDPROC, (LONG)gldWndProc);
+			SetWindowLongPtr(hWnd, GWLP_WNDPROC, (LONG_PTR)gldWndProc);
 			}
         // Find the parent window of the app too.
         if (glb.hWndActive == NULL) {
@@ -892,17 +865,17 @@ HGLRC gldCreateContext(
                 hWnd = GetParent(hWnd);
             }
             // Hook the parent window too.
-            lpfnWndProc = GetWindowLong(glb.hWndActive, GWL_WNDPROC);
+            lpfnWndProc = GetWindowLongPtr(glb.hWndActive, GWLP_WNDPROC);
             if (glb.hWndActive == lpCtx->hWnd)
                 glb.lpfnWndProc = lpCtx->lpfnWndProc;
-            else if (lpfnWndProc != (LONG)gldWndProc)
+            else if (lpfnWndProc != (LONG_PTR)gldWndProc)
                 glb.lpfnWndProc = lpfnWndProc;
             if (glb.lpfnWndProc)
-                SetWindowLong(glb.hWndActive, GWL_WNDPROC, (LONG)gldWndProc);
+                SetWindowLongPtr(glb.hWndActive, GWLP_WNDPROC, (LONG_PTR)gldWndProc);
         }
     }
 
-	gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContext succeeded for HGLRC=%d", (int)hGLRC);
+	gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContext succeeded for HGLRC=%d", (int)(INT_PTR)hGLRC);
 
 	return hGLRC;
 }
@@ -921,7 +894,7 @@ BOOL gldMakeCurrent(
 	BOOL bWindowChanged, bContextChanged;
 	DWORD dwThreadId = GetCurrentThreadId();
 
-	context = (int)b; // This is as a result of STRICT!
+	context = (int)(INT_PTR)b; // This is as a result of STRICT!
 
 	// Workaround for Unreal engine games.
 	if (!bContextReady && (context == 0) && (a == 0)) {
@@ -946,8 +919,7 @@ BOOL gldMakeCurrent(
 	// If the HGLRC is NULL then make no context current;
 	// Ditto if the HDC is NULL either. (DaveM)
 	if (context == 0 || a == 0) {
-		// Corresponding Mesa operation
-		_mesa_make_current(NULL, NULL);
+		// No context to make current — deactivate
 		gldSetCurrentContext(0);
 		return TRUE;
 	}
@@ -1008,33 +980,36 @@ BOOL gldMakeCurrent(
 	// Now we can update our globals
 	gldSetCurrentContext(b);
 
-	// Corresponding Mesa operation
-	_mesa_make_current(lpCtx->glCtx, lpCtx->glBuffer);
-	lpCtx->glCtx->Driver.UpdateState(lpCtx->glCtx, _NEW_ALL);
+	// Update the GL context's cached DC/window handles
+	lpCtx->gl46Ctx.hDC  = lpCtx->hDC;
+	lpCtx->gl46Ctx.hWnd = lpCtx->hWnd;
+
+	// TODO: wglMakeCurrent on the real OGL context will be done in task 3.2/3.3
+	// For now, just update viewport state if the window was resized
 	if (bNeedResize) {
-		// Resize buffers (Note Mesa GL needs to be setup beforehand);
-		// Resize Mesa internal buffer too via glViewport() command,
-		// which subsequently calls gldWglResizeBuffers() too.
-		lpCtx->glCtx->Driver.Viewport(lpCtx->glCtx, 0, 0, lpCtx->dwWidth, lpCtx->dwHeight);
+		lpCtx->gl46Ctx.viewportWidth  = (GLsizei)(lpCtx->rcScreenRect.right - lpCtx->rcScreenRect.left);
+		lpCtx->gl46Ctx.viewportHeight = (GLsizei)(lpCtx->rcScreenRect.bottom - lpCtx->rcScreenRect.top);
+		lpCtx->dwWidth  = lpCtx->rcScreenRect.right - lpCtx->rcScreenRect.left;
+		lpCtx->dwHeight = lpCtx->rcScreenRect.bottom - lpCtx->rcScreenRect.top;
 		lpCtx->bHasBeenCurrent = TRUE;
 	}
 
 	// Don't want to spit this out *every* frame...
 	//gldLogPrintf(GLDLOG_SYSTEM, "gldMakeCurrent: width = %d, height = %d", lpCtx->dwWidth, lpCtx->dwHeight);
 
-	// We have to clear D3D back buffer and render state if emulated front buffering
+	// We have to clear back buffer and render state if emulated front buffering
 	// for different window (but not context) like in Solid Edge.
 	if (glb.bDirectDrawPersistant && glb.bPersistantBuffers
 		&& (bWindowChanged /* || bContextChanged */) && lpCtx->EmulateSingle) {
-//		IDirect3DDevice8_EndScene(lpCtx->pDev);
-//		lpCtx->bSceneStarted = FALSE;
-		lpCtx->glCtx->Driver.Clear(lpCtx->glCtx, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT,
-			GL_TRUE, 0, 0, lpCtx->dwWidth, lpCtx->dwHeight);
+		// TODO: Issue glClear via the new GL46 path (task 3.2/3.3)
 	}
 
 	// The first time we call MakeCurrent we set the initial viewport size
 	if (lpCtx->bHasBeenCurrent == FALSE) {
-		lpCtx->glCtx->Driver.Viewport(lpCtx->glCtx, 0, 0, lpCtx->dwWidth, lpCtx->dwHeight);
+		lpCtx->gl46Ctx.viewportX      = 0;
+		lpCtx->gl46Ctx.viewportY      = 0;
+		lpCtx->gl46Ctx.viewportWidth  = (GLsizei)lpCtx->dwWidth;
+		lpCtx->gl46Ctx.viewportHeight = (GLsizei)lpCtx->dwHeight;
 		// Send a Paint message to the app by invalidating and updating the window
 		InvalidateRect(lpCtx->hWnd, NULL, TRUE);
 		UpdateWindow(lpCtx->hWnd);
@@ -1065,10 +1040,10 @@ BOOL gldDeleteContext(
 //		return FALSE;
 		return TRUE; // Workaround for Unreal engine games.
 
-	gldLogPrintf(GLDLOG_SYSTEM, "gldDeleteContext: Deleting context HGLRC=%d, ThreadId=%X", (int)a, dwThreadId);
+	gldLogPrintf(GLDLOG_SYSTEM, "gldDeleteContext: Deleting context HGLRC=%d, ThreadId=%X", (int)(INT_PTR)a, dwThreadId);
 
 	// Make sure the HGLRC is in range
-	if (((int) a> GLD_MAX_CONTEXTS) || ((int)a < 0)) {
+	if (((int)(INT_PTR)a> GLD_MAX_CONTEXTS) || ((int)(INT_PTR)a < 0)) {
 		gldLogMessage(GLDLOG_ERROR, "gldDeleteCurrent: HGLRC out of range\n");
 		return FALSE;
 	}
@@ -1076,14 +1051,14 @@ BOOL gldDeleteContext(
 	// Make sure context is valid
 	lpCtx = gldGetContextAddress(a);
 	if (!lpCtx->bAllocated) {
-		gldLogPrintf(GLDLOG_WARN, "Tried to delete unallocated context HGLRC=%d", (int)a);
+		gldLogPrintf(GLDLOG_WARN, "Tried to delete unallocated context HGLRC=%d", (int)(INT_PTR)a);
 //		return FALSE;
 		return TRUE; // HACK: Shuts up "WebLab Viewer Pro". KeithH
 	}
 
 	// Make sure context is de-activated
 	if (a == gldGetCurrentContext()) {
-		gldLogPrintf(GLDLOG_WARN, "gldDeleteContext: context HGLRC=%d still active", (int)a);
+		gldLogPrintf(GLDLOG_WARN, "gldDeleteContext: context HGLRC=%d still active", (int)(INT_PTR)a);
 		gldMakeCurrent(NULL, NULL);
 	}
 
@@ -1109,16 +1084,7 @@ BOOL gldDeleteContext(
 #define SAFE_RELEASE(p) WARN_MESSAGE(p); RELEASE(p);
 
 __try {
-    WARN_MESSAGE(gl_destroy_framebuffer);
-	if (lpCtx->glBuffer)
-		_mesa_destroy_framebuffer(lpCtx->glBuffer);
-    WARN_MESSAGE(gl_destroy_context);
-	if (lpCtx->glCtx)
-		_mesa_destroy_context(lpCtx->glCtx);
-    WARN_MESSAGE(gl_destroy_visual);
-	if (lpCtx->glVis)
-		_mesa_destroy_visual(lpCtx->glVis);
-
+    WARN_MESSAGE(DestroyDrawable);
 	_gldDriver.DestroyDrawable(lpCtx);
 }
 __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -1128,8 +1094,8 @@ __except(EXCEPTION_EXECUTE_HANDLER) {
 	// Restore the window message handler because this context may be used
 	// again by another window with a *different* message handler. (DaveM)
 	if (lpCtx->lpfnWndProc) {
-		SetWindowLong(lpCtx->hWnd, GWL_WNDPROC, (LONG)lpCtx->lpfnWndProc);
-		lpCtx->lpfnWndProc = (LONG)NULL;
+		SetWindowLongPtr(lpCtx->hWnd, GWLP_WNDPROC, lpCtx->lpfnWndProc);
+		lpCtx->lpfnWndProc = (LONG_PTR)NULL;
 		}
 
 	lpCtx->bAllocated = FALSE; // This context is now free for use
@@ -1194,8 +1160,8 @@ BOOL gldSwapBuffers(
 		EnterCriticalSection(&CriticalSection);
 #endif
 
-	// Notify Mesa of impending swap, so Mesa can flush internal buffers.
-	_mesa_notifySwapBuffers(lpCtx->glCtx);
+	// Flush GL commands before swap (replaces Mesa _mesa_notifySwapBuffers)
+	glFlush();
 	// Now perform driver buffer swap
 	_gldDriver.SwapBuffers(lpCtx, hDC, hWnd);
 

@@ -91,7 +91,7 @@ extern "C" {
 extern GLD_driver _gldDriver;
 
 BOOL gldInitDriverPointers(DWORD dwDriver);
-const GLubyte* _gldGetStringGeneric(GLcontext *ctx, GLenum name);
+const GLubyte* _gldGetStringGeneric(GLD_ctx *ctx, GLenum name);
 BOOL gldValidate();
 
 #ifdef  __cplusplus

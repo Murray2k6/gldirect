@@ -41,10 +41,12 @@
 
 #include "gld_driver.h"
 #include "gld_log.h"
-#include "glheader.h"
+// TODO: Mesa includes removed - will be replaced by GL46 modules in later tasks
+// #include "glheader.h"
 
-#include "common_x86_asm.h"		// For glGetString().
-#include "version.h"			// For MESA_VERSION_STRING
+// TODO: Mesa includes removed - CPU feature detection will be reimplemented in later tasks
+// #include "common_x86_asm.h"		// For glGetString().
+// #include "version.h"			// For MESA_VERSION_STRING
 
 //---------------------------------------------------------------------------
 
@@ -57,7 +59,8 @@ static char _gldRendererString[1024];
 static char *g_szGLDVendor		= "SciTech Software, Inc.";
 
 // Based on mesa\src\mesa\main\get.c::_mesa_GetString
-static char *g_szGLDVersion		= "1.1 Mesa " MESA_VERSION_STRING;
+// TODO: Version string updated for GL46 - will be finalized in later tasks
+static char *g_szGLDVersion		= "4.6 GLDirect";
 
 // extensions
 // Quake3 is slower with GL_EXT_compiled_vertex_array !
@@ -192,7 +195,7 @@ static BOOL	_GetDisplayMode_ERROR(
 //---------------------------------------------------------------------------
 
 const GLubyte* _gldGetStringGeneric(
-	GLcontext *ctx,
+	GLD_ctx *ctx,
 	GLenum name)
 {
 	if (!ctx)
@@ -204,11 +207,8 @@ const GLubyte* _gldGetStringGeneric(
 	case GL_VERSION:
 		return (const GLubyte *) g_szGLDVersion;
 	case GL_RENDERER:
-		sprintf(_gldRendererString, "GLDirect 5.0 %s%s%s%s (%s %s)",
-			_mesa_x86_cpu_features	? "x86"		: "",
-			cpu_has_mmx				? "/MMX"		: "",
-			cpu_has_3dnow			? "/3DNow!"		: "",
-			cpu_has_xmm				? "/SSE"		: "",
+		// TODO: CPU feature detection removed with Mesa - will be reimplemented in later tasks
+		sprintf(_gldRendererString, "GLDirect 5.0 GL46 (%s %s)",
 			__DATE__, __TIME__);
 		return (const GLubyte *) _gldRendererString;
 	case GL_EXTENSIONS:

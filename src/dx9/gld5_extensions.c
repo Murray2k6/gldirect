@@ -36,22 +36,26 @@
 *********************************************************************************/
 
 #include <windows.h>
-#define GL_GLEXT_PROTOTYPES
-#include <GL/gl.h>
-#include <GL/glext.h>
+// TODO: Mesa GL headers removed - replaced by GLAD
+// #define GL_GLEXT_PROTOTYPES
+// #include <GL/gl.h>
+// #include <GL/glext.h>
+#include <glad/gl.h>
 
-#include "glheader.h"
-#include "context.h"
-#include "colormac.h"
-#include "depth.h"
-#include "extensions.h"
-#include "macros.h"
-#include "matrix.h"
-#include "mtypes.h"
-#include "texformat.h"
-#include "texstore.h"
+// TODO: Mesa includes removed - replaced by mesa_compat.h shim
+// #include "glheader.h"
+// #include "context.h"
+// #include "colormac.h"
+// #include "depth.h"
+// #include "extensions.h"
+// #include "macros.h"
+// #include "matrix.h"
+// #include "mtypes.h"
+// #include "texformat.h"
+// #include "texstore.h"
 #include "gld_context.h"
-#include "extensions.h"
+#include "mesa_compat.h"
+// #include "extensions.h"
 
 // For some reason this is not defined in an above header...
 extern void _mesa_enable_imaging_extensions(GLcontext *ctx);
@@ -85,7 +89,7 @@ void APIENTRY gldSelectTextureSGIS(
 	GLenum target)
 {
 	GLenum ARB_target = GL_TEXTURE0_ARB + (target - GL_TEXTURE0_SGIS);
-	glActiveTextureARB(ARB_target);
+	glActiveTexture(ARB_target);
 }
 
 //---------------------------------------------------------------------------
@@ -96,7 +100,7 @@ void APIENTRY gldMTexCoord2fSGIS(
 	GLfloat t)
 {
 	GLenum ARB_target = GL_TEXTURE0_ARB + (target - GL_TEXTURE0_SGIS);
-	glMultiTexCoord2fARB(ARB_target, s, t);
+	glMultiTexCoord2f(ARB_target, s, t);
 }
 
 //---------------------------------------------------------------------------
@@ -106,7 +110,7 @@ void APIENTRY gldMTexCoord2fvSGIS(
 	const GLfloat *v)
 {
 	GLenum ARB_target = GL_TEXTURE0_ARB + (target - GL_TEXTURE0_SGIS);
-	glMultiTexCoord2fvARB(ARB_target, v);
+	glMultiTexCoord2f(ARB_target, v[0], v[1]);
 }
 
 //---------------------------------------------------------------------------
@@ -119,112 +123,73 @@ typedef struct {
 }  GLD_extension;
 
 GLD_extension GLD_extList[] = {
-#ifdef GL_EXT_polygon_offset
-    {	(PROC)glPolygonOffsetEXT,		"glPolygonOffsetEXT"		},
-#endif
-    {	(PROC)glBlendEquationEXT,		"glBlendEquationEXT"		},
-    {	(PROC)glBlendColorEXT,			"glBlendColorExt"			},
-    {	(PROC)glVertexPointerEXT,		"glVertexPointerEXT"		},
-    {	(PROC)glNormalPointerEXT,		"glNormalPointerEXT"		},
-    {	(PROC)glColorPointerEXT,		"glColorPointerEXT"			},
-    {	(PROC)glIndexPointerEXT,		"glIndexPointerEXT"			},
-    {	(PROC)glTexCoordPointerEXT,		"glTexCoordPointer"			},
-    {	(PROC)glEdgeFlagPointerEXT,		"glEdgeFlagPointerEXT"		},
-    {	(PROC)glGetPointervEXT,			"glGetPointervEXT"			},
-    {	(PROC)glArrayElementEXT,		"glArrayElementEXT"			},
-    {	(PROC)glDrawArraysEXT,			"glDrawArrayEXT"			},
-    {	(PROC)glAreTexturesResidentEXT,	"glAreTexturesResidentEXT"	},
-    {	(PROC)glBindTextureEXT,			"glBindTextureEXT"			},
-    {	(PROC)glDeleteTexturesEXT,		"glDeleteTexturesEXT"		},
-    {	(PROC)glGenTexturesEXT,			"glGenTexturesEXT"			},
-    {	(PROC)glIsTextureEXT,			"glIsTextureEXT"			},
-    {	(PROC)glPrioritizeTexturesEXT,	"glPrioritizeTexturesEXT"	},
-    {	(PROC)glCopyTexSubImage3DEXT,	"glCopyTexSubImage3DEXT"	},
-    {	(PROC)glTexImage3DEXT,			"glTexImage3DEXT"			},
-    {	(PROC)glTexSubImage3DEXT,		"glTexSubImage3DEXT"		},
-    {	(PROC)glPointParameterfEXT,		"glPointParameterfEXT"		},
-    {	(PROC)glPointParameterfvEXT,	"glPointParameterfvEXT"		},
+    {	NULL,							"glPolygonOffsetEXT"		},
+    {	NULL,							"glBlendEquationEXT"		},
+    {	NULL,							"glBlendColorExt"			},
+    {	NULL,							"glVertexPointerEXT"		},
+    {	NULL,							"glNormalPointerEXT"		},
+    {	NULL,							"glColorPointerEXT"			},
+    {	NULL,							"glIndexPointerEXT"			},
+    {	NULL,							"glTexCoordPointer"			},
+    {	NULL,							"glEdgeFlagPointerEXT"		},
+    {	NULL,							"glGetPointervEXT"			},
+    {	NULL,							"glArrayElementEXT"			},
+    {	NULL,							"glDrawArrayEXT"			},
+    {	NULL,							"glAreTexturesResidentEXT"	},
+    {	NULL,							"glBindTextureEXT"			},
+    {	NULL,							"glDeleteTexturesEXT"		},
+    {	NULL,							"glGenTexturesEXT"			},
+    {	NULL,							"glIsTextureEXT"			},
+    {	NULL,							"glPrioritizeTexturesEXT"	},
+    {	NULL,							"glCopyTexSubImage3DEXT"	},
+    {	NULL,							"glTexImage3DEXT"			},
+    {	NULL,							"glTexSubImage3DEXT"		},
+    {	NULL,							"glPointParameterfEXT"		},
+    {	NULL,							"glPointParameterfvEXT"		},
 
-    {	(PROC)glLockArraysEXT,			"glLockArraysEXT"			},
-    {	(PROC)glUnlockArraysEXT,		"glUnlockArraysEXT"			},
+    {	NULL,							"glLockArraysEXT"			},
+    {	NULL,							"glUnlockArraysEXT"			},
 	{	NULL,							"\0"						}
 };
 
 GLD_extension GLD_multitexList[] = {
-/*
-    {	(PROC)glMultiTexCoord1dSGIS,		"glMTexCoord1dSGIS"			},
-    {	(PROC)glMultiTexCoord1dvSGIS,		"glMTexCoord1dvSGIS"		},
-    {	(PROC)glMultiTexCoord1fSGIS,		"glMTexCoord1fSGIS"			},
-    {	(PROC)glMultiTexCoord1fvSGIS,		"glMTexCoord1fvSGIS"		},
-    {	(PROC)glMultiTexCoord1iSGIS,		"glMTexCoord1iSGIS"			},
-    {	(PROC)glMultiTexCoord1ivSGIS,		"glMTexCoord1ivSGIS"		},
-    {	(PROC)glMultiTexCoord1sSGIS,		"glMTexCoord1sSGIS"			},
-    {	(PROC)glMultiTexCoord1svSGIS,		"glMTexCoord1svSGIS"		},
-    {	(PROC)glMultiTexCoord2dSGIS,		"glMTexCoord2dSGIS"			},
-    {	(PROC)glMultiTexCoord2dvSGIS,		"glMTexCoord2dvSGIS"		},
-    {	(PROC)glMultiTexCoord2fSGIS,		"glMTexCoord2fSGIS"			},
-    {	(PROC)glMultiTexCoord2fvSGIS,		"glMTexCoord2fvSGIS"		},
-    {	(PROC)glMultiTexCoord2iSGIS,		"glMTexCoord2iSGIS"			},
-    {	(PROC)glMultiTexCoord2ivSGIS,		"glMTexCoord2ivSGIS"		},
-    {	(PROC)glMultiTexCoord2sSGIS,		"glMTexCoord2sSGIS"			},
-    {	(PROC)glMultiTexCoord2svSGIS,		"glMTexCoord2svSGIS"		},
-    {	(PROC)glMultiTexCoord3dSGIS,		"glMTexCoord3dSGIS"			},
-    {	(PROC)glMultiTexCoord3dvSGIS,		"glMTexCoord3dvSGIS"		},
-    {	(PROC)glMultiTexCoord3fSGIS,		"glMTexCoord3fSGIS"			},
-    {	(PROC)glMultiTexCoord3fvSGIS,		"glMTexCoord3fvSGIS"		},
-    {	(PROC)glMultiTexCoord3iSGIS,		"glMTexCoord3iSGIS"			},
-    {	(PROC)glMultiTexCoord3ivSGIS,		"glMTexCoord3ivSGIS"		},
-    {	(PROC)glMultiTexCoord3sSGIS,		"glMTexCoord3sSGIS"			},
-    {	(PROC)glMultiTexCoord3svSGIS,		"glMTexCoord3svSGIS"		},
-    {	(PROC)glMultiTexCoord4dSGIS,		"glMTexCoord4dSGIS"			},
-    {	(PROC)glMultiTexCoord4dvSGIS,		"glMTexCoord4dvSGIS"		},
-    {	(PROC)glMultiTexCoord4fSGIS,		"glMTexCoord4fSGIS"			},
-    {	(PROC)glMultiTexCoord4fvSGIS,		"glMTexCoord4fvSGIS"		},
-    {	(PROC)glMultiTexCoord4iSGIS,		"glMTexCoord4iSGIS"			},
-    {	(PROC)glMultiTexCoord4ivSGIS,		"glMTexCoord4ivSGIS"		},
-    {	(PROC)glMultiTexCoord4sSGIS,		"glMTexCoord4sSGIS"			},
-    {	(PROC)glMultiTexCoord4svSGIS,		"glMTexCoord4svSGIS"		},
-    {	(PROC)glMultiTexCoordPointerSGIS,	"glMTexCoordPointerSGIS"	},
-    {	(PROC)glSelectTextureSGIS,			"glSelectTextureSGIS"			},
-    {	(PROC)glSelectTextureCoordSetSGIS,	"glSelectTextureCoordSetSGIS"	},
-*/
-    {	(PROC)glActiveTextureARB,		"glActiveTextureARB"		},
-    {	(PROC)glClientActiveTextureARB,	"glClientActiveTextureARB"	},
-    {	(PROC)glMultiTexCoord1dARB,		"glMultiTexCoord1dARB"		},
-    {	(PROC)glMultiTexCoord1dvARB,	"glMultiTexCoord1dvARB"		},
-    {	(PROC)glMultiTexCoord1fARB,		"glMultiTexCoord1fARB"		},
-    {	(PROC)glMultiTexCoord1fvARB,	"glMultiTexCoord1fvARB"		},
-    {	(PROC)glMultiTexCoord1iARB,		"glMultiTexCoord1iARB"		},
-    {	(PROC)glMultiTexCoord1ivARB,	"glMultiTexCoord1ivARB"		},
-    {	(PROC)glMultiTexCoord1sARB,		"glMultiTexCoord1sARB"		},
-    {	(PROC)glMultiTexCoord1svARB,	"glMultiTexCoord1svARB"		},
-    {	(PROC)glMultiTexCoord2dARB,		"glMultiTexCoord2dARB"		},
-    {	(PROC)glMultiTexCoord2dvARB,	"glMultiTexCoord2dvARB"		},
-    {	(PROC)glMultiTexCoord2fARB,		"glMultiTexCoord2fARB"		},
-    {	(PROC)glMultiTexCoord2fvARB,	"glMultiTexCoord2fvARB"		},
-    {	(PROC)glMultiTexCoord2iARB,		"glMultiTexCoord2iARB"		},
-    {	(PROC)glMultiTexCoord2ivARB,	"glMultiTexCoord2ivARB"		},
-    {	(PROC)glMultiTexCoord2sARB,		"glMultiTexCoord2sARB"		},
-    {	(PROC)glMultiTexCoord2svARB,	"glMultiTexCoord2svARB"		},
-    {	(PROC)glMultiTexCoord3dARB,		"glMultiTexCoord3dARB"		},
-    {	(PROC)glMultiTexCoord3dvARB,	"glMultiTexCoord3dvARB"		},
-    {	(PROC)glMultiTexCoord3fARB,		"glMultiTexCoord3fARB"		},
-    {	(PROC)glMultiTexCoord3fvARB,	"glMultiTexCoord3fvARB"		},
-    {	(PROC)glMultiTexCoord3iARB,		"glMultiTexCoord3iARB"		},
-    {	(PROC)glMultiTexCoord3ivARB,	"glMultiTexCoord3ivARB"		},
-    {	(PROC)glMultiTexCoord3sARB,		"glMultiTexCoord3sARB"		},
-    {	(PROC)glMultiTexCoord3svARB,	"glMultiTexCoord3svARB"		},
-    {	(PROC)glMultiTexCoord4dARB,		"glMultiTexCoord4dARB"		},
-    {	(PROC)glMultiTexCoord4dvARB,	"glMultiTexCoord4dvARB"		},
-    {	(PROC)glMultiTexCoord4fARB,		"glMultiTexCoord4fARB"		},
-    {	(PROC)glMultiTexCoord4fvARB,	"glMultiTexCoord4fvARB"		},
-    {	(PROC)glMultiTexCoord4iARB,		"glMultiTexCoord4iARB"		},
-    {	(PROC)glMultiTexCoord4ivARB,	"glMultiTexCoord4ivARB"		},
-    {	(PROC)glMultiTexCoord4sARB,		"glMultiTexCoord4sARB"		},
-    {	(PROC)glMultiTexCoord4svARB,	"glMultiTexCoord4svARB"		},
+    {	NULL,							"glActiveTextureARB"		},
+    {	NULL,							"glClientActiveTextureARB"	},
+    {	NULL,							"glMultiTexCoord1dARB"		},
+    {	NULL,							"glMultiTexCoord1dvARB"		},
+    {	NULL,							"glMultiTexCoord1fARB"		},
+    {	NULL,							"glMultiTexCoord1fvARB"		},
+    {	NULL,							"glMultiTexCoord1iARB"		},
+    {	NULL,							"glMultiTexCoord1ivARB"		},
+    {	NULL,							"glMultiTexCoord1sARB"		},
+    {	NULL,							"glMultiTexCoord1svARB"		},
+    {	NULL,							"glMultiTexCoord2dARB"		},
+    {	NULL,							"glMultiTexCoord2dvARB"		},
+    {	NULL,							"glMultiTexCoord2fARB"		},
+    {	NULL,							"glMultiTexCoord2fvARB"		},
+    {	NULL,							"glMultiTexCoord2iARB"		},
+    {	NULL,							"glMultiTexCoord2ivARB"		},
+    {	NULL,							"glMultiTexCoord2sARB"		},
+    {	NULL,							"glMultiTexCoord2svARB"		},
+    {	NULL,							"glMultiTexCoord3dARB"		},
+    {	NULL,							"glMultiTexCoord3dvARB"		},
+    {	NULL,							"glMultiTexCoord3fARB"		},
+    {	NULL,							"glMultiTexCoord3fvARB"		},
+    {	NULL,							"glMultiTexCoord3iARB"		},
+    {	NULL,							"glMultiTexCoord3ivARB"		},
+    {	NULL,							"glMultiTexCoord3sARB"		},
+    {	NULL,							"glMultiTexCoord3svARB"		},
+    {	NULL,							"glMultiTexCoord4dARB"		},
+    {	NULL,							"glMultiTexCoord4dvARB"		},
+    {	NULL,							"glMultiTexCoord4fARB"		},
+    {	NULL,							"glMultiTexCoord4fvARB"		},
+    {	NULL,							"glMultiTexCoord4iARB"		},
+    {	NULL,							"glMultiTexCoord4ivARB"		},
+    {	NULL,							"glMultiTexCoord4sARB"		},
+    {	NULL,							"glMultiTexCoord4svARB"		},
 
 	// Descent3 doesn't use correct string, hence this hack
-    {	(PROC)glMultiTexCoord4fARB,		"glMultiTexCoord4f"			},
+    {	NULL,							"glMultiTexCoord4f"			},
 
 	// Quake2 SGIS multitexture
     {	(PROC)gldSelectTextureSGIS,		"glSelectTextureSGIS"		},

@@ -47,21 +47,73 @@
 #endif // STRICT
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <GL\gl.h>
+#include <glad/gl.h>
 
 #include "gld_macros.h"
 #include "gld_globals.h"
 #include "gld_log.h"
 #include "gld_pf.h"
 
-#include "context.h"	// Mesa context
-
 /*---------------------- Macros and type definitions ----------------------*/
 
 // TODO: Use a list instead of this constant!
 #define GLD_MAX_CONTEXTS 32
 
-// Structure for describing an OpenGL context
+/*
+ * Forward declarations for per-context manager state caches.
+ * These are defined in their respective gl46/ module headers.
+ */
+typedef struct GLD_bufferCache_s	GLD_bufferCache;
+typedef struct GLD_textureCache_s	GLD_textureCache;
+typedef struct GLD_renderTargetCache_s	GLD_renderTargetCache;
+typedef struct GLD_shaderCache_s	GLD_shaderCache;
+typedef struct GLD_fixedFuncCache_s	GLD_fixedFuncCache;
+
+/*
+ * GLD_glContext — replaces the old Mesa GLcontext / GLvisual / GLframebuffer.
+ * Holds the real OpenGL 4.6 context handle and all associated GL state that
+ * GLDirect needs to track for DX9-to-GL translation.
+ */
+typedef struct {
+	// Real OpenGL context handles
+	HGLRC				hRC;			// WGL rendering context handle
+	HDC					hDC;			// Device context the GL context is bound to
+	HWND				hWnd;			// Window associated with this context
+
+	// Viewport state
+	GLint				viewportX;
+	GLint				viewportY;
+	GLsizei				viewportWidth;
+	GLsizei				viewportHeight;
+	GLfloat				depthRangeNear;
+	GLfloat				depthRangeFar;
+
+	// Clear values
+	GLfloat				clearColor[4];	// RGBA clear color
+	GLfloat				clearDepth;		// Depth clear value
+	GLint				clearStencil;	// Stencil clear value
+
+	// Active GL object IDs
+	GLuint				activeShaderProgram;	// Currently bound shader program
+	GLuint				activeVAO;				// Currently bound Vertex Array Object
+	GLuint				activeFBO;				// Currently bound Framebuffer Object
+
+	// Per-context manager state caches (owned by gl46/ modules)
+	GLD_bufferCache			*bufferCache;
+	GLD_textureCache		*textureCache;
+	GLD_renderTargetCache	*renderTargetCache;
+	GLD_shaderCache			*shaderCache;
+	GLD_fixedFuncCache		*fixedFuncCache;
+
+	// Coordinate adapter state
+	BOOL				bClipControlAvailable;	// TRUE if ARB_clip_control is active
+
+	// Negotiated GL version
+	GLint				glVersionMajor;
+	GLint				glVersionMinor;
+} GLD_glContext;
+
+// Structure for describing a GLDirect context slot
 typedef struct {
 	BOOL				bHasBeenCurrent;
 	GLD_pixelFormat		*lpPF;
@@ -69,10 +121,17 @@ typedef struct {
 	// Pointer to private driver data (this also contains the drawable).
 	void				*glPriv;
 
-	// Mesa vars:
-	GLcontext			*glCtx;			// The core Mesa context
-	GLvisual			*glVis;			// Describes the color buffer
-	GLframebuffer		*glBuffer;		// Ancillary buffers
+	// OpenGL 4.6 context (replaces Mesa GLcontext/GLvisual/GLframebuffer)
+	GLD_glContext		gl46Ctx;
+
+	// Legacy Mesa GLcontext pointer for DX9 backend compatibility.
+	// The DX9 backend accesses this as ctx->glCtx->Field.
+	// Allocated in gldCreateContextBuffers; freed in gldDeleteContext.
+	// Will be removed when DX9 backend is fully replaced by GL46 modules.
+	struct __GLcontextRec	*glCtx;
+
+	// Legacy Mesa GLframebuffer pointer for DX9 backend compatibility.
+	struct gl_framebuffer	*glBuffer;
 
 	GLuint				ClearIndex;
 	GLuint				CurrentIndex;
@@ -103,12 +162,10 @@ typedef struct {
 	DWORD				dwModeHeight;	// Display mode height
 	float				dvClipX;
 	float				dvClipY;
-	LONG				lpfnWndProc;	// window message handler function
+	LONG_PTR			lpfnWndProc;	// window message handler function
 } GLD_ctx;
 
 typedef GLD_ctx GLD_context;
-
-#define GLD_GET_CONTEXT(c)	(GLD_context*)(c)->DriverCtx
 
 /*------------------------- Function Prototypes ---------------------------*/
 

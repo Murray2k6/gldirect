@@ -42,21 +42,21 @@
 #include "gld_context.h"
 #include "gld_log.h"
 #include "gldirect5.h"
+#include "mesa_compat.h"
 
-#include "glheader.h"
-#include "context.h"
-#include "colormac.h"
-#include "depth.h"
-#include "extensions.h"
-#include "macros.h"
-#include "matrix.h"
-#include "mtypes.h"
-#include "texformat.h"
-#include "texstore.h"
-#include "vtxfmt.h"
-#include "dlist.h"
-
-const char *_mesa_lookup_enum_by_nr( int nr );
+// TODO: Mesa includes removed - replaced by mesa_compat.h shim
+// #include "glheader.h"
+// #include "context.h"
+// #include "colormac.h"
+// #include "depth.h"
+// #include "extensions.h"
+// #include "macros.h"
+// #include "matrix.h"
+// #include "mtypes.h"
+// #include "texformat.h"
+// #include "texstore.h"
+// #include "vtxfmt.h"
+// #include "dlist.h"
 
 //---------------------------------------------------------------------------
 // Defines
@@ -1785,7 +1785,7 @@ void gldUpdateShaders(
 	// Only update light state if lighting is enabled
 	//
 	if (ctx->Light.Enabled) {
-		const struct gl_material	*mat = &ctx->Light.Material;
+		const struct gl_material	*mat = &ctx->Light.Material[0];
 		GLD_HLSL_light				Light;	// Ensure this is defined without packing!
 		// Global ambient light
 		_gldSetEffectVector(pEffect, pHandles->Ambient, ctx->Light.Model.Ambient);

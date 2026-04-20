@@ -106,6 +106,8 @@ typedef struct {
 	DWORD	dwAdapter;			// DX8 adapter ordinal
 	DWORD	dwTnL;				// Transform & Lighting type
 	DWORD	dwMultisample;		// DX8 multisample type
+
+	char	szLogVerbosity[32];	// Log verbosity: "debug", "info", "warning", "error"
 } INI_settings;
 
 static INI_settings ini;
@@ -185,6 +187,10 @@ BOOL ReadINIFile(
 	// dwTnL now defaults to zero (chooses TnL at runtime). KeithH
 	ini.dwTnL			= GetPrivateProfileInt(szSectionName, "dwTnL", 0, szINIFile);
 	ini.dwMultisample	= GetPrivateProfileInt(szSectionName, "dwMultisample", 0, szINIFile);
+
+	// Log verbosity: "debug", "info", "warning", "error" (default: "info")
+	GetPrivateProfileString(szSectionName, "LogVerbosity", "info",
+		ini.szLogVerbosity, sizeof(ini.szLogVerbosity), szINIFile);
 
 	return TRUE;
 }
@@ -644,6 +650,9 @@ BOOL gldInitDriver(void)
 	gldLogWarnOption(glb.bMessageBoxWarnings);
 	gldLogOpen((GLDLOG_loggingMethodType)dwLogging,
 			  (GLDLOG_severityType)dwDebugLevel);
+
+	// Apply LogVerbosity from INI if present (overrides dwLoggingSeverity)
+	gldLogSetVerbosity(ini.szLogVerbosity);
 
 	// Obtain the name of the calling app
 	gldLogMessage(GLDLOG_SYSTEM, "Driver           : SciTech GLDirect 5.0\n");

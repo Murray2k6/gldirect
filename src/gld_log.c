@@ -183,3 +183,28 @@ void gldLogPathOption(
 }
 
 // ***********************************************************************
+
+void gldLogSetVerbosity(
+	LPSTR szVerbosity)
+{
+	if (szVerbosity == NULL || szVerbosity[0] == '\0') {
+		// Default to info level
+		gldDebugLevel = GLDLOG_INFO;
+		return;
+	}
+
+	if (_stricmp(szVerbosity, "debug") == 0) {
+		gldDebugLevel = GLDLOG_DEBUG;
+	} else if (_stricmp(szVerbosity, "info") == 0) {
+		gldDebugLevel = GLDLOG_INFO;
+	} else if (_stricmp(szVerbosity, "warning") == 0) {
+		gldDebugLevel = GLDLOG_WARN;
+	} else if (_stricmp(szVerbosity, "error") == 0) {
+		gldDebugLevel = GLDLOG_ERROR;
+	} else {
+		// Unrecognized value, default to info
+		gldDebugLevel = GLDLOG_INFO;
+	}
+}
+
+// ***********************************************************************

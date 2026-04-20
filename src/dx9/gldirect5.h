@@ -50,6 +50,14 @@
 #include <d3d9.h>	// Core Direct3D
 #include <d3dx9.h>	// Direct3D Extension library
 
+/*
+ * Legacy Mesa type compatibility for the DX9 backend.
+ * Full struct definitions are now provided by mesa_compat.h.
+ * The DX9 backend will be entirely replaced by GL46 modules,
+ * at which point these can be removed.
+ */
+#include "mesa_compat.h"
+
 //---------------------------------------------------------------------------
 // Defines
 //---------------------------------------------------------------------------

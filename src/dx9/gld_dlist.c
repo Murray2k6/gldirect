@@ -40,26 +40,22 @@
 #include "gld_context.h"
 #include "gld_log.h"
 #include "gldirect5.h"
+#include "mesa_compat.h"
 
-#include "glheader.h"
-#include "context.h"
-#include "colormac.h"
-#include "depth.h"
-#include "extensions.h"
-#include "macros.h"
-#include "matrix.h"
-#include "mtypes.h"
-#include "texformat.h"
-#include "texstore.h"
-#include "vtxfmt.h"
-#include "dlist.h"
-#include "m_eval.h" // Evaluator functions
-
-void _mesa_update_state( GLcontext *ctx );
-void mesa_print_display_list( GLuint list );
-void _mesa_noop_vtxfmt_init( GLvertexformat *vfmt );
-
-void gldSaveFlushVertices(GLcontext *ctx);
+// TODO: Mesa includes removed - replaced by mesa_compat.h shim
+// #include "glheader.h"
+// #include "context.h"
+// #include "colormac.h"
+// #include "depth.h"
+// #include "extensions.h"
+// #include "macros.h"
+// #include "matrix.h"
+// #include "mtypes.h"
+// #include "texformat.h"
+// #include "texstore.h"
+// #include "vtxfmt.h"
+// #include "dlist.h"
+// #include "m_eval.h" // Evaluator functions
 
 //---------------------------------------------------------------------------
 // Display List defines
@@ -229,7 +225,7 @@ void gldDrawPrimitive_Print(
 {
 	GLD_data_DrawPrimitive *pDrawPrim = (GLD_data_DrawPrimitive *)data;
 	char szLine[1024];
-	sprintf(szLine, "DrawPrimitive dev=%x type=%d start=%d primcount=%d ptsize=%d\n", pDrawPrim->pDevice, pDrawPrim->PrimitiveType, pDrawPrim->StartVertex, pDrawPrim->PrimitiveCount, pDrawPrim->PointSize);
+	sprintf(szLine, "DrawPrimitive dev=%p type=%d start=%d primcount=%d ptsize=%d\n", (void*)pDrawPrim->pDevice, pDrawPrim->PrimitiveType, pDrawPrim->StartVertex, pDrawPrim->PrimitiveCount, pDrawPrim->PointSize);
 	_mesa_printf(szLine);
 	gldLogMessage(GLDLOG_INFO, szLine);
 }

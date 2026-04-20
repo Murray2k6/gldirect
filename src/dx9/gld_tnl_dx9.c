@@ -39,22 +39,23 @@
 #include "gld_log.h"
 #include "gldirect5.h"
 
-#include "glheader.h"
-#include "context.h"
-#include "colormac.h"
-#include "depth.h"
-#include "extensions.h"
-#include "macros.h"
-#include "matrix.h"
-#include "mtypes.h"
-#include "texformat.h"
-#include "texstore.h"
-#include "vtxfmt.h"
-#include "dlist.h"
-#include "state.h" // mesa_update_state()
-#include "api_noop.h"
-#include "api_arrayelt.h"
-#include "m_eval.h" // Evaluator functions
+// TODO: Mesa includes removed - will be replaced by GL46 modules in later tasks
+// #include "glheader.h"
+// #include "context.h"
+// #include "colormac.h"
+// #include "depth.h"
+// #include "extensions.h"
+// #include "macros.h"
+// #include "matrix.h"
+// #include "mtypes.h"
+// #include "texformat.h"
+// #include "texstore.h"
+// #include "vtxfmt.h"
+// #include "dlist.h"
+// #include "state.h" // mesa_update_state()
+// #include "api_noop.h"
+// #include "api_arrayelt.h"
+// #include "m_eval.h" // Evaluator functions
 
 GLboolean _mesa_validate_DrawElements(GLcontext *ctx,GLenum mode, GLsizei count, GLenum type, const GLvoid *indices);
 

@@ -97,7 +97,7 @@ typedef struct {
 
 	// Win32 internals
 	BOOL				bAppActive; // Keep track of Alt-Tab
-	LONG				lpfnWndProc; // WndProc of calling app
+	LONG_PTR			lpfnWndProc; // WndProc of calling app
 
 	// Pixel Format Descriptior list.
 	int					nPixelFormatCount;

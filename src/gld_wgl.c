@@ -37,6 +37,7 @@
 
 #include "gld_wgl.h"
 #include "gld_driver.h"
+#include "mesa_compat.h"
 
 #include "glu.h"	// MUST USE MICROSOFT'S GLU32!
 
@@ -44,11 +45,11 @@
 // otherwise export GLD2 GLD_* functions.
 #define _GLD_WGL_EXPORT(a) wgl##a
 
-// Calls into Mesa 4.x are different
-#include "dlist.h"
-#include "drawpix.h"
-#include "get.h"
-#include "matrix.h"
+// TODO: Mesa includes removed - will be replaced by GL46 modules in later tasks
+// #include "dlist.h"
+// #include "drawpix.h"
+// #include "get.h"
+// #include "matrix.h"
 // NOTE: All the _GLD* macros now call the gl* functions direct.
 //       This ensures that the correct internal pathway is taken. KeithH
 #define _GLD_glNewList		glNewList
@@ -217,7 +218,7 @@ int gldGetPixelFormat(void)
 	// get thread-specific instance
 	if (glb.bMultiThreaded) {
 		__try {
-			iPixelFormat = (int)TlsGetValue(dwTLSPixelFormat);
+			iPixelFormat = (int)(INT_PTR)TlsGetValue(dwTLSPixelFormat);
 		}
 		__except(EXCEPTION_EXECUTE_HANDLER) {
 			iPixelFormat = curPFD;
@@ -241,7 +242,7 @@ void gldSetPixelFormat(int iPixelFormat)
 	// set thread-specific instance
 	if (glb.bMultiThreaded) {
 		__try {
-			TlsSetValue(dwTLSPixelFormat, (LPVOID)iPixelFormat);
+			TlsSetValue(dwTLSPixelFormat, (LPVOID)(INT_PTR)iPixelFormat);
 		}
 		__except(EXCEPTION_EXECUTE_HANDLER) {
 			curPFD = iPixelFormat;
@@ -940,10 +941,10 @@ BOOL APIENTRY _GLD_WGL_EXPORT(SwapLayerBuffers)(
 // either MESA glViewport() or GLD wglMakeCurrent().
 
 BOOL gldWglResizeBuffers(
-	GLcontext *ctx,
+	GLD_ctx *ctx,
 	BOOL bDefaultDriver)
 {
-	GLD_ctx						*gld = NULL;
+	GLD_ctx						*gld = ctx;
 	RECT						rcScreenRect;
 	DWORD						dwWidth;
 	DWORD						dwHeight;
@@ -964,7 +965,6 @@ BOOL gldWglResizeBuffers(
 	// Sanity checks
 	if (ctx == NULL)
 		return FALSE;
-	gld = (GLD_ctx*)ctx->DriverCtx;
 	if (gld == NULL)
 		return FALSE;
 
@@ -1624,7 +1624,7 @@ CreateHighResolutionFont(HDC hDC)
 	logFont.lfPitchAndFamily =
 		otm->otmTextMetrics.tmPitchAndFamily & 0xf0;
 	strcpy(logFont.lfFaceName,
-	       (char *)otm + (int)otm->otmpFaceName);
+	       (char *)otm + (int)(INT_PTR)otm->otmpFaceName);
 
 	hNewFont = CreateFontIndirect(&logFont);
 	if (hNewFont == NULL)
@@ -1773,7 +1773,7 @@ DrawGlyph(	IN  UCHAR*	glyphBuf,
 		v[2] = 0.0;
 		z_value = 0.0f;
 
-		gluTessBeginPolygonProc(tess, (void *)*(int *)&z_value);
+		gluTessBeginPolygonProc(tess, (void *)(INT_PTR)*(int *)&z_value);
 			for (loop = (DWORD) *p++; loop; --loop)
 				{
 				gluTessBeginContourProc(tess);
@@ -1840,7 +1840,7 @@ DrawGlyph(	IN  UCHAR*	glyphBuf,
 			_GLD_glNormal3f(0.0f, 0.0f, -1.0f);
 			gluTessNormalProc(tess,	0.0F, 0.0F, -1.0F);
 
-			gluTessBeginPolygonProc(tess, (void *)*(int *)&thickness);
+			gluTessBeginPolygonProc(tess, (void *)(INT_PTR)*(int *)&thickness);
 
 			for (loop = (DWORD) *p++; loop; --loop)
 			{

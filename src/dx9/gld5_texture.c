@@ -38,13 +38,15 @@
 #include "gld_context.h"
 #include "gld_log.h"
 #include "gldirect5.h"
+#include "mesa_compat.h"
 
 #include <d3dx9tex.h>
 
-#include "texformat.h"
-#include "colormac.h"
-#include "texstore.h"
-#include "image.h"
+// TODO: Mesa includes removed - replaced by mesa_compat.h shim
+// #include "texformat.h"
+// #include "colormac.h"
+// #include "texstore.h"
+// #include "image.h"
 // #include "mem.h"
 
 //---------------------------------------------------------------------------
@@ -675,7 +677,7 @@ const struct gl_texture_format* _gldMesaFormatForD3DFormat(
 
 	// If we reach here then we've made an error somewhere else
 	// by allowing a format that is not supported.
-	assert(0);
+	ASSERT(0);
 
 	return NULL; // Shut up compiler warning
 }

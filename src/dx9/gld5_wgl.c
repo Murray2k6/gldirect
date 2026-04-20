@@ -39,6 +39,7 @@
 #include "gld_driver.h"
 #include "gld_dxerr9.h"
 #include "gldirect5.h"
+#include "mesa_compat.h"
 
 // Copied from gld_context.c
 #define GLDERR_NONE     0
@@ -782,8 +783,8 @@ BOOL gldDestroyDrawable_DX(
 	// Hack for exiting DX9 D3D fullscreen page-flipping mode.
 	// Otherwise Quake3 crashes on exit. (DaveM)
 	if (ctx->bFullscreen && ctx->lpfnWndProc) {
-		SetWindowLong(ctx->hWnd, GWL_WNDPROC, (LONG)ctx->lpfnWndProc);
-		ctx->lpfnWndProc = (LONG)NULL;
+		SetWindowLongPtr(ctx->hWnd, GWLP_WNDPROC, ctx->lpfnWndProc);
+		ctx->lpfnWndProc = (LONG_PTR)NULL;
 		}
 
 	// Ensure device isn't holding onto any interfaces before we release it.

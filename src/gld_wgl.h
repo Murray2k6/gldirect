@@ -46,7 +46,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
-#include <GL\gl.h>
+#include <glad/gl.h>
 
 #include "gld_context.h"
 #include "gld_globals.h"
@@ -67,7 +67,7 @@ typedef struct {
 extern "C" {
 #endif
 
-BOOL	gldWglResizeBuffers(GLcontext *ctx, BOOL bDefaultDriver);
+BOOL	gldWglResizeBuffers(GLD_ctx *ctx, BOOL bDefaultDriver);
 
 #ifdef  __cplusplus
 }

@@ -27,11 +27,19 @@
 #ifndef GLD_ARRAYELT_H
 #define GLD_ARRAYELT_H
 
-#include "mtypes.h"
+/*
+ * NOTE: This module previously depended on Mesa GLcontext internals
+ * (ctx->aelt_context, ctx->Array, ctx->Const, etc.).
+ * With the Mesa removal (task 3.1), these functions are stubbed out.
+ * They will be fully replaced by the GL46 Buffer_Manager module (task 9).
+ */
 
-extern GLboolean _ae_create_context( GLcontext *ctx );
-extern void _ae_destroy_context( GLcontext *ctx );
-extern void _ae_invalidate_state( GLcontext *ctx, GLuint new_state );
+#include <glad/gl.h>
+
+/* Stubbed — no-ops until Buffer_Manager replaces this module */
+extern GLboolean _ae_create_context( void *ctx );
+extern void _ae_destroy_context( void *ctx );
+extern void _ae_invalidate_state( void *ctx, GLuint new_state );
 extern void GLAPIENTRY _ae_loopback_array_elt( GLint elt );
 
 #endif

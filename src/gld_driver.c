@@ -38,9 +38,11 @@
 #define STRICT
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <d3d9.h>
 
 #include "gld_driver.h"
 #include "gld_log.h"
+#include "gl46/gl46_driver.h"
 // TODO: Mesa includes removed - will be replaced by GL46 modules in later tasks
 // #include "glheader.h"
 
@@ -56,18 +58,146 @@ static char *szDriverError = "Driver used before initialisation!";
 static char _gldRendererString[1024];
 
 // Vendor string
-static char *g_szGLDVendor		= "SciTech Software, Inc.";
+static char g_szGLDVendor[256]   = "";
+static char g_szGLDRenderer[256] = "";
+static BOOL g_bGPUInfoQueried    = FALSE;
+
+static void _queryGPUInfo(void)
+{
+	D3DADAPTER_IDENTIFIER9 ident;
+	IDirect3D9 *pD3D;
+	HINSTANCE hD3D9;
+	typedef IDirect3D9* (WINAPI *FN_D3DCreate9)(UINT);
+	FN_D3DCreate9 fnCreate;
+
+	if (g_bGPUInfoQueried) return;
+	g_bGPUInfoQueried = TRUE;
+
+	/* Default fallback */
+	strcpy(g_szGLDVendor, "GLDirect");
+	strcpy(g_szGLDRenderer, "GLDirect DX9 Wrapper");
+
+	/* Try to use the existing D3D9 from context manager */
+	{
+		extern IDirect3D9* gldGetD3D46(void);
+		pD3D = gldGetD3D46();
+		if (pD3D) {
+			if (SUCCEEDED(IDirect3D9_GetAdapterIdentifier(pD3D, 0, 0, &ident))) {
+				strncpy(g_szGLDRenderer, ident.Description, sizeof(g_szGLDRenderer) - 1);
+				g_szGLDRenderer[sizeof(g_szGLDRenderer) - 1] = '\0';
+				switch (ident.VendorId) {
+				case 0x10DE: strcpy(g_szGLDVendor, "NVIDIA Corporation"); break;
+				case 0x1002: case 0x1022: strcpy(g_szGLDVendor, "ATI Technologies Inc."); break;
+				case 0x8086: strcpy(g_szGLDVendor, "Intel"); break;
+				default: sprintf(g_szGLDVendor, "Vendor 0x%04X", ident.VendorId); break;
+				}
+			}
+			return;
+		}
+	}
+
+	/* Fallback: create a temporary D3D9 instance */
+	hD3D9 = LoadLibrary("D3D9.DLL");
+	if (!hD3D9) return;
+
+	fnCreate = (FN_D3DCreate9)GetProcAddress(hD3D9, "Direct3DCreate9");
+	if (!fnCreate) { FreeLibrary(hD3D9); return; }
+
+	pD3D = fnCreate(D3D_SDK_VERSION);
+	if (!pD3D) { FreeLibrary(hD3D9); return; }
+
+	if (SUCCEEDED(IDirect3D9_GetAdapterIdentifier(pD3D, 0, 0, &ident))) {
+		strncpy(g_szGLDRenderer, ident.Description, sizeof(g_szGLDRenderer) - 1);
+		g_szGLDRenderer[sizeof(g_szGLDRenderer) - 1] = '\0';
+		switch (ident.VendorId) {
+		case 0x10DE: strcpy(g_szGLDVendor, "NVIDIA Corporation"); break;
+		case 0x1002: case 0x1022: strcpy(g_szGLDVendor, "ATI Technologies Inc."); break;
+		case 0x8086: strcpy(g_szGLDVendor, "Intel"); break;
+		default: sprintf(g_szGLDVendor, "Vendor 0x%04X", ident.VendorId); break;
+		}
+	}
+
+	IDirect3D9_Release(pD3D);
+	FreeLibrary(hD3D9);
+}
 
 // Based on mesa\src\mesa\main\get.c::_mesa_GetString
 // TODO: Version string updated for GL46 - will be finalized in later tasks
 static char *g_szGLDVersion		= "4.6 GLDirect";
 
 // extensions
-// Quake3 is slower with GL_EXT_compiled_vertex_array !
+// Extension string — report all extensions that DX9 can reasonably emulate.
+// Games check this via glGetString(GL_EXTENSIONS) to decide what features to use.
 static char *g_szGLDExtensions	=
-//"GL_EXT_polygon_offset "
+"GL_ARB_multitexture "
+"GL_ARB_texture_env_combine "
+"GL_ARB_texture_env_crossbar "
+"GL_ARB_texture_env_dot3 "
+"GL_ARB_texture_cube_map "
+"GL_ARB_texture_env_add "
+"GL_ARB_texture_compression "
+"GL_ARB_texture_non_power_of_two "
+"GL_ARB_texture_border_clamp "
+"GL_ARB_texture_mirrored_repeat "
+"GL_ARB_transpose_matrix "
+"GL_ARB_vertex_buffer_object "
+"GL_ARB_vertex_program "
+"GL_ARB_vertex_shader "
+"GL_ARB_fragment_program "
+"GL_ARB_fragment_shader "
+"GL_ARB_shader_objects "
+"GL_ARB_shading_language_100 "
+"GL_ARB_multisample "
+"GL_ARB_depth_texture "
+"GL_ARB_shadow "
+"GL_ARB_point_parameters "
+"GL_ARB_point_sprite "
+"GL_ARB_draw_buffers "
+"GL_ARB_occlusion_query "
+"GL_ARB_framebuffer_object "
+"GL_ARB_pixel_buffer_object "
+"GL_ARB_map_buffer_range "
+"GL_ARB_vertex_array_object "
+"GL_ARB_uniform_buffer_object "
+"GL_ARB_sync "
+"GL_ARB_sampler_objects "
+"GL_ARB_texture_storage "
+"GL_ARB_instanced_arrays "
+"GL_ARB_draw_instanced "
+"GL_ARB_draw_elements_base_vertex "
+"GL_ARB_clip_control "
+"GL_ARB_debug_output "
+"GL_ARB_create_context "
+"GL_ARB_create_context_profile "
 "GL_EXT_texture_env_add "
-"GL_ARB_multitexture ";
+"GL_EXT_texture_compression_s3tc "
+"GL_EXT_texture_filter_anisotropic "
+"GL_EXT_texture_lod_bias "
+"GL_EXT_texture_edge_clamp "
+"GL_EXT_blend_subtract "
+"GL_EXT_blend_minmax "
+"GL_EXT_blend_func_separate "
+"GL_EXT_blend_equation_separate "
+"GL_EXT_stencil_wrap "
+"GL_EXT_stencil_two_side "
+"GL_EXT_packed_depth_stencil "
+"GL_EXT_framebuffer_object "
+"GL_EXT_framebuffer_blit "
+"GL_EXT_framebuffer_multisample "
+"GL_EXT_draw_range_elements "
+"GL_EXT_compiled_vertex_array "
+"GL_EXT_multi_draw_arrays "
+"GL_EXT_texture3D "
+"GL_EXT_fog_coord "
+"GL_EXT_secondary_color "
+"GL_EXT_gpu_shader4 "
+"GL_EXT_swap_control "
+"GL_NV_blend_square "
+"GL_NV_texture_env_combine4 "
+"GL_SGIS_generate_mipmap "
+"GL_S3_s3tc "
+"GL_KHR_debug "
+;
 
 //---------------------------------------------------------------------------
 
@@ -198,8 +328,7 @@ const GLubyte* _gldGetStringGeneric(
 	GLD_ctx *ctx,
 	GLenum name)
 {
-	if (!ctx)
-		return NULL;
+	_queryGPUInfo();
 
 	switch (name) {
 	case GL_VENDOR:
@@ -207,14 +336,13 @@ const GLubyte* _gldGetStringGeneric(
 	case GL_VERSION:
 		return (const GLubyte *) g_szGLDVersion;
 	case GL_RENDERER:
-		// TODO: CPU feature detection removed with Mesa - will be reimplemented in later tasks
-		sprintf(_gldRendererString, "GLDirect 5.0 GL46 (%s %s)",
-			__DATE__, __TIME__);
-		return (const GLubyte *) _gldRendererString;
+		return (const GLubyte *) g_szGLDRenderer;
 	case GL_EXTENSIONS:
 		return (const GLubyte *) g_szGLDExtensions;
+	case 0x8B8C: /* GL_SHADING_LANGUAGE_VERSION */
+		return (const GLubyte *) "4.60 GLDirect";
 	default:
-		return NULL; // Mesa will "fill in blanks" if we return NULL.
+		return NULL;
 	}
 }
 
@@ -433,6 +561,22 @@ BOOL gldInitDriverPointers(
 		_gldDriver.GetDisplayMode			= gldGetDisplayMode_DX;
 		return TRUE;
 	};
+
+	if (dwDriver == GLDS_DRIVER_GL46) {
+		// OpenGL 4.6 core profile backend
+		_gldDriver.GetDXErrorString			= gldGetDXErrorString_GL46;
+		_gldDriver.CreateDrawable			= gldCreateDrawable_GL46;
+		_gldDriver.ResizeDrawable			= gldResizeDrawable_GL46;
+		_gldDriver.DestroyDrawable			= gldDestroyDrawable_GL46;
+		_gldDriver.CreatePrivateGlobals		= gldCreatePrivateGlobals_GL46;
+		_gldDriver.DestroyPrivateGlobals	= gldDestroyPrivateGlobals_GL46;
+		_gldDriver.BuildPixelformatList		= gldBuildPixelformatList_GL46;
+		_gldDriver.InitialiseMesa			= gldInitialiseMesa_GL46;
+		_gldDriver.SwapBuffers				= gldSwapBuffers_GL46;
+		_gldDriver.wglGetProcAddress		= gldGetProcAddress_GL46;
+		_gldDriver.GetDisplayMode			= gldGetDisplayMode_GL46;
+		return TRUE;
+	}
 
 	return FALSE;
 }

@@ -442,6 +442,9 @@
     <ClCompile Include="src\gl46\swap_chain.c" />
     <ClCompile Include="src\gl46\pixel_format_provider.c" />
     <ClCompile Include="src\gl46\dx9_dispatch.c" />
+    <ClCompile Include="src\gl46\gl46_driver.c" />
+    <ClCompile Include="src\gl46\gl_state.c" />
+    <ClCompile Include="src\gl46\gl_impl.c" />
     <ClCompile Include="src\mesa_compat.c" />
     <ClCompile Include="src\gl_legacy_stubs.c" />
   </ItemGroup>
@@ -506,6 +509,9 @@
     <ClInclude Include="src\gl46\swap_chain.h" />
     <ClInclude Include="src\gl46\pixel_format_provider.h" />
     <ClInclude Include="src\gl46\dx9_dispatch.h" />
+    <ClInclude Include="src\gl46\gl46_driver.h" />
+    <ClInclude Include="src\gl46\gl_state.h" />
+    <ClInclude Include="src\gl46\gl_impl.h" />
     <ClInclude Include="src\mesa_compat.h" />
   </ItemGroup>
   <ItemGroup>

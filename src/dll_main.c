@@ -38,6 +38,7 @@
 #include "dll_main.h"
 
 #include "gld_driver.h"
+#include "gld_diag.h"
 
 #include "mmsystem.h"
 
@@ -165,7 +166,7 @@ BOOL ReadINIFile(
 
 	// Read settings from private INI file.
 	// Note that defaults are contained in the calls.
-	ini.dwDriver = GetPrivateProfileInt(szSectionName, "dwDriver", 2, szINIFile);
+	ini.dwDriver = GetPrivateProfileInt(szSectionName, "dwDriver", 3, szINIFile);
 	ini.bMipmapping = GetPrivateProfileInt(szSectionName, "bMipmapping", 1, szINIFile);
 	ini.bMultitexture = GetPrivateProfileInt(szSectionName, "bMultitexture", 1, szINIFile);
 	ini.bWaitForRetrace = GetPrivateProfileInt(szSectionName, "bWaitForRetrace", 0, szINIFile);
@@ -203,16 +204,20 @@ BOOL dllReadRegistry(
 	// Read settings from INI file, if available
     bValidINIFound = FALSE;
 	if (ReadINIFile(hInstance)) {
-		const char *szRendering[3] = {
+		const char *szRendering[4] = {
 			"SciTech Software Renderer",
 			"Direct3D MMX Software Renderer",
-			"Direct3D Hardware Renderer"
+			"Direct3D Hardware Renderer",
+			"OpenGL 4.6 Core Renderer"
 		};
 		// Set globals
 		glb.bPrimary = 1;
 		glb.bHardware = (ini.dwDriver == 2) ? 1 : 0;
 		strcpy(glb.szDDName, "Primary");
-		strcpy(glb.szD3DName, szRendering[ini.dwDriver]);
+		if (ini.dwDriver <= 3)
+			strcpy(glb.szD3DName, szRendering[ini.dwDriver]);
+		else
+			strcpy(glb.szD3DName, szRendering[2]);
 		glb.dwRendering = ini.dwDriver;
 		glb.bUseMipmaps = ini.bMipmapping;
 		glb.bMultitexture = ini.bMultitexture;
@@ -601,6 +606,7 @@ BOOL gldInitDriver(void)
 		"Mesa Software",
 		"Direct3D RGB SW",
 		"Direct3D HW",
+		"OpenGL 4.6 Core",
 	};
     static BOOL bWarnOnce = FALSE;
 
@@ -615,13 +621,15 @@ BOOL gldInitDriver(void)
 
 	// Read registry or INI file settings
 	if (!dllReadRegistry(hInstanceDll)) {
-        if (!bWarnOnce)
-			MessageBox( NULL, "GLDirect has not been configured.\n\n"
-						  "Please run the configuration program\n"
-                          "before using GLDirect with applications.\n",
-						  "GLDirect", MB_OK | MB_ICONWARNING);
-        bWarnOnce = TRUE;
-        return FALSE;
+		// No valid INI found — default to GL46 backend instead of failing.
+		gldLogMessage(GLDLOG_SYSTEM, "No INI file found, defaulting to GL46 backend (dwDriver=3)\n");
+		glb.dwDriver    = GLDS_DRIVER_GL46;
+		glb.dwRendering = GLDS_DRIVER_GL46;
+		glb.bPrimary    = 1;
+		glb.bHardware   = 0;
+		strcpy(glb.szDDName, "Primary");
+		strcpy(glb.szD3DName, "OpenGL 4.6 Core");
+		dwLogging       = 1;  // Enable normal logging by default
 	}
 
 	// Must do this as early as possible.
@@ -662,7 +670,8 @@ BOOL gldInitDriver(void)
 	gldLogPrintf(GLDLOG_SYSTEM, "DirectDraw device: %s", glb.szDDName);
 	gldLogPrintf(GLDLOG_SYSTEM, "Direct3D driver  : %s", glb.szD3DName);
 
-	gldLogPrintf(GLDLOG_SYSTEM, "Rendering type   : %s", szRendering[glb.dwRendering]);
+	gldLogPrintf(GLDLOG_SYSTEM, "Rendering type   : %s",
+		(glb.dwRendering <= 3) ? szRendering[glb.dwRendering] : "Unknown");
 
 	gldLogPrintf(GLDLOG_SYSTEM, "Multithreaded    : %s", glb.bMultiThreaded ? "Enabled" : "Disabled");
 	gldLogPrintf(GLDLOG_SYSTEM, "Display resources: %s", glb.bDirectDrawPersistant ? "Persistant" : "Instanced");
@@ -711,6 +720,9 @@ __except(EXCEPTION_EXECUTE_HANDLER) {
 
 	// Close the log file
 	gldLogClose();
+
+	// Close the diagnostic log file
+	gldDiagLogClose();
 }
 
 // ***********************************************************************
@@ -725,11 +737,15 @@ int WINAPI DllMain(
         // Cache DLL instance handle
         hInstanceDll = hInstance;
 
+        gldDiagLog("DllMain: DLL_PROCESS_ATTACH");
+
         // Flag that callback driver has yet to be initialized
         bInitialized = bExited = FALSE;
 
 		// Init defaults
+		gldDiagLog("DllMain: calling gldInitGlobals");
 		gldInitGlobals();
+		gldDiagLog("DllMain: gldInitGlobals done");
 
         // Defer rest of DLL initialization to 1st WGL function call
 		break;
@@ -799,18 +815,33 @@ BOOL gldValidate()
 	char *szCaption = "SciTech GLDirect Driver";
 	UINT uType = MB_OK | MB_ICONEXCLAMATION;
 
-	// (Re)build pixelformat list
-	if (glb.bPixelformatsDirty)
+	// Fast path: skip logging entirely when already validated and no work needed
+	if (bDriverValidated && bInitialized && !glb.bPixelformatsDirty) {
+		return TRUE;
+	}
+
+	gldDiagLog("gldValidate: enter (bInitialized=%d, bDriverValidated=%d, bPixelformatsDirty=%d)",
+		bInitialized, bDriverValidated, glb.bPixelformatsDirty);
+
+	// (Re)build pixelformat list only if driver is already initialized
+	if (glb.bPixelformatsDirty && bInitialized) {
+		gldDiagLog("gldValidate: rebuilding pixelformat list");
+		glb.bPixelformatsDirty = FALSE;
 		_gldDriver.BuildPixelformatList();
+		gldDiagLog("gldValidate: pixelformat list rebuilt");
+	}
 
 	// Check to see if we have already validated
-	if (bDriverValidated && bInitialized)
+	if (bDriverValidated && bInitialized) {
 		return TRUE;
+	}
 
     // Since all (most) the WGL functions must be validated at this point,
     // this also insure that the callback driver is completely initialized.
-    if (!bInitialized)
+    if (!bInitialized) {
+		gldDiagLog("gldValidate: calling gldInitDriver");
         if (!gldInitDriver()) {
+			gldDiagLog("gldValidate: gldInitDriver FAILED");
 			MessageBox(NULL,
 				"The GLDirect driver could not initialize.\n\n"
 				"Please run the configuration program to\n"
@@ -818,6 +849,8 @@ BOOL gldValidate()
                 "re-run the installation program.", szCaption, uType);
 			_exit(1); // Bail
         }
+		gldDiagLog("gldValidate: gldInitDriver succeeded");
+	}
 
 	return TRUE;
 }

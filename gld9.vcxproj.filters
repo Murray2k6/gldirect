@@ -127,6 +127,15 @@
     <ClCompile Include="src\gl46\dx9_dispatch.c">
       <Filter>src\gl46</Filter>
     </ClCompile>
+    <ClCompile Include="src\gl46\gl46_driver.c">
+      <Filter>src\gl46</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gl46\gl_state.c">
+      <Filter>src\gl46</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gl46\gl_impl.c">
+      <Filter>src\gl46</Filter>
+    </ClCompile>
     <ClCompile Include="src\mesa_compat.c">
       <Filter>core</Filter>
     </ClCompile>
@@ -310,6 +319,15 @@
       <Filter>src\gl46</Filter>
     </ClInclude>
     <ClInclude Include="src\gl46\dx9_dispatch.h">
+      <Filter>src\gl46</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gl46\gl46_driver.h">
+      <Filter>src\gl46</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gl46\gl_state.h">
+      <Filter>src\gl46</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gl46\gl_impl.h">
       <Filter>src\gl46</Filter>
     </ClInclude>
     <ClInclude Include="src\mesa_compat.h">

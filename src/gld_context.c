@@ -39,6 +39,7 @@
 
 #include "gld_driver.h"
 #include "mesa_compat.h"
+#include "gl46/context_manager.h"
 
 void gldExitDriver(void);
 BOOL gldValidate();
@@ -646,15 +647,9 @@ BOOL gldCreateContextBuffers(
 		
 	}
 
-	_gldDriver.CreateDrawable(lpCtx, glb.bDirectDrawPersistant, glb.bPersistantBuffers);
-
-	gldLogPrintf(GLDLOG_INFO, "Window: w=%i, h=%i (%s)",
-							lpCtx->dwWidth,
-							lpCtx->dwHeight,
-							lpCtx->bFullscreen ? "fullscreen" : "windowed");
-
 	//
-	//	Initialise the GLD_glContext (replaces Mesa context/visual/framebuffer)
+	//	Initialise the GLD_glContext BEFORE CreateDrawable
+	//	(CreateDrawable will populate hRC, version, etc.)
 	//
 	{
 		GLD_glContext *gl46 = &lpCtx->gl46Ctx;
@@ -665,7 +660,7 @@ BOOL gldCreateContextBuffers(
 		// Cache window/DC handles in the GL context
 		gl46->hDC  = lpCtx->hDC;
 		gl46->hWnd = lpCtx->hWnd;
-		gl46->hRC  = NULL; // Will be set by Context_Manager (task 3.2)
+		gl46->hRC  = NULL; // Will be set by CreateDrawable -> gldCreateContext46
 
 		// Initialise viewport to match window dimensions
 		gl46->viewportX      = 0;
@@ -695,11 +690,18 @@ BOOL gldCreateContextBuffers(
 		gl46->shaderCache       = NULL;
 		gl46->fixedFuncCache    = NULL;
 
-		// Clip control and version will be set during context creation (task 3.2)
+		// Clip control and version will be set during CreateDrawable
 		gl46->bClipControlAvailable = FALSE;
 		gl46->glVersionMajor = 0;
 		gl46->glVersionMinor = 0;
 	}
+
+	_gldDriver.CreateDrawable(lpCtx, glb.bDirectDrawPersistant, glb.bPersistantBuffers);
+
+	gldLogPrintf(GLDLOG_INFO, "Window: w=%i, h=%i (%s)",
+							lpCtx->dwWidth,
+							lpCtx->dwHeight,
+							lpCtx->bFullscreen ? "fullscreen" : "windowed");
 
 	//
 	// Allocate the legacy Mesa GLcontext for the DX9 backend
@@ -784,6 +786,21 @@ HGLRC gldCreateContext(
 		return NULL;
 
 	gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContext for HDC=%X, ThreadId=%X", a, dwThreadId);
+
+	// Check if a context already exists for this HDC or window.
+	// Apps like Dolphin may call wglCreateContext repeatedly on the same HDC;
+	// return the existing context to prevent an infinite create loop.
+	{
+		HWND hWndCheck = WindowFromDC(a);
+		for (i=0; i<GLD_MAX_CONTEXTS; i++) {
+			if (ctxlist[i].bAllocated &&
+				(ctxlist[i].hDC == a || (hWndCheck && ctxlist[i].hWnd == hWndCheck))) {
+				hGLRC = (HGLRC)(INT_PTR)(i+1);
+				gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContext: reusing existing HGLRC=%d for HDC=%X", (int)(INT_PTR)hGLRC, a);
+				return hGLRC;
+			}
+		}
+	}
 
 	// Find next free context.
 	// Also ensure that only one Fullscreen context is created at any one time.
@@ -984,8 +1001,11 @@ BOOL gldMakeCurrent(
 	lpCtx->gl46Ctx.hDC  = lpCtx->hDC;
 	lpCtx->gl46Ctx.hWnd = lpCtx->hWnd;
 
-	// TODO: wglMakeCurrent on the real OGL context will be done in task 3.2/3.3
-	// For now, just update viewport state if the window was resized
+	// Make the real GL46 context current on the GPU
+	if (lpCtx->gl46Ctx.hRC) {
+		gldMakeCurrent46(lpCtx->hDC, lpCtx->gl46Ctx.hRC);
+	}
+
 	if (bNeedResize) {
 		lpCtx->gl46Ctx.viewportWidth  = (GLsizei)(lpCtx->rcScreenRect.right - lpCtx->rcScreenRect.left);
 		lpCtx->gl46Ctx.viewportHeight = (GLsizei)(lpCtx->rcScreenRect.bottom - lpCtx->rcScreenRect.top);
@@ -1010,9 +1030,13 @@ BOOL gldMakeCurrent(
 		lpCtx->gl46Ctx.viewportY      = 0;
 		lpCtx->gl46Ctx.viewportWidth  = (GLsizei)lpCtx->dwWidth;
 		lpCtx->gl46Ctx.viewportHeight = (GLsizei)lpCtx->dwHeight;
-		// Send a Paint message to the app by invalidating and updating the window
-		InvalidateRect(lpCtx->hWnd, NULL, TRUE);
-		UpdateWindow(lpCtx->hWnd);
+		// Post a paint message asynchronously to avoid cross-thread deadlock.
+		// UpdateWindow() sends WM_PAINT synchronously which deadlocks when
+		// called from a worker thread on a window owned by the main thread.
+		if (lpCtx->hWnd) {
+			InvalidateRect(lpCtx->hWnd, NULL, TRUE);
+			PostMessage(lpCtx->hWnd, WM_PAINT, 0, 0);
+		}
 	}
 
 	lpCtx->bHasBeenCurrent = TRUE;

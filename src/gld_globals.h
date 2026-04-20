@@ -54,6 +54,7 @@ typedef enum {
 	GLDS_DRIVER_MESA_SW			= 0,	// Mesa SW rendering
 	GLDS_DRIVER_REF				= 1,	// Direct3D Reference Rasteriser
 	GLDS_DRIVER_HAL				= 2,	// Direct3D HW rendering
+	GLDS_DRIVER_GL46			= 3,	// OpenGL 4.6 core profile backend
 } GLDS_DRIVER;
 
 typedef enum {

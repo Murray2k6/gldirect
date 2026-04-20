@@ -27,7 +27,9 @@
 * Language:     ANSI C
 * Environment:  Windows 9x/NT/2000/XP (Win32)
 *
-* Description:  OpenGL 4.6 core profile context creation and management via WGL.
+* Description:  GL46 context creation and management via Direct3D 9.
+*               This is an OpenGL-to-DX9 wrapper — no real OpenGL context
+*               is created. All rendering is translated to D3D9 calls.
 *
 *********************************************************************************/
 
@@ -35,7 +37,7 @@
 #define __GL46_CONTEXT_MANAGER_H
 
 #include <windows.h>
-#include <glad/gl.h>
+#include <d3d9.h>
 
 /*
  * GLD_ctx is defined in gld_context.h.  We need the full definition
@@ -52,50 +54,42 @@ extern "C" {
 #endif
 
 /*
- * Create an OpenGL 4.6 core profile context on the given device context.
- *
- * Steps:
- *   1. Create a temporary legacy context and make it current.
- *   2. Load WGL extensions via gladLoadWGL (specifically wglCreateContextAttribsARB).
- *   3. Request a 4.6 core forward-compatible context.
- *   4. If 4.6 fails, fall back through 4.5, 4.4, ... 3.3 core.
- *   5. Delete the temporary context.
- *   6. Make the new context current and load GL 4.6 function pointers via gladLoadGL.
- *   7. Validate critical GL function pointers.
- *
- * On success, populates glCtx->glVersionMajor and glCtx->glVersionMinor with
- * the negotiated version and returns the HGLRC.
- * On failure, returns NULL.
+ * Initialize the D3D9 layer for the GL46 backend.
+ * Loads d3d9.dll and obtains Direct3DCreate9.
+ * Must be called before gldCreateContext46.
+ * Returns TRUE on success, FALSE on failure.
+ */
+BOOL gldInitContext46(void);
+
+/*
+ * Shut down the D3D9 layer and release all persistent resources.
+ * Call during DLL cleanup / process detach.
+ */
+void gldShutdownContext46(void);
+
+/*
+ * Create a D3D9 device for the GL46 context.
  *
  * Parameters:
- *   hDC   — device context to create the GL context on.
- *   pMajor — [out] receives the negotiated major GL version (may be NULL).
- *   pMinor — [out] receives the negotiated minor GL version (may be NULL).
+ *   hDC    — device context (used to find the target window).
+ *   pMajor — [out] receives the emulated major GL version (may be NULL).
+ *   pMinor — [out] receives the emulated minor GL version (may be NULL).
+ *
+ * Returns a non-NULL dummy HGLRC on success, NULL on failure.
+ * The actual D3D9 device is stored internally and accessed via gldGetD3DDevice46().
  */
 HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor);
 
 /*
- * Make an OpenGL context current on the given device context.
+ * Make context current — no-op for DX9 wrapper since D3D9 doesn't
+ * have the concept of "make current".
  *
- * Calls wglMakeCurrent to bind the real OpenGL context, then updates
- * the per-thread current context pointer in the GLD_ctx slot array
- * via gldSetCurrentContext.
- *
- * Parameters:
- *   hDC  — device context to bind the GL context to.
- *   hRC  — the OpenGL rendering context handle (from gldCreateContext46).
- *
- * Returns TRUE on success, FALSE on failure.
+ * Returns TRUE always.
  */
 BOOL gldMakeCurrent46(HDC hDC, HGLRC hRC);
 
 /*
- * Delete an OpenGL context and release all associated GL resources.
- *
- * Iterates and deletes all OpenGL resources owned by the context
- * (shader program cache, buffer/VAO cache, texture cache, FBO cache),
- * then calls wglDeleteContext on the real handle, then clears the
- * context slot's GL state.
+ * Delete the GL46 context and release associated resources.
  *
  * Parameters:
  *   ctx — pointer to the GLD_ctx slot that owns the context.
@@ -104,8 +98,26 @@ BOOL gldMakeCurrent46(HDC hDC, HGLRC hRC);
  */
 BOOL gldDeleteContext46(GLD_ctx *ctx);
 
+/*
+ * Get the D3D9 device pointer for use by other GL46 modules.
+ * Returns NULL if no device has been created yet.
+ */
+IDirect3DDevice9* gldGetD3DDevice46(void);
+
+/*
+ * Ensure the D3D9 device exists. Creates it lazily on the calling thread.
+ * Returns TRUE on success, FALSE on failure.
+ */
+BOOL _gldEnsureDevice(HWND hWnd);
+
+/*
+ * Get the D3D9 interface pointer for use by other GL46 modules.
+ * Returns NULL if D3D9 has not been initialized.
+ */
+IDirect3D9* gldGetD3D46(void);
+
 #ifdef  __cplusplus
 }
 #endif
 
-#endif
+#endif /* __GL46_CONTEXT_MANAGER_H */

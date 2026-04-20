@@ -38,6 +38,7 @@
 #include "gld_wgl.h"
 #include "gld_driver.h"
 #include "mesa_compat.h"
+#include "gld_diag.h"
 
 #include "glu.h"	// MUST USE MICROSOFT'S GLU32!
 
@@ -265,7 +266,7 @@ int APIENTRY _GLD_WGL_EXPORT(ChoosePixelFormat)(
 {
 	GLD_pixelFormat			*lpPF = glb.lpPF;
 
-    PIXELFORMATDESCRIPTOR	ppfdBest;
+	gldDiagLog("ChoosePixelFormat: HDC=%p", (void*)(INT_PTR)a);    PIXELFORMATDESCRIPTOR	ppfdBest;
     int						i;
 	int						bestIndex = -1;
     int						numPixelFormats;
@@ -590,12 +591,15 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(CreateContext)(
 {
 	int ipf;
 
+	gldDiagLog("wglCreateContext: HDC=%p", (void*)(INT_PTR)a);
+
 	// Validate license
 	if (!gldValidate())
 		return 0;
 
 	// Check that the current PFD is valid
 	ipf = gldGetPixelFormat();
+	gldDiagLog("wglCreateContext: current PF=%d", ipf);
 	if (!IsValidPFD(ipf))
 		return (HGLRC)0;
 
@@ -621,6 +625,8 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(CreateLayerContext)(
 BOOL APIENTRY _GLD_WGL_EXPORT(DeleteContext)(
 	HGLRC a)
 {
+	gldDiagLog("wglDeleteContext: HGLRC=%d", (int)(INT_PTR)a);
+
 	// Validate license
 	if (!gldValidate())
 		return FALSE;
@@ -657,6 +663,8 @@ int APIENTRY _GLD_WGL_EXPORT(DescribePixelFormat)(
 	LPPIXELFORMATDESCRIPTOR d)
 {
 	UINT nSize;
+
+	gldDiagLog("DescribePixelFormat: HDC=%p, index=%d, pfd=%s", (void*)(INT_PTR)a, b, d ? "non-null" : "NULL");
 
 	// Validate license
 	if (!gldValidate())
@@ -755,12 +763,15 @@ PROC APIENTRY _GLD_WGL_EXPORT(GetProcAddress)(
 	LPCSTR a)
 {
 	PROC gldGetProcAddressD3D(LPCSTR a);
+	PROC result;
 
 	// Validate license
 	if (!gldValidate())
 		return NULL;
 
-	return _gldDriver.wglGetProcAddress(a);
+	result = _gldDriver.wglGetProcAddress(a);
+	gldDiagLog("wglGetProcAddress: \"%s\" -> %s", a ? a : "(null)", result ? "found" : "NULL");
+	return result;
 }
 
 // ***********************************************************************
@@ -769,6 +780,8 @@ BOOL APIENTRY _GLD_WGL_EXPORT(MakeCurrent)(
 	HDC a,
 	HGLRC b)
 {
+	gldDiagLog("wglMakeCurrent: HDC=%p, HGLRC=%d", (void*)(INT_PTR)a, (int)(INT_PTR)b);
+
 	// Validate license
 	if (!gldValidate())
 		return FALSE;
@@ -815,6 +828,8 @@ BOOL APIENTRY _GLD_WGL_EXPORT(SetPixelFormat)(
 	int b,
 	CONST PIXELFORMATDESCRIPTOR *c)
 {
+	gldDiagLog("SetPixelFormat: HDC=%p, format=%d", (void*)(INT_PTR)a, b);
+
 	// Validate license
 	if (!gldValidate())
 		return FALSE;

@@ -812,8 +812,20 @@ BOOL gldCreatePrivateGlobals_DX(void)
 {
 	ZeroMemory(&dx9Globals, sizeof(dx9Globals));
 
-	// Load d3d9.dll
-	dx9Globals.hD3D9DLL = LoadLibrary("D3D9.DLL");
+	// Load d3d9.dll from game directory (supports local d3d9.dll wrappers)
+	{
+		char dllPath[MAX_PATH];
+		char modulePath[MAX_PATH];
+		char *lastSlash;
+		GetModuleFileName(NULL, modulePath, MAX_PATH);
+		lastSlash = strrchr(modulePath, '\\');
+		if (lastSlash) {
+			*(lastSlash + 1) = '\0';
+			strcpy(dllPath, modulePath);
+			strcat(dllPath, "d3d9.dll");
+			dx9Globals.hD3D9DLL = LoadLibraryA(dllPath);
+		}
+	}
 	if (dx9Globals.hD3D9DLL == NULL)
 		return FALSE;
 

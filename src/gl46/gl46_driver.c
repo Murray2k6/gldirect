@@ -176,12 +176,11 @@ BOOL gldCreateDrawable_GL46(
 	BOOL bPersistantBuffers)
 {
 	HGLRC hRC;
-	HWND hWnd;
 
 	gldLogPrintf(GLDLOG_SYSTEM, "GL46: CreateDrawable for HDC=%X", ctx->hDC);
 
 	/*
-	 * Create the GL46 context (sets up D3D9 interface).
+	 * Create the GL46 context with full D3D9 device creation.
 	 */
 	hRC = gldCreateContext46(ctx->hDC,
 		&ctx->gl46Ctx.glVersionMajor,
@@ -191,21 +190,18 @@ BOOL gldCreateDrawable_GL46(
 		return FALSE;
 	}
 
-	/* Store the dummy HGLRC sentinel */
+	/* Store the HGLRC */
 	ctx->gl46Ctx.hRC = hRC;
 
-	/*
-	 * Create the D3D9 device eagerly so GL calls work immediately.
-	 * The device needs the window handle from the context.
-	 */
-	hWnd = ctx->hWnd ? ctx->hWnd : WindowFromDC(ctx->hDC);
-	if (!hWnd) hWnd = GetDesktopWindow();
+	/* Verify device exists */
 	if (!gldGetD3DDevice46()) {
-		if (!_gldEnsureDevice(hWnd)) {
-			gldLogMessage(GLDLOG_ERROR, "GL46: Failed to create D3D9 device\n");
-			return FALSE;
-		}
+		gldLogMessage(GLDLOG_ERROR, "GL46: No D3D9 device after context creation\n");
+		return FALSE;
 	}
+
+	gldLogPrintf(GLDLOG_SYSTEM, "GL46: D3D9 context ready (GL %d.%d), device=%p",
+		ctx->gl46Ctx.glVersionMajor, ctx->gl46Ctx.glVersionMinor,
+		(void*)gldGetD3DDevice46());
 
 	gldLogPrintf(GLDLOG_SYSTEM, "GL46: D3D9 context ready (emulating GL %d.%d), device=%s",
 		ctx->gl46Ctx.glVersionMajor, ctx->gl46Ctx.glVersionMinor,
@@ -299,18 +295,14 @@ BOOL gldSwapBuffers_GL46(
 	HDC hDC,
 	HWND hWnd)
 {
-	IDirect3DDevice9 *pDev;
+	IDirect3DDevice9 *pDev = gldGetD3DDevice46();
 
-	// Lazy device creation — create on the render thread to avoid deadlocks
-	if (!gldGetD3DDevice46()) {
-		HWND hw = hWnd ? hWnd : (ctx ? ctx->hWnd : NULL);
-		if (!hw) hw = WindowFromDC(hDC);
-		if (!_gldEnsureDevice(hw))
-			return TRUE;
+	if (!pDev) {
+		gldLogMessage(GLDLOG_ERROR, "GL46: SwapBuffers called with no D3D9 device\n");
+		return FALSE;
 	}
 
-	pDev = gldGetD3DDevice46();
-	if (pDev) {
+	{
 		HRESULT hr;
 
 		// End the current scene

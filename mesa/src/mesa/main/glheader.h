@@ -139,8 +139,10 @@
 typedef void *HGLRC;
 typedef void *HDC;
 #endif
-typedef int (GLAPIENTRY *PROC)();
-typedef unsigned long COLORREF;
+#ifndef _WINDOWS_
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 #endif
 
 

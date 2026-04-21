@@ -70,12 +70,27 @@ static GLD_gl46_dx9_globals gl46Globals;
 
 BOOL gldInitContext46(void)
 {
+    char dllPath[MAX_PATH];
+    char modulePath[MAX_PATH];
+    char *lastSlash;
+
     ZeroMemory(&gl46Globals, sizeof(gl46Globals));
 
-    // Load d3d9.dll
-    gl46Globals.hD3D9DLL = LoadLibrary("D3D9.DLL");
+    // Load d3d9.dll from the game directory (supports local d3d9.dll wrappers)
+    GetModuleFileName(NULL, modulePath, MAX_PATH);
+    lastSlash = strrchr(modulePath, '\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = '\0';
+        strcpy(dllPath, modulePath);
+        strcat(dllPath, "d3d9.dll");
+        gl46Globals.hD3D9DLL = LoadLibraryA(dllPath);
+        if (gl46Globals.hD3D9DLL) {
+            gldLogPrintf(GLDLOG_SYSTEM, "GL46: Loaded d3d9.dll from %s", dllPath);
+        }
+    }
+
     if (gl46Globals.hD3D9DLL == NULL) {
-        gldLogMessage(GLDLOG_ERROR, "GL46: Failed to load D3D9.DLL\n");
+        gldLogMessage(GLDLOG_ERROR, "GL46: No d3d9.dll found in game directory\n");
         return FALSE;
     }
 
@@ -126,32 +141,142 @@ void gldShutdownContext46(void)
 
 // ***********************************************************************
 // Create a D3D9 device for the GL46 context.
-// This replaces the old gldCreateContext46 which incorrectly tried to
-// create a real OpenGL context.
+// Full device creation — no lazy, no dummy handles.
 // ***********************************************************************
 
 HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor)
 {
-    HWND hWnd;
+    IDirect3DDevice9        *pDev = NULL;
+    D3DPRESENT_PARAMETERS   d3dpp;
+    D3DDISPLAYMODE          d3ddm;
+    D3DCAPS9                d3dCaps;
+    D3DADAPTER_IDENTIFIER9  d3dIdent;
+    DWORD                   dwBehaviourFlags;
+    HRESULT                 hr;
+    HWND                    hWnd;
 
-    // Try to load D3D9 if not already loaded — not fatal if it fails
+    // Load D3D9 if not already loaded
     if (!gl46Globals.fnDirect3DCreate9) {
-        gldInitContext46();
+        if (!gldInitContext46()) {
+            gldLogMessage(GLDLOG_ERROR, "GL46: D3D9 not available\n");
+            return NULL;
+        }
     }
 
-    // Create the D3D9 device now — games call glClear before SwapBuffers
+    // Ensure we have the IDirect3D9 interface
+    if (!gl46Globals.pD3D) {
+        gl46Globals.pD3D = gl46Globals.fnDirect3DCreate9(D3D_SDK_VERSION);
+        if (!gl46Globals.pD3D) {
+            gldLogMessage(GLDLOG_ERROR, "GL46: Direct3DCreate9 failed\n");
+            return NULL;
+        }
+        gl46Globals.bDirect3D = TRUE;
+    }
+
+    // Get the window handle
     hWnd = WindowFromDC(hDC);
-    if (!gl46Globals.pDev) {
-        _gldEnsureDevice(hWnd);
+    if (!hWnd) hWnd = GetDesktopWindow();
+
+    // If device already exists, reuse it
+    if (gl46Globals.pDev) {
+        if (pMajor) *pMajor = 4;
+        if (pMinor) *pMinor = 6;
+        return (HGLRC)(INT_PTR)1;
     }
 
-    // Report the emulated GL version
+    // Get display mode
+    hr = IDirect3D9_GetAdapterDisplayMode(gl46Globals.pD3D, glb.dwAdapter, &d3ddm);
+    if (FAILED(hr)) {
+        gldLogPrintf(GLDLOG_ERROR, "GL46: GetAdapterDisplayMode failed (0x%08X)", hr);
+        return NULL;
+    }
+
+    // Get device caps
+    hr = IDirect3D9_GetDeviceCaps(gl46Globals.pD3D, glb.dwAdapter, D3DDEVTYPE_HAL, &d3dCaps);
+    if (FAILED(hr)) {
+        gldLogPrintf(GLDLOG_ERROR, "GL46: GetDeviceCaps failed (0x%08X)", hr);
+        return NULL;
+    }
+
+    // Set up presentation parameters
+    ZeroMemory(&d3dpp, sizeof(d3dpp));
+    d3dpp.Windowed               = TRUE;
+    d3dpp.SwapEffect             = D3DSWAPEFFECT_DISCARD;
+    d3dpp.BackBufferFormat        = d3ddm.Format;
+    d3dpp.BackBufferCount         = 1;
+    d3dpp.EnableAutoDepthStencil  = TRUE;
+    d3dpp.AutoDepthStencilFormat  = D3DFMT_D24S8;
+    d3dpp.hDeviceWindow           = hWnd;
+    d3dpp.PresentationInterval    = D3DPRESENT_INTERVAL_DEFAULT;
+
+    if (!glb.bWaitForRetrace) {
+        if (d3dCaps.PresentationIntervals & D3DPRESENT_INTERVAL_IMMEDIATE)
+            d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    }
+
+    // Vertex processing + multithreaded
+    dwBehaviourFlags = (d3dCaps.DevCaps & D3DDEVCAPS_HWTRANSFORMANDLIGHT) ?
+        D3DCREATE_HARDWARE_VERTEXPROCESSING : D3DCREATE_SOFTWARE_VERTEXPROCESSING;
+    dwBehaviourFlags |= D3DCREATE_MULTITHREADED;
+    if (!glb.bFastFPU)
+        dwBehaviourFlags |= D3DCREATE_FPU_PRESERVE;
+
+    // Create the device
+    hr = IDirect3D9_CreateDevice(gl46Globals.pD3D,
+        glb.dwAdapter,
+        D3DDEVTYPE_HAL,
+        hWnd,
+        dwBehaviourFlags,
+        &d3dpp,
+        &pDev);
+
+    if (FAILED(hr) || !pDev) {
+        gldLogPrintf(GLDLOG_ERROR, "GL46: CreateDevice failed (0x%08X)", hr);
+        return NULL;
+    }
+
+    // Store the device
+    gl46Globals.pDev = pDev;
+    gl46Globals.bDirect3DDevice = TRUE;
+
+    // Begin the first scene
+    IDirect3DDevice9_BeginScene(pDev);
+
+    // Set default render states
+    IDirect3DDevice9_SetRenderState(pDev, D3DRS_LIGHTING, FALSE);
+    IDirect3DDevice9_SetRenderState(pDev, D3DRS_ZENABLE, D3DZB_TRUE);
+    IDirect3DDevice9_SetRenderState(pDev, D3DRS_CULLMODE, D3DCULL_NONE);
+    IDirect3DDevice9_SetRenderState(pDev, D3DRS_DITHERENABLE, TRUE);
+    IDirect3DDevice9_SetRenderState(pDev, D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
+    IDirect3DDevice9_SetRenderState(pDev, D3DRS_CLIPPING, TRUE);
+
+    // Set identity view matrix
+    {
+        D3DMATRIX identity;
+        ZeroMemory(&identity, sizeof(identity));
+        identity._11 = identity._22 = identity._33 = identity._44 = 1.0f;
+        IDirect3DDevice9_SetTransform(pDev, D3DTS_VIEW, &identity);
+        IDirect3DDevice9_SetTransform(pDev, D3DTS_WORLD, &identity);
+        IDirect3DDevice9_SetTransform(pDev, D3DTS_PROJECTION, &identity);
+    }
+
+    // Log adapter info
+    if (SUCCEEDED(IDirect3D9_GetAdapterIdentifier(gl46Globals.pD3D, glb.dwAdapter, 0, &d3dIdent))) {
+        gldLogPrintf(GLDLOG_SYSTEM, "GL46: GPU: %s", d3dIdent.Description);
+        gldLogPrintf(GLDLOG_SYSTEM, "GL46: Driver: %s %d.%d.%02d.%d",
+            d3dIdent.Driver,
+            HIWORD(d3dIdent.DriverVersion.HighPart),
+            LOWORD(d3dIdent.DriverVersion.HighPart),
+            HIWORD(d3dIdent.DriverVersion.LowPart),
+            LOWORD(d3dIdent.DriverVersion.LowPart));
+    }
+
+    gldLogPrintf(GLDLOG_SYSTEM, "GL46: D3D9 device created: %p, HWND=%p, %ux%u",
+        (void*)pDev, (void*)hWnd, d3dpp.BackBufferWidth, d3dpp.BackBufferHeight);
+
+    // Report emulated GL version
     if (pMajor) *pMajor = 4;
     if (pMinor) *pMinor = 6;
-
-    gldLogPrintf(GLDLOG_SYSTEM,
-        "GL46: Context created (emulating GL 4.6), D3D9 device=%p",
-        (void*)gl46Globals.pDev);
 
     return (HGLRC)(INT_PTR)1;
 }

@@ -39,6 +39,7 @@
 
 #include "gld_driver.h"
 #include "gld_diag.h"
+#include "mesa_proxy.h"
 
 #include "mmsystem.h"
 
@@ -708,6 +709,9 @@ void gldExitDriver(void)
     // DDraw objects may be invalid when DLL unloads.
 __try {
 
+	// Shut down Mesa proxy
+	mesaProxyShutdown();
+
 	// Clean-up sequence (moved from DLL_PROCESS_DETACH)
 	gldReleasePixelFormatList();
 	gldDeleteContextState();
@@ -746,6 +750,9 @@ int WINAPI DllMain(
 		gldDiagLog("DllMain: calling gldInitGlobals");
 		gldInitGlobals();
 		gldDiagLog("DllMain: gldInitGlobals done");
+
+		// Initialize Mesa proxy (optional — falls back to GLD if mesa_gl.dll not found)
+		mesaProxyInit();
 
         // Defer rest of DLL initialization to 1st WGL function call
 		break;

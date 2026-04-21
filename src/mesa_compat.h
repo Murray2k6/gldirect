@@ -652,14 +652,15 @@ enum {
 #endif
 
 //---------------------------------------------------------------------------
-// GET_CURRENT_CONTEXT
+// GET_CURRENT_CONTEXT — use Mesa's real glapi context mechanism
 //---------------------------------------------------------------------------
 
-struct __GLcontextRec;
-struct __GLcontextRec* _mesa_compat_get_current_context(void);
+/* _glapi_Context is the global context pointer from Mesa's glapi.c */
+extern void *_glapi_Context;
+extern void *_glapi_get_context(void);
 
 #define GET_CURRENT_CONTEXT(c)  \
-    struct __GLcontextRec *c = _mesa_compat_get_current_context()
+    struct __GLcontextRec *c = (struct __GLcontextRec *) _glapi_Context
 
 //---------------------------------------------------------------------------
 // Forward declarations for sub-structs
@@ -1375,8 +1376,9 @@ void GLAPIENTRY _mesa_save_CallLists(GLsizei n, GLenum type, const GLvoid *lists
 void GLAPIENTRY _mesa_save_EvalMesh1(GLenum mode, GLint i1, GLint i2);
 void GLAPIENTRY _mesa_save_EvalMesh2(GLenum mode, GLint i1, GLint i2, GLint j1, GLint j2);
 
-/* Context current setter */
-void _mesa_compat_set_current_context(GLcontext *ctx);
+/* Context current setter — use Mesa's real glapi */
+extern void _glapi_set_context(void *context);
+#define _mesa_compat_set_current_context(ctx) _glapi_set_context((void*)(ctx))
 
 #ifdef __cplusplus
 }

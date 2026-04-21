@@ -38,7 +38,9 @@
 #include "gld_wgl.h"
 #include "gld_driver.h"
 #include "mesa_compat.h"
+#include "mesa_proxy.h"
 #include "gld_diag.h"
+#include "gl46/context_manager.h"
 
 #include "glu.h"	// MUST USE MICROSOFT'S GLU32!
 
@@ -265,6 +267,10 @@ int APIENTRY _GLD_WGL_EXPORT(ChoosePixelFormat)(
 	CONST PIXELFORMATDESCRIPTOR *ppfd)
 {
 	GLD_pixelFormat			*lpPF = glb.lpPF;
+
+	/* Forward to Mesa if available */
+	if (g_mesaProxy.initialized && g_mesaProxy.wglChoosePixelFormat)
+		return g_mesaProxy.wglChoosePixelFormat(a, ppfd);
 
 	gldDiagLog("ChoosePixelFormat: HDC=%p", (void*)(INT_PTR)a);    PIXELFORMATDESCRIPTOR	ppfdBest;
     int						i;
@@ -591,6 +597,10 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(CreateContext)(
 {
 	int ipf;
 
+	/* Forward to Mesa if available */
+	if (g_mesaProxy.initialized && g_mesaProxy.wglCreateContext)
+		return g_mesaProxy.wglCreateContext(a);
+
 	gldDiagLog("wglCreateContext: HDC=%p", (void*)(INT_PTR)a);
 
 	// Validate license
@@ -625,6 +635,10 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(CreateLayerContext)(
 BOOL APIENTRY _GLD_WGL_EXPORT(DeleteContext)(
 	HGLRC a)
 {
+	/* Forward to Mesa if available */
+	if (g_mesaProxy.initialized && g_mesaProxy.wglDeleteContext)
+		return g_mesaProxy.wglDeleteContext(a);
+
 	gldDiagLog("wglDeleteContext: HGLRC=%d", (int)(INT_PTR)a);
 
 	// Validate license
@@ -663,6 +677,10 @@ int APIENTRY _GLD_WGL_EXPORT(DescribePixelFormat)(
 	LPPIXELFORMATDESCRIPTOR d)
 {
 	UINT nSize;
+
+	/* Forward to Mesa if available */
+	if (g_mesaProxy.initialized && g_mesaProxy.wglDescribePixelFormat)
+		return g_mesaProxy.wglDescribePixelFormat(a, b, c, d);
 
 	gldDiagLog("DescribePixelFormat: HDC=%p, index=%d, pfd=%s", (void*)(INT_PTR)a, b, d ? "non-null" : "NULL");
 
@@ -750,6 +768,10 @@ int APIENTRY _GLD_WGL_EXPORT(GetLayerPaletteEntries)(
 int APIENTRY _GLD_WGL_EXPORT(GetPixelFormat)(
 	HDC a)
 {
+	/* Forward to Mesa if available */
+	if (g_mesaProxy.initialized && g_mesaProxy.wglGetPixelFormat)
+		return g_mesaProxy.wglGetPixelFormat(a);
+
 	// Validate license
 	if (!gldValidate())
 		return 0;
@@ -764,6 +786,15 @@ PROC APIENTRY _GLD_WGL_EXPORT(GetProcAddress)(
 {
 	PROC gldGetProcAddressD3D(LPCSTR a);
 	PROC result;
+
+	/* Forward to Mesa if available */
+	if (g_mesaProxy.initialized) {
+		result = mesaProxyGetProcAddress(a);
+		if (result) {
+			gldDiagLog("wglGetProcAddress: \"%s\" -> Mesa", a ? a : "(null)");
+			return result;
+		}
+	}
 
 	// Validate license
 	if (!gldValidate())
@@ -780,6 +811,10 @@ BOOL APIENTRY _GLD_WGL_EXPORT(MakeCurrent)(
 	HDC a,
 	HGLRC b)
 {
+	/* Forward to Mesa if available */
+	if (g_mesaProxy.initialized && g_mesaProxy.wglMakeCurrent)
+		return g_mesaProxy.wglMakeCurrent(a, b);
+
 	gldDiagLog("wglMakeCurrent: HDC=%p, HGLRC=%d", (void*)(INT_PTR)a, (int)(INT_PTR)b);
 
 	// Validate license
@@ -828,6 +863,10 @@ BOOL APIENTRY _GLD_WGL_EXPORT(SetPixelFormat)(
 	int b,
 	CONST PIXELFORMATDESCRIPTOR *c)
 {
+	/* Forward to Mesa if available */
+	if (g_mesaProxy.initialized && g_mesaProxy.wglSetPixelFormat)
+		return g_mesaProxy.wglSetPixelFormat(a, b, c);
+
 	gldDiagLog("SetPixelFormat: HDC=%p, format=%d", (void*)(INT_PTR)a, b);
 
 	// Validate license
@@ -929,6 +968,32 @@ BOOL APIENTRY _GLD_WGL_EXPORT(ShareLists)(
 BOOL APIENTRY _GLD_WGL_EXPORT(SwapBuffers)(
 	HDC a)
 {
+	/* When Mesa is active, still use D3D9 for presentation so that
+	 * a d3d9.dll wrapper (dgVoodoo, etc.) can intercept the output. */
+	if (g_mesaProxy.initialized && g_mesaProxy.wglSwapBuffers) {
+		BOOL result;
+		IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+		HWND hWnd = WindowFromDC(a);
+
+		/* Ensure D3D9 device exists — this is what d3d9.dll wrappers intercept */
+		if (!pDev && hWnd) {
+			_gldEnsureDevice(hWnd);
+			pDev = gldGetD3DDevice46();
+		}
+
+		/* Let Mesa do its rendering */
+		result = g_mesaProxy.wglSwapBuffers(a);
+
+		/* Present through D3D9 — the d3d9.dll wrapper sees this */
+		if (pDev) {
+			IDirect3DDevice9_EndScene(pDev);
+			IDirect3DDevice9_Present(pDev, NULL, NULL, hWnd, NULL);
+			IDirect3DDevice9_BeginScene(pDev);
+		}
+
+		return result;
+	}
+
 	// Validate license
 	if (!gldValidate())
 		return FALSE;

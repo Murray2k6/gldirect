@@ -176,7 +176,7 @@
       <AdditionalIncludeDirectories>\private\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>d3d9.lib;d3dx9.lib;dxerr.lib;d3dx9d.lib;glu32.lib;opengl32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d9.lib;glu32.lib;opengl32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)opengl32.dll</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
       <AdditionalLibraryDirectories>\mssdk\lib;\dx9\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
@@ -221,7 +221,7 @@
       <AdditionalIncludeDirectories>\private\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>d3d9.lib;dxerr9.lib;d3dx9d.lib;glu32.lib;opengl32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d9.lib;glu32.lib;opengl32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)opengl32.dll</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
       <AdditionalLibraryDirectories>\mssdk\lib;\dx9\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
@@ -265,7 +265,7 @@
       <AdditionalIncludeDirectories>\private\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>dxguid.lib;d3dx9.lib;d3dx.lib;dxerr9.lib;opengl32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d9.lib;opengl32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)opengl32.dll</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
       <AdditionalLibraryDirectories>\mssdk\lib;\dx9\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
@@ -308,7 +308,7 @@
       <AdditionalIncludeDirectories>\private\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>dxguid.lib;d3dx9.lib;d3dx.lib;dxerr9.lib;opengl32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d9.lib;opengl32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)opengl32.dll</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
       <AdditionalLibraryDirectories>\mssdk\lib;\dx9\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
@@ -355,7 +355,7 @@
       <AdditionalIncludeDirectories>\private\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>legacy_stdio_definitions.lib;d3dx9.lib;dxerr.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>legacy_stdio_definitions.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)opengl32.dll</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
       <AdditionalLibraryDirectories>\mssdk\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
@@ -403,7 +403,7 @@
       <AdditionalIncludeDirectories>\private\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>legacy_stdio_definitions.lib;d3dx9.lib;dxerr.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>legacy_stdio_definitions.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)opengl32.dll</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
       <AdditionalLibraryDirectories>\mssdk\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
@@ -435,6 +435,7 @@
     <ClCompile Include="src\mesa_proxy.c" />
     <ClCompile Include="src\glapi_shim.c" />
     <ClCompile Include="src\gl_mesa_forward.c" />
+    <ClCompile Include="src\gl_ext_dsa.c" />
     <ClCompile Include="src\glad\src\gl.c" />
     <ClCompile Include="src\glad\src\wgl.c" />
     <ClCompile Include="src\gl46\error_handler.c" />

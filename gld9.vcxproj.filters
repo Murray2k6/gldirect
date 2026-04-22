@@ -97,6 +97,9 @@
     <ClCompile Include="src\gl_mesa_forward.c">
       <Filter>core</Filter>
     </ClCompile>
+    <ClCompile Include="src\gl_ext_dsa.c">
+      <Filter>core</Filter>
+    </ClCompile>
     <ClCompile Include="src\gld_arrayelt.c">
       <Filter>array element</Filter>
     </ClCompile>

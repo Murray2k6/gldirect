@@ -94,9 +94,9 @@ void gldEvalCoord_Execute(
 {
 	GLD_data_EvalCoord *pEval = (GLD_data_EvalCoord *)data;
 
-	// Sanity tests in Debug build
-	ASSERT(pEval);
-	ASSERT((pEval->dims==1) || (pEval->dims==2));
+	/* Validate input — skip if data is invalid */
+	if (!pEval) return;
+	if (pEval->dims != 1 && pEval->dims != 2) return;
 
 	if (pEval->dims == 2)
 		ctx->Exec->EvalCoord2f(pEval->u, pEval->v);
@@ -242,7 +242,11 @@ static void _gldEnlargeSavePrimitiveBuffer(
 	// Enlarge in chunks of vertices; adding a single vertex at a time is Not Good
 	dl->dwMaxPrimVerts += GLD_PRIM_BLOCK_SIZE;
 	dl->pPrim = realloc(dl->pPrim, GLD_4D_VERTEX_SIZE * dl->dwMaxPrimVerts);
-	ASSERT(dl->pPrim);
+	if (!dl->pPrim) {
+		gldLogPrintf(GLDLOG_ERROR, "Out of memory enlarging primitive buffer for list %d", ctx->ListState.CurrentListNum);
+		dl->dwMaxPrimVerts = 0;
+		return;
+	}
 #ifdef DEBUG
 	// Useful info to know; dump it in Debug builds
 	gldLogPrintf(GLDLOG_SYSTEM, "** Primitive Save buffer (list %d) enlarged to %d verts **", ctx->ListState.CurrentListNum, dl->dwMaxPrimVerts);
@@ -259,7 +263,10 @@ void _gldCreateStreamSourceNode(
 {
 	GLD_data_SetStreamSource	*node;
 
-	ASSERT(dl->opSetStreamSource);
+	if (!dl->opSetStreamSource) {
+		gldLogMessage(GLDLOG_ERROR, "opSetStreamSource not registered for display list\n");
+		return;
+	}
 
 	node = (GLD_data_SetStreamSource*)_mesa_alloc_instruction(ctx, dl->opSetStreamSource, sizeof(*node));
 
@@ -487,7 +494,13 @@ static void GLAPIENTRY gld_save_End(void)
 		count			= nD3DPrimitives;
 		break;
 	default:
-		ASSERT(0); // BANG!
+		/* Unknown primitive type — treat as points to avoid crash */
+		nGLPrimitives	= dl->dwPrimVert;
+		nD3DPrimitives	= nGLPrimitives;
+		nD3DVertices	= nGLPrimitives;
+		count			= dl->dwPrimVert;
+		gldLogPrintf(GLDLOG_WARN, "gld_dlist: unknown primitive mode 0x%X, treating as points", dl->GLReducedPrim);
+		break;
 	}
 
 	// Test for invalid primitives
@@ -605,7 +618,11 @@ static void GLAPIENTRY gld_save_End(void)
 		}
 		break;
 	default:
-		ASSERT(0); // Sanity test...
+		/* Unknown primitive — copy vertices as-is (point-like) */
+		for (j=0; j<count && j<(int)dl->dwPrimVert; j++, pDst++) {
+			*pDst = pSrc[j];
+		}
+		break;
 	}
 
 	// Update count of vertices in VB
@@ -1298,8 +1315,11 @@ static void gldSaveFlushVertices(
 		ctx->Driver.SaveNeedFlush	= 0;
 		return; // Invalid primitive type
 	default:
-		ASSERT(0);
-		return;
+		/* Unrecognized reduced primitive — treat as points */
+		d3dpt		= D3DPT_POINTLIST;
+		nPrimitives	= nVertices;
+		gldLogPrintf(GLDLOG_WARN, "gld_dlist: unknown reduced prim 0x%X", dl->GLReducedPrim);
+		break;
 	}
 
 	// Bail if nothing to do

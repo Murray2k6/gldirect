@@ -47,8 +47,7 @@
 #define D3D_DEBUG_INFO
 #endif
 
-#include <d3d9.h>	// Core Direct3D
-#include <d3dx9.h>	// Direct3D Extension library
+#include <d3d9.h>	// Core Direct3D — only d3d9.dll, no D3DX
 
 /*
  * Legacy Mesa type compatibility for the DX9 backend.
@@ -59,27 +58,28 @@
 #include "mesa_compat.h"
 
 //---------------------------------------------------------------------------
-// Defines
+// D3DX type replacements — pure D3D9 equivalents
 //---------------------------------------------------------------------------
 
-// Helper macros for ID3DXEffect
-#define ID3DXEffect_Begin(a,b,c)				(a)->lpVtbl->Begin((a), (b), (c))
-#define ID3DXEffect_BeginPass(a,b)				(a)->lpVtbl->BeginPass((a), (b))
-#define ID3DXEffect_EndPass(a)					(a)->lpVtbl->EndPass((a))
-#define ID3DXEffect_CommitChanges(a)			(a)->lpVtbl->CommitChanges((a))
-#define ID3DXEffect_End(a)						(a)->lpVtbl->End((a))
-#define ID3DXEffect_SetVector(a,b,c)			(a)->lpVtbl->SetVector((a), (b), (c))
-#define ID3DXEffect_SetFloat(a,b,c)				(a)->lpVtbl->SetFloat((a), (b), (c))
-#define ID3DXEffect_SetMatrix(a,b,c)			(a)->lpVtbl->SetMatrix((a), (b), (c))
-#define ID3DXEffect_SetTexture(a,b,c)			(a)->lpVtbl->SetTexture((a), (b), (c))
-#define ID3DXEffect_SetTechnique(a,b)			(a)->lpVtbl->SetTechnique((a), (b))
-#define ID3DXEffect_SetValue(a,b,c,d)			(a)->lpVtbl->SetValue((a), (b), (c), (d))
-#define ID3DXEffect_GetParameterByName(a,b,c)	(a)->lpVtbl->GetParameterByName((a), (b), (c))
-#define ID3DXEffect_GetParameterElement(a,b,c)	(a)->lpVtbl->GetParameterElement((a), (b), (c))
-#define ID3DXEffect_GetTechniqueByName(a,b)		(a)->lpVtbl->GetTechniqueByName((a), (b))
-#define ID3DXEffect_OnLostDevice(a)				(a)->lpVtbl->OnLostDevice((a))
-#define ID3DXEffect_OnResetDevice(a)			(a)->lpVtbl->OnResetDevice((a))
+// Replace D3DXVECTOR4 with a plain struct (same layout)
+typedef struct {
+	float x, y, z, w;
+} GLD_VEC4;
 
+// Replace D3DXVECTOR3 with a plain struct (same layout)
+typedef struct {
+	float x, y, z;
+} GLD_VEC3;
+
+// D3DXMATRIX is identical to D3DMATRIX which is already in d3d9.h
+// Use D3DMATRIX directly everywhere.
+
+// D3DXHANDLE was just a void* — not needed with fixed-function pipeline,
+// but kept as a typedef for any residual references.
+typedef void* GLD_HANDLE;
+
+//---------------------------------------------------------------------------
+// Defines
 //---------------------------------------------------------------------------
 
 // Typedef for obtaining function from d3d9.dll
@@ -162,55 +162,18 @@ static D3DVERTEXELEMENT9 GLD_vertDecl[] = {
 //#define GLD_FVF (D3DFVF_XYZW | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX2)
 
 typedef struct {
-	D3DXVECTOR4		Position;	// XYZW Vector in object space
-	D3DXVECTOR3		Normal;		// XYZ Normal in object space
+	GLD_VEC4		Position;	// XYZW Vector in object space
+	GLD_VEC3		Normal;		// XYZ Normal in object space
 	D3DCOLOR		Diffuse;	// Diffuse colour
-	D3DXVECTOR4		Tex0;		// First texture unit
-	D3DXVECTOR4		Tex1;		// Second texture unit
+	GLD_VEC4		Tex0;		// First texture unit
+	GLD_VEC4		Tex1;		// Second texture unit
 } GLD_4D_VERTEX;
 
 #define GLD_4D_VERTEX_SIZE (sizeof(GLD_4D_VERTEX))
 
 //---------------------------------------------------------------------------
-// Effects (Vertex Shaders and Pixel Shaders)
-//---------------------------------------------------------------------------
-
-// ** HLSL structs must not be padded **
-#pragma pack(push, 1)
-
-//---------------------------------------------------------------------------
-
-//
-// Colours derived from material and light. Pre-calculated to reduce work in vertex shader.
-//
-//	NOTE: Derived values are preceeded with an undescore, as per Mesa source.
-//
-typedef struct {
-	D3DXVECTOR4		Ambient;
-	D3DXVECTOR4		Diffuse;
-	D3DXVECTOR4		Specular;
-	// Terms derived from material and light colours
-	D3DXVECTOR4		_Ambient;
-	D3DXVECTOR4		_Diffuse;
-	D3DXVECTOR4		_Specular;
-} GLD_HLSL_lightmat;
-
-//---------------------------------------------------------------------------
-
-typedef struct {
-	GLD_HLSL_lightmat	Front;
-	GLD_HLSL_lightmat	Back;
-	D3DXVECTOR4			Position;
-	D3DXVECTOR4			Direction;
-	D3DXVECTOR4			Attenuation;	// Constant/Linear/Quadratic in .xyz
-	D3DXVECTOR4			SpotLight;		// cos(spot cuttoff angle) in .x, spot power in .y, 
-} GLD_HLSL_light;
-
-//---------------------------------------------------------------------------
-
-// ** Restore packing **
-#pragma pack(pop)
-
+// Effect state — used for fixed-function pipeline state tracking
+// (D3DX Effect system has been replaced with direct D3D9 render states)
 //---------------------------------------------------------------------------
 
 typedef struct {
@@ -277,7 +240,7 @@ typedef struct {
 
 //---------------------------------------------------------------------------
 
-// The unique set of state handled by the effect
+// The unique set of state handled by the fixed-function pipeline
 typedef struct {
 	GLD_effect_texture		Texture;
 	GLD_effect_lightstate	Light;
@@ -286,56 +249,11 @@ typedef struct {
 
 //---------------------------------------------------------------------------
 
-//
-// This struct holds handles (DWORDS) corresponding to string names of HLSL variables.
-// Handles are queried once only when the text of the HLSL effect is compiled.
-// Handles are more efficient than updating variables by specifying their ascii name.
-//
-
-typedef struct {
-	// Transformation Matrices
-	D3DXHANDLE	matWorldViewProject;						// WorldViewProjection matrix
-	D3DXHANDLE	matWorldView;								// WorldView matrix
-	D3DXHANDLE	matInvWorldView;							// Inverse WorldView matrix
-
-	// Fog
-	D3DXHANDLE	Fog;										// Fog: Start, End, Density, 1 in .xyzw
-
-	// Lighting
-	D3DXHANDLE	Lights[GLD_MAX_LIGHTS_DX9];					// Light structs
-	// Global Ambient term
-	D3DXHANDLE	Ambient;
-	// Front material
-	D3DXHANDLE	mtlFrontEmissive;
-	D3DXHANDLE	mtlFrontAmbient;
-	D3DXHANDLE	mtlFrontDiffuse;
-	D3DXHANDLE	mtlFrontSpecular;
-	D3DXHANDLE	mtlFrontShininess;
-	// Back material
-	D3DXHANDLE	mtlBackEmissive;
-	D3DXHANDLE	mtlBackAmbient;
-	D3DXHANDLE	mtlBackDiffuse;
-	D3DXHANDLE	mtlBackSpecular;
-	D3DXHANDLE	mtlBackShininess;
-
-	// Texture
-	D3DXHANDLE	texDiffuse[GLD_MAX_TEXTURE_UNITS_DX9];		// Diffuse Texture
-	D3DXHANDLE	matTexture[GLD_MAX_TEXTURE_UNITS_DX9];		// Texture matrices
-	D3DXHANDLE	matInvTexture[GLD_MAX_TEXTURE_UNITS_DX9];	// Inverse texture matrices
-	D3DXHANDLE	EnvColor[GLD_MAX_TEXTURE_UNITS_DX9];		// Colour for GL_BLEND
-	D3DXHANDLE	TexPlaneS[GLD_MAX_TEXTURE_UNITS_DX9];		// Shared between EyePlane and ObjectPlane
-	D3DXHANDLE	TexPlaneT[GLD_MAX_TEXTURE_UNITS_DX9];
-	D3DXHANDLE	TexPlaneR[GLD_MAX_TEXTURE_UNITS_DX9];
-	D3DXHANDLE	TexPlaneQ[GLD_MAX_TEXTURE_UNITS_DX9];
-} GLD_handles;
-
-//---------------------------------------------------------------------------
-
+// Fixed-function effect: state snapshot + dirty flag
+// Replaces the old ID3DXEffect-based GLD_effect struct.
 typedef struct {
 	GLD_effect_state	State;
-	ID3DXEffect			*pEffect;				// The compiled Effect, ready for Direct3D to use
-	D3DXHANDLE			hTechnique;				// Technique handle
-	GLD_handles			Handles;			
+	BOOL				bActive;	// Whether this effect state has been applied
 } GLD_effect;
 
 //---------------------------------------------------------------------------
@@ -407,12 +325,12 @@ typedef struct {
 	BOOL						bHasHWTnL;				// Device has Hardware Transform/Light?
 	IDirect3D9					*pD3D;					// Base Direct3D9 interface
 	IDirect3DDevice9			*pDev;					// Direct3D9 Device interface
-	D3DXMATRIX					matProjection;			// Projection matrix for D3D TnL
-	D3DXMATRIX					matModelView;			// Model/View matrix for D3D TnL
-	D3DXMATRIX					matInvModelView;		// Inverse Model/View matrix for D3D TnL
-	D3DXMATRIX					matModelViewProject;	// Model/View/Project matrix for D3D TnL
-	D3DXMATRIX					matTexture[GLD_MAX_TEXTURE_UNITS_DX9];		// Texture matrix per unit
-	D3DXMATRIX					matInvTexture[GLD_MAX_TEXTURE_UNITS_DX9];	// Inverse texture matrix per unit
+	D3DMATRIX					matProjection;			// Projection matrix for D3D TnL
+	D3DMATRIX					matModelView;			// Model/View matrix for D3D TnL
+	D3DMATRIX					matInvModelView;		// Inverse Model/View matrix for D3D TnL
+	D3DMATRIX					matModelViewProject;	// Model/View/Project matrix for D3D TnL
+	D3DMATRIX					matTexture[GLD_MAX_TEXTURE_UNITS_DX9];		// Texture matrix per unit
+	D3DMATRIX					matInvTexture[GLD_MAX_TEXTURE_UNITS_DX9];	// Inverse texture matrix per unit
 	IDirect3DVertexDeclaration9	*pVertDecl;				// Vertex declaration for GLD_4D_VERTEX
 
 	// Mesa Vertex Formats for Exec mode and Save mode.
@@ -441,16 +359,16 @@ typedef struct {
 	GLD_display_list			DList;			// Data for current Display List 
 
 	//
-	// Run-time shader generation
+	// Fixed-function pipeline state tracking
+	// (Replaces the old D3DX Effect system)
 	//
-	ID3DXEffectPool				*pEffectPool;	// This allows parameters to be shared between effects
-	int							iLastEffect;	// Index of previous effect (or -1)
-	int							iCurEffect;		// Index of current effect (or -1)
-	int							nEffects;		// Count of current effects
-	GLD_effect					Effects[100];	// TODO: Use linked list
+	int							iLastEffect;	// Index of previous effect state (or -1)
+	int							iCurEffect;		// Index of current effect state (or -1)
+	int							nEffects;		// Count of cached effect states
+	GLD_effect					Effects[100];	// Cached effect states
 
 	// Keep track of direction of directional lights.
-	D3DXVECTOR4					LightDir[GLD_MAX_LIGHTS_DX9];
+	GLD_VEC4					LightDir[GLD_MAX_LIGHTS_DX9];
 
 	// Viewport adjustment hack
 	float						fViewportY;
@@ -505,7 +423,7 @@ GLenum							gldReducedPrim(GLenum mode);
 // Display List support
 BOOL							_gld_install_save_vtxfmt(GLcontext *ctx);
 
-// Run-time shader generation
+// Fixed-function pipeline state management (replaces D3DX Effect system)
 void							gldUpdateShaders(GLcontext *ctx);
 void							gldReleaseShaders(GLD_driver_dx9 *gld);
 void							gldBeginEffect(GLD_driver_dx9 *gld, int iEffect);

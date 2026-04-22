@@ -62,7 +62,7 @@ extern BOOL gldSwapBuffers(HDC hDC);
 //---------------------------------------------------------------------------
 
 static void _gldD3DMatrixProjection(
-	D3DXMATRIX *pMatIn,
+	D3DMATRIX *pMatIn,
 	GLD_context *gldCtx)
 {
 	//
@@ -76,20 +76,35 @@ static void _gldD3DMatrixProjection(
 
 	// The matrix that will be used to convert input matrix
 	// into Direct3D's canonical clip volume.
-    D3DXMATRIX matD3DClipVolume;
+    D3DMATRIX matD3DClipVolume;
 
 	// Start off with an identity matrix
-	D3DXMatrixIdentity(&matD3DClipVolume);
+	ZeroMemory(&matD3DClipVolume, sizeof(D3DMATRIX));
+	matD3DClipVolume._11 = matD3DClipVolume._22 = matD3DClipVolume._33 = matD3DClipVolume._44 = 1.0f;
 
 	// Set matrix to scale Z by half and offset Z by half
 	matD3DClipVolume._33 = matD3DClipVolume._43 = 0.5f;
 
 	// Ensure 2D/HUD/Orthographic vertices project to non-integer coordinates
-	matD3DClipVolume._41 = -1.0 / gldCtx->dwWidth;
-	matD3DClipVolume._42 = 1.0 / gldCtx->dwHeight;
+	matD3DClipVolume._41 = -1.0f / gldCtx->dwWidth;
+	matD3DClipVolume._42 = 1.0f / gldCtx->dwHeight;
 
 	// Convert input matrix to D3D's canonical clip volume
-	D3DXMatrixMultiply(pMatIn, pMatIn, &matD3DClipVolume);
+	// Manual 4x4 matrix multiply: pMatIn = pMatIn * matD3DClipVolume
+	{
+		D3DMATRIX result;
+		int i;
+		for (i = 0; i < 4; i++) {
+			float *pRow = ((float*)pMatIn) + i * 4;
+			float *pOut = ((float*)&result) + i * 4;
+			float *pB = (float*)&matD3DClipVolume;
+			pOut[0] = pRow[0]*pB[0] + pRow[1]*pB[4] + pRow[2]*pB[8]  + pRow[3]*pB[12];
+			pOut[1] = pRow[0]*pB[1] + pRow[1]*pB[5] + pRow[2]*pB[9]  + pRow[3]*pB[13];
+			pOut[2] = pRow[0]*pB[2] + pRow[1]*pB[6] + pRow[2]*pB[10] + pRow[3]*pB[14];
+			pOut[3] = pRow[0]*pB[3] + pRow[1]*pB[7] + pRow[2]*pB[11] + pRow[3]*pB[15];
+		}
+		*pMatIn = result;
+	}
 }
 
 //---------------------------------------------------------------------------
@@ -111,9 +126,8 @@ void _gld_mesa_fatal(
     // Intercept Mesa's internal fatal-message mechanism
     gldLogPrintf(GLDLOG_CRITICAL, "Mesa FATAL: %s", str);
 
-    // Mesa calls abort(0) here.
-    gldLogClose();
-    exit(0);
+    // Do NOT call exit() — let the game continue or handle the error.
+    // Mesa 26 proxy handles all real GL work; Mesa 5.1 fatals are non-critical.
 }
 
 //---------------------------------------------------------------------------
@@ -606,22 +620,38 @@ static void _gldComputeWorldViewProject(
 	//
 	// In situations where we don't need eye coordinates we can use
 	// matModelViewProject in vertex shaders to improve performance.
-	D3DXMatrixMultiply(&gld->matModelViewProject, &gld->matModelView, &gld->matProjection);
+	// Manual 4x4 matrix multiply: matModelViewProject = matModelView * matProjection
+	{
+		D3DMATRIX *pA = &gld->matModelView;
+		D3DMATRIX *pB = &gld->matProjection;
+		D3DMATRIX *pOut = &gld->matModelViewProject;
+		int i;
+		for (i = 0; i < 4; i++) {
+			float *pRow = ((float*)pA) + i * 4;
+			float *pR = ((float*)pOut) + i * 4;
+			float *pBf = (float*)pB;
+			pR[0] = pRow[0]*pBf[0] + pRow[1]*pBf[4] + pRow[2]*pBf[8]  + pRow[3]*pBf[12];
+			pR[1] = pRow[0]*pBf[1] + pRow[1]*pBf[5] + pRow[2]*pBf[9]  + pRow[3]*pBf[13];
+			pR[2] = pRow[0]*pBf[2] + pRow[1]*pBf[6] + pRow[2]*pBf[10] + pRow[3]*pBf[14];
+			pR[3] = pRow[0]*pBf[3] + pRow[1]*pBf[7] + pRow[2]*pBf[11] + pRow[3]*pBf[15];
+		}
+	}
 }
 
 //---------------------------------------------------------------------------
 
-static void _GLMatrixToD3DXMatrix(
+static void _GLMatrixToD3DMatrix(
 	const GLmatrix *pGL,
-	D3DXMATRIX *pD3D,
+	D3DMATRIX *pD3D,
 	BOOL bInverse)
 {
 	//
-	// Take the 4x4 homogenous GL matrix and make a D3DX matrix.
+	// Take the 4x4 homogenous GL matrix and make a D3D matrix.
 	//
 	if (0 && pGL->type == MATRIX_IDENTITY) {
 		// Shortcut
-		D3DXMatrixIdentity(pD3D);
+		ZeroMemory(pD3D, sizeof(D3DMATRIX));
+		pD3D->_11 = pD3D->_22 = pD3D->_33 = pD3D->_44 = 1.0f;
 	} else {
 		GLfloat *pM = (bInverse) ? pGL->inv : pGL->m;
 		// TODO: Straight memcopy? Are both aligned/padded equally? If true, maybe we can use the GL matrix directly?
@@ -652,8 +682,8 @@ void gld_NEW_MODELVIEW(
     GLD_context         *gldCtx = GLD_GET_CONTEXT(ctx);
     GLD_driver_dx9      *gld    = GLD_GET_DX9_DRIVER(gldCtx);
 
-	_GLMatrixToD3DXMatrix(ctx->ModelviewMatrixStack.Top, &gld->matModelView, FALSE);
-	_GLMatrixToD3DXMatrix(ctx->ModelviewMatrixStack.Top, &gld->matInvModelView, TRUE);
+	_GLMatrixToD3DMatrix(ctx->ModelviewMatrixStack.Top, &gld->matModelView, FALSE);
+	_GLMatrixToD3DMatrix(ctx->ModelviewMatrixStack.Top, &gld->matInvModelView, TRUE);
 	_gldComputeWorldViewProject(gld);
 }
 
@@ -665,7 +695,7 @@ void gld_NEW_PROJECTION(
     GLD_context         *gldCtx = GLD_GET_CONTEXT(ctx);
     GLD_driver_dx9      *gld    = GLD_GET_DX9_DRIVER(gldCtx);
 
-	_GLMatrixToD3DXMatrix(ctx->ProjectionMatrixStack.Top, &gld->matProjection, FALSE);
+	_GLMatrixToD3DMatrix(ctx->ProjectionMatrixStack.Top, &gld->matProjection, FALSE);
 	_gldD3DMatrixProjection(&gld->matProjection, gldCtx);
 	_gldComputeWorldViewProject(gld);
 
@@ -685,8 +715,8 @@ void gld_NEW_TEXTURE_MATRIX(
 	int					i;
 
 	for (i=0; i<GLD_MAX_TEXTURE_UNITS_DX9; i++) {
-		_GLMatrixToD3DXMatrix(ctx->TextureMatrixStack[i].Top, &gld->matTexture[i], FALSE);
-		_GLMatrixToD3DXMatrix(ctx->TextureMatrixStack[i].Top, &gld->matInvTexture[i], TRUE);
+		_GLMatrixToD3DMatrix(ctx->TextureMatrixStack[i].Top, &gld->matTexture[i], FALSE);
+		_GLMatrixToD3DMatrix(ctx->TextureMatrixStack[i].Top, &gld->matInvTexture[i], TRUE);
 	}
 }
 
@@ -1008,7 +1038,7 @@ void gld_TexGen(
     GLD_context     *gldCtx = GLD_GET_CONTEXT(ctx);
     GLD_driver_dx9  *gld    = GLD_GET_DX9_DRIVER(gldCtx);
 	GLuint			tUnit = ctx->Texture.CurrentUnit;
-	D3DXVECTOR4		*pV;
+	GLD_VEC4		*pV;
 
 	// Only interested in the EyePlane
 	if (pname != GL_EYE_PLANE)

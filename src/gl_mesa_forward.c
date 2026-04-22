@@ -560,3 +560,4 @@ MESA_FORWARD_VOID(glMultiTexCoord4iARB, (GLenum target, GLint s, GLint t, GLint 
 MESA_FORWARD_VOID(glMultiTexCoord4ivARB, (GLenum target, const GLint *v), (target,v))
 MESA_FORWARD_VOID(glMultiTexCoord4sARB, (GLenum target, GLshort s, GLshort t, GLshort r, GLshort q), (target,s,t,r,q))
 MESA_FORWARD_VOID(glMultiTexCoord4svARB, (GLenum target, const GLshort *v), (target,v))
+

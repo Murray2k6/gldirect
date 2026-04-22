@@ -214,6 +214,30 @@ int curPFD = 0;							// Current PFD (static)
 
 // ***********************************************************************
 
+// Full Mesa proxy initialization — called on first WGL entry point.
+// Must NOT be called from DLL_PROCESS_ATTACH because CreateWindow
+// under the loader lock causes deadlocks with Mesa's DLL chain.
+// Every WGL function calls this at the top. It runs once, fully,
+// then becomes a no-op on subsequent calls.
+static BOOL bMesaProxyReady = FALSE;
+static BOOL bMesaProxyAttempted = FALSE;
+
+static void _gldInitMesaProxy(void)
+{
+	if (bMesaProxyReady || bMesaProxyAttempted)
+		return;
+	bMesaProxyAttempted = TRUE;
+	gldDiagLog("_gldInitMesaProxy: calling mesaProxyInit");
+	if (mesaProxyInit()) {
+		bMesaProxyReady = TRUE;
+		gldDiagLog("_gldInitMesaProxy: SUCCESS");
+	} else {
+		gldDiagLog("_gldInitMesaProxy: FAILED (mesa_gl.dll not found?)");
+	}
+}
+
+// ***********************************************************************
+
 int gldGetPixelFormat(void)
 {
 #ifdef GLD_THREADS
@@ -267,6 +291,9 @@ int APIENTRY _GLD_WGL_EXPORT(ChoosePixelFormat)(
 	CONST PIXELFORMATDESCRIPTOR *ppfd)
 {
 	GLD_pixelFormat			*lpPF = glb.lpPF;
+
+	/* Full Mesa init on first WGL call */
+	_gldInitMesaProxy();
 
 	/* Forward to Mesa if available */
 	if (g_mesaProxy.initialized && g_mesaProxy.wglChoosePixelFormat)
@@ -597,9 +624,19 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(CreateContext)(
 {
 	int ipf;
 
+	/* Full Mesa init on first WGL call */
+	_gldInitMesaProxy();
+
 	/* Forward to Mesa if available */
-	if (g_mesaProxy.initialized && g_mesaProxy.wglCreateContext)
-		return g_mesaProxy.wglCreateContext(a);
+	if (g_mesaProxy.initialized && g_mesaProxy.wglCreateContext) {
+		HGLRC rc = g_mesaProxy.wglCreateContext(a);
+
+		/* D3D9 device creation is deferred to SwapBuffers.
+		 * Creating it here can cause recursive DLL loading
+		 * (d3d9.dll -> opengl32.dll -> us again) and crashes. */
+
+		return rc;
+	}
 
 	gldDiagLog("wglCreateContext: HDC=%p", (void*)(INT_PTR)a);
 
@@ -635,6 +672,9 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(CreateLayerContext)(
 BOOL APIENTRY _GLD_WGL_EXPORT(DeleteContext)(
 	HGLRC a)
 {
+	/* Full Mesa init on first WGL call */
+	_gldInitMesaProxy();
+
 	/* Forward to Mesa if available */
 	if (g_mesaProxy.initialized && g_mesaProxy.wglDeleteContext)
 		return g_mesaProxy.wglDeleteContext(a);
@@ -677,6 +717,9 @@ int APIENTRY _GLD_WGL_EXPORT(DescribePixelFormat)(
 	LPPIXELFORMATDESCRIPTOR d)
 {
 	UINT nSize;
+
+	/* Full Mesa init on first WGL call */
+	_gldInitMesaProxy();
 
 	/* Forward to Mesa if available */
 	if (g_mesaProxy.initialized && g_mesaProxy.wglDescribePixelFormat)
@@ -768,6 +811,9 @@ int APIENTRY _GLD_WGL_EXPORT(GetLayerPaletteEntries)(
 int APIENTRY _GLD_WGL_EXPORT(GetPixelFormat)(
 	HDC a)
 {
+	/* Full Mesa init on first WGL call */
+	_gldInitMesaProxy();
+
 	/* Forward to Mesa if available */
 	if (g_mesaProxy.initialized && g_mesaProxy.wglGetPixelFormat)
 		return g_mesaProxy.wglGetPixelFormat(a);
@@ -787,13 +833,26 @@ PROC APIENTRY _GLD_WGL_EXPORT(GetProcAddress)(
 	PROC gldGetProcAddressD3D(LPCSTR a);
 	PROC result;
 
-	/* Forward to Mesa if available */
+	if (!a) return NULL;
+
+	/* Full Mesa init on first WGL call */
+	_gldInitMesaProxy();
+
+	/* When Mesa is active, get ALL functions from Mesa + our extensions */
 	if (g_mesaProxy.initialized) {
+		/* mesaProxyGetProcAddress checks:
+		 * 1. Mesa's wglGetProcAddress (GL extensions)
+		 * 2. Mesa DLL exports (core GL)
+		 * 3. Our EXT_direct_state_access / vendor extension table
+		 * 4. Our own DLL exports (gl_mesa_forward.c) */
 		result = mesaProxyGetProcAddress(a);
 		if (result) {
-			gldDiagLog("wglGetProcAddress: \"%s\" -> Mesa", a ? a : "(null)");
+			gldDiagLog("wglGetProcAddress: \"%s\" -> Mesa", a);
 			return result;
 		}
+
+		gldDiagLog("wglGetProcAddress: \"%s\" -> NULL (not in Mesa or ext table)", a);
+		return NULL;
 	}
 
 	// Validate license
@@ -811,6 +870,9 @@ BOOL APIENTRY _GLD_WGL_EXPORT(MakeCurrent)(
 	HDC a,
 	HGLRC b)
 {
+	/* Full Mesa init on first WGL call */
+	_gldInitMesaProxy();
+
 	/* Forward to Mesa if available */
 	if (g_mesaProxy.initialized && g_mesaProxy.wglMakeCurrent)
 		return g_mesaProxy.wglMakeCurrent(a, b);
@@ -863,9 +925,26 @@ BOOL APIENTRY _GLD_WGL_EXPORT(SetPixelFormat)(
 	int b,
 	CONST PIXELFORMATDESCRIPTOR *c)
 {
+	/* Full Mesa init on first WGL call */
+	_gldInitMesaProxy();
+
 	/* Forward to Mesa if available */
-	if (g_mesaProxy.initialized && g_mesaProxy.wglSetPixelFormat)
-		return g_mesaProxy.wglSetPixelFormat(a, b, c);
+	if (g_mesaProxy.initialized && g_mesaProxy.wglSetPixelFormat) {
+		BOOL result = g_mesaProxy.wglSetPixelFormat(a, b, c);
+		/* If Mesa's SetPixelFormat fails (e.g. already set on this DC),
+		 * return TRUE anyway — Mesa handles pixel formats internally.
+		 * Windows error 3 = "already set" which is harmless. */
+		if (!result) {
+			DWORD err = GetLastError();
+			if (err == ERROR_INVALID_PIXEL_FORMAT || err == 2000 || err == 3) {
+				return TRUE;
+			}
+			/* Try setting it directly as fallback */
+			SetPixelFormat(a, b, c);
+			return TRUE;
+		}
+		return result;
+	}
 
 	gldDiagLog("SetPixelFormat: HDC=%p, format=%d", (void*)(INT_PTR)a, b);
 
@@ -968,27 +1047,130 @@ BOOL APIENTRY _GLD_WGL_EXPORT(ShareLists)(
 BOOL APIENTRY _GLD_WGL_EXPORT(SwapBuffers)(
 	HDC a)
 {
-	/* When Mesa is active, still use D3D9 for presentation so that
-	 * a d3d9.dll wrapper (dgVoodoo, etc.) can intercept the output. */
+	/* Cached offscreen surface for Mesa→D3D9 framebuffer copy */
+	static IDirect3DSurface9 *s_pOffscreen = NULL;
+	static int s_cachedW = 0, s_cachedH = 0;
+	static IDirect3DDevice9 *s_cachedDev = NULL;
+
+	/* Full Mesa init on first WGL call */
+	_gldInitMesaProxy();
+
 	if (g_mesaProxy.initialized && g_mesaProxy.wglSwapBuffers) {
 		BOOL result;
-		IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+		IDirect3DDevice9 *pDev;
 		HWND hWnd = WindowFromDC(a);
 
-		/* Ensure D3D9 device exists — this is what d3d9.dll wrappers intercept */
+		/* Ensure D3D9 device exists */
+		pDev = gldGetD3DDevice46();
 		if (!pDev && hWnd) {
+			gldInitContext46();
 			_gldEnsureDevice(hWnd);
 			pDev = gldGetD3DDevice46();
 		}
 
-		/* Let Mesa do its rendering */
+		/* Let Mesa render and swap to the window */
 		result = g_mesaProxy.wglSwapBuffers(a);
 
-		/* Present through D3D9 — the d3d9.dll wrapper sees this */
-		if (pDev) {
-			IDirect3DDevice9_EndScene(pDev);
-			IDirect3DDevice9_Present(pDev, NULL, NULL, hWnd, NULL);
-			IDirect3DDevice9_BeginScene(pDev);
+		/* Copy Mesa's rendered frame to D3D9 backbuffer and Present */
+		if (pDev && hWnd) {
+			RECT rc;
+			GetClientRect(hWnd, &rc);
+			int w = rc.right;
+			int h = rc.bottom;
+
+			if (w > 0 && h > 0) {
+				HRESULT hr;
+
+				/* Check device state */
+				hr = IDirect3DDevice9_TestCooperativeLevel(pDev);
+				if (hr == D3DERR_DEVICELOST) {
+					return result; /* Device lost — skip D3D9 present, Mesa already showed via GDI */
+				}
+				if (hr == D3DERR_DEVICENOTRESET) {
+					/* Release cached surface before reset */
+					if (s_pOffscreen) {
+						IDirect3DSurface9_Release(s_pOffscreen);
+						s_pOffscreen = NULL;
+						s_cachedW = s_cachedH = 0;
+					}
+					/* Try to reset — if it fails, skip this frame */
+					{
+						D3DPRESENT_PARAMETERS d3dpp;
+						D3DDISPLAYMODE d3ddm;
+						IDirect3DDevice9_GetDisplayMode(pDev, 0, &d3ddm);
+						ZeroMemory(&d3dpp, sizeof(d3dpp));
+						d3dpp.Windowed = TRUE;
+						d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+						d3dpp.BackBufferFormat = d3ddm.Format;
+						d3dpp.BackBufferCount = 1;
+						d3dpp.BackBufferWidth = w;
+						d3dpp.BackBufferHeight = h;
+						d3dpp.hDeviceWindow = hWnd;
+						d3dpp.EnableAutoDepthStencil = FALSE;
+						hr = IDirect3DDevice9_Reset(pDev, &d3dpp);
+						if (FAILED(hr)) return result;
+						IDirect3DDevice9_BeginScene(pDev);
+					}
+				}
+
+				/* Recreate cached offscreen surface if size changed or device changed */
+				if (s_pOffscreen && (s_cachedW != w || s_cachedH != h || s_cachedDev != pDev)) {
+					IDirect3DSurface9_Release(s_pOffscreen);
+					s_pOffscreen = NULL;
+				}
+				if (!s_pOffscreen) {
+					/* Match the backbuffer format exactly for UpdateSurface */
+					IDirect3DSurface9 *pTmpBack = NULL;
+					D3DSURFACE_DESC bbDesc;
+					D3DFORMAT bbFmt = D3DFMT_X8R8G8B8;
+					hr = IDirect3DDevice9_GetBackBuffer(pDev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &pTmpBack);
+					if (SUCCEEDED(hr) && pTmpBack) {
+						IDirect3DSurface9_GetDesc(pTmpBack, &bbDesc);
+						bbFmt = bbDesc.Format;
+						IDirect3DSurface9_Release(pTmpBack);
+					}
+					hr = IDirect3DDevice9_CreateOffscreenPlainSurface(
+						pDev, w, h, bbFmt,
+						D3DPOOL_SYSTEMMEM, &s_pOffscreen, NULL);
+					if (SUCCEEDED(hr)) {
+						s_cachedW = w;
+						s_cachedH = h;
+						s_cachedDev = pDev;
+					}
+				}
+
+				if (s_pOffscreen) {
+					HDC hSurfDC = NULL;
+					hr = IDirect3DSurface9_GetDC(s_pOffscreen, &hSurfDC);
+					if (SUCCEEDED(hr) && hSurfDC) {
+						HDC hWndDC = GetDC(hWnd);
+						if (hWndDC) {
+							BitBlt(hSurfDC, 0, 0, w, h, hWndDC, 0, 0, SRCCOPY);
+							ReleaseDC(hWnd, hWndDC);
+						}
+						IDirect3DSurface9_ReleaseDC(s_pOffscreen, hSurfDC);
+
+						/* UpdateSurface: SYSTEMMEM → DEFAULT (backbuffer) */
+						{
+							IDirect3DSurface9 *pBack = NULL;
+							hr = IDirect3DDevice9_GetBackBuffer(pDev, 0, 0,
+								D3DBACKBUFFER_TYPE_MONO, &pBack);
+							if (SUCCEEDED(hr) && pBack) {
+								POINT pt = {0, 0};
+								RECT srcRect = {0, 0, w, h};
+								hr = IDirect3DDevice9_UpdateSurface(pDev,
+									s_pOffscreen, &srcRect, pBack, &pt);
+								IDirect3DSurface9_Release(pBack);
+							}
+						}
+					}
+				}
+
+				/* Present */
+				IDirect3DDevice9_EndScene(pDev);
+				hr = IDirect3DDevice9_Present(pDev, NULL, NULL, NULL, NULL);
+				IDirect3DDevice9_BeginScene(pDev);
+			}
 		}
 
 		return result;

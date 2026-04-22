@@ -40,7 +40,7 @@
 #include "gldirect5.h"
 #include "mesa_compat.h"
 
-#include <d3dx9tex.h>
+/* D3DX removed — all texture ops use pure D3D9 API */
 
 // TODO: Mesa includes removed - replaced by mesa_compat.h shim
 // #include "texformat.h"
@@ -60,7 +60,8 @@
 
 #define GLD_SAVE_TEXTURE_TO_FILE
 #define GLD_SAVE_TEXTURE_EXT		"dds"
-#define GLD_SAVE_TEXTURE_FORMAT		D3DXIFF_DDS
+/* D3DXIFF_DDS removed — D3DX no longer available. Texture save is disabled. */
+#define GLD_SAVE_TEXTURE_FORMAT		0
 
 #endif
 #endif
@@ -74,41 +75,12 @@ static void _gldSaveTextureToFile(
 	GLuint Name,
 	IDirect3DTexture9* pTex)
 {
-	HRESULT					hr;
-	IDirect3DSurface9		*pSurface;
-	D3DXIMAGE_FILEFORMAT	DestFormat;
-	char					szFile[MAX_PATH];
-	char					szModFile[MAX_PATH];
-	char					szLine[MAX_PATH];
-	char					*p;
-
-	//
-	// Obtain first mip level of input texture and dump it to file.
-	// This will fail if texture is in vidmem, but GLD5 uses managed
-	// textures so there is a sysmem copy.
-	//
-
-	// Sanity test
-	if (!pTex) return;
-
-	// Get top-level surface of texture
-	hr = IDirect3DTexture9_GetSurfaceLevel(pTex, 0, &pSurface);
-	if (FAILED(hr))
-		return; // Surface level doesn't exist (or just a plain error)
-
-	GetModuleFileName(NULL, szModFile, MAX_PATH); // NULL for current process
-	p = strrchr(szModFile, '.');
-	if (p) {
-		*p = 0;
-		strcpy(szFile, szModFile);
-		sprintf(szLine, "_gld_tex_%04d."GLD_SAVE_TEXTURE_EXT, Name);
-		strcat(szFile, szLine);
-	}
-
-	DestFormat = GLD_SAVE_TEXTURE_FORMAT;
-	hr = D3DXSaveSurfaceToFile(szFile, DestFormat, pSurface, NULL, NULL);
-
-	IDirect3DSurface9_Release(pSurface);
+	// D3DXSaveSurfaceToFile removed — this was debug-only functionality.
+	// Texture saving requires D3DX which we no longer link against.
+	// If texture debugging is needed, use a GPU debugger (PIX, RenderDoc, etc.)
+	(void)Name;
+	(void)pTex;
+	gldLogMessage(GLDLOG_WARN, "GLD_SAVE_TEXTURE_TO_FILE: D3DX removed, texture save disabled\n");
 }
 #endif
 
@@ -588,7 +560,7 @@ GLenum _gldDecodeBaseFormat(
 {
 	// Examine Direct3D texture and return base OpenGL internal texture format
 	// NOTE: We can't use any base format info from Mesa because D3D might have
-	// used a different texture format when we used D3DXCreateTexture().
+	// used a different texture format when we used CreateTexture().
 
 	// Base internal format is one of (Red Book p355):
 	//	GL_ALPHA, 
@@ -675,11 +647,9 @@ const struct gl_texture_format* _gldMesaFormatForD3DFormat(
 		return &_gld_texformat_X4R4G4B4;
 	}
 
-	// If we reach here then we've made an error somewhere else
-	// by allowing a format that is not supported.
-	ASSERT(0);
-
-	return NULL; // Shut up compiler warning
+	// If we reach here then the format is not directly supported.
+	// Fall back to X8R8G8B8 which is universally supported by D3D9.
+	return &_gld_texformat_X8R8G8B8;
 }
 
 //---------------------------------------------------------------------------
@@ -799,15 +769,15 @@ HRESULT _gldDrawPixels(
 	float				ScaleWidth, ScaleHeight;
 	float				fPixelCenterY; // An adjustment for sampling textures from their pixel center
 
-	// Create a texture to hold image
-	hr = D3DXCreateTexture(
+	// Create a texture to hold image — pure D3D9, no D3DX
+	hr = IDirect3DDevice9_CreateTexture(
 		gld->pDev,
 		width, height,
 		1, // miplevels
 		0, // usage
 		D3DFMT_A8R8G8B8, // format
 		D3DPOOL_MANAGED, // pool
-		&pTexture);
+		&pTexture, NULL);
 	if (FAILED(hr))
 		return hr;
 
@@ -817,12 +787,25 @@ HRESULT _gldDrawPixels(
 		return hr;
 	}
 
-	// Copy image into texture
-	hr = D3DXLoadSurfaceFromSurface(
-		pSurface, NULL, NULL,	// Dest surface
-		pImage, NULL, NULL,		// Src surface
-		D3DX_FILTER_POINT,
-		0);
+	// Copy image into texture via StretchRect or UpdateSurface
+	// Both surfaces are same format/size so UpdateSurface works
+	hr = IDirect3DDevice9_StretchRect(gld->pDev, pImage, NULL, pSurface, NULL, D3DTEXF_POINT);
+	if (FAILED(hr)) {
+		// Fallback: lock both surfaces and memcpy
+		D3DLOCKED_RECT lrSrc, lrDst;
+		if (SUCCEEDED(IDirect3DSurface9_LockRect(pImage, &lrSrc, NULL, D3DLOCK_READONLY)) &&
+		    SUCCEEDED(IDirect3DSurface9_LockRect(pSurface, &lrDst, NULL, 0))) {
+			UINT row;
+			UINT copyPitch = (lrSrc.Pitch < lrDst.Pitch) ? lrSrc.Pitch : lrDst.Pitch;
+			for (row = 0; row < (UINT)height; row++) {
+				memcpy((BYTE*)lrDst.pBits + row * lrDst.Pitch,
+				       (BYTE*)lrSrc.pBits + row * lrSrc.Pitch, copyPitch);
+			}
+			IDirect3DSurface9_UnlockRect(pSurface);
+			IDirect3DSurface9_UnlockRect(pImage);
+			hr = D3D_OK;
+		}
+	}
 	IDirect3DSurface9_Release(pSurface);
 	if (FAILED(hr)) {
 		IDirect3DTexture9_Release(pTexture);
@@ -1062,22 +1045,45 @@ void gld_ReadPixels_DX9(
 
 	// Get source pixels.
 	//
-	// This intermediate surface ensure that we can use CopyRects()
-	// instead of relying on D3DXLoadSurfaceFromSurface(), which may
-	// try and lock the backbuffer. This way seems safer.
+	// Copy from backbuffer to our scratch surface using GetRenderTargetData
+	// or lock/memcpy. D3DXLoadSurfaceFromSurface has been replaced.
 	//
-	// CopyRects has been removed for DX9.
-	//
-	hr = D3DXLoadSurfaceFromSurface(
-			pNativeImage,		// Dest surface
-			NULL,				// Dest palette
-			&rcSrc,				// Dest rect
-			pBackbuffer,		// Src surface
-			NULL,				// Src palette
-			&rcSrc,				// Src rect
-			D3DX_FILTER_POINT,	// Filter
-			0					// Colorkey (0=no colorkey)
-		);
+	{
+		// Use GetRenderTargetData to copy backbuffer to a system-mem surface,
+		// then lock both and memcpy the sub-rect we need.
+		IDirect3DSurface9 *pRTCopy = NULL;
+		D3DSURFACE_DESC bbDesc;
+		IDirect3DSurface9_GetDesc(pBackbuffer, &bbDesc);
+
+		hr = IDirect3DDevice9_CreateOffscreenPlainSurface(
+			gld->pDev, bbDesc.Width, bbDesc.Height,
+			bbDesc.Format, D3DPOOL_SYSTEMMEM, &pRTCopy, NULL);
+		if (SUCCEEDED(hr)) {
+			hr = IDirect3DDevice9_GetRenderTargetData(gld->pDev, pBackbuffer, pRTCopy);
+			if (SUCCEEDED(hr)) {
+				// Now copy the sub-rect from pRTCopy to pNativeImage
+				D3DLOCKED_RECT lrSrc, lrDst;
+				if (SUCCEEDED(IDirect3DSurface9_LockRect(pRTCopy, &lrSrc, &rcSrc, D3DLOCK_READONLY)) &&
+				    SUCCEEDED(IDirect3DSurface9_LockRect(pNativeImage, &lrDst, NULL, 0))) {
+					UINT row;
+					// Bytes per pixel for the native format
+					UINT bpp = (d3dsd.Format == D3DFMT_A8R8G8B8 || d3dsd.Format == D3DFMT_X8R8G8B8) ? 4 :
+					           (d3dsd.Format == D3DFMT_R5G6B5 || d3dsd.Format == D3DFMT_X1R5G5B5 || d3dsd.Format == D3DFMT_A1R5G5B5) ? 2 : 4;
+					UINT copyBytes = width * bpp;
+					for (row = 0; row < (UINT)height; row++) {
+						memcpy((BYTE*)lrDst.pBits + row * lrDst.Pitch,
+						       (BYTE*)lrSrc.pBits + row * lrSrc.Pitch,
+						       copyBytes);
+					}
+					IDirect3DSurface9_UnlockRect(pNativeImage);
+					IDirect3DSurface9_UnlockRect(pRTCopy);
+				} else {
+					hr = E_FAIL;
+				}
+			}
+			IDirect3DSurface9_Release(pRTCopy);
+		}
+	}
 	if (FAILED(hr)) {
 		goto gld_ReadPixels_DX9_return;
 	}
@@ -1095,14 +1101,76 @@ void gld_ReadPixels_DX9(
 		goto gld_ReadPixels_DX9_return;
 	}
 
-	// Convert to RGBA8888
-	hr = D3DXLoadSurfaceFromSurface(
-		pCanonicalImage,	// Dest surface
-		NULL, NULL,			// Dest palette, RECT
-		pNativeImage,		// Src surface
-		NULL, NULL,			// Src palette, RECT
-		D3DX_FILTER_POINT,	// Filter
-		0);					// Colourkey
+	// Convert native format to RGBA8888 via lock/memcpy
+	// If native format is already A8R8G8B8, direct copy; otherwise pixel conversion.
+	{
+		D3DLOCKED_RECT lrSrc, lrDst;
+		hr = IDirect3DSurface9_LockRect(pNativeImage, &lrSrc, NULL, D3DLOCK_READONLY);
+		if (SUCCEEDED(hr)) {
+			hr = IDirect3DSurface9_LockRect(pCanonicalImage, &lrDst, NULL, 0);
+			if (SUCCEEDED(hr)) {
+				if (d3dsd.Format == D3DFMT_A8R8G8B8 || d3dsd.Format == D3DFMT_X8R8G8B8) {
+					// Same pixel size — direct row copy
+					UINT row;
+					UINT copyBytes = width * 4;
+					for (row = 0; row < (UINT)height; row++) {
+						memcpy((BYTE*)lrDst.pBits + row * lrDst.Pitch,
+						       (BYTE*)lrSrc.pBits + row * lrSrc.Pitch,
+						       copyBytes);
+					}
+					// For X8R8G8B8, set alpha to 0xFF
+					if (d3dsd.Format == D3DFMT_X8R8G8B8) {
+						for (row = 0; row < (UINT)height; row++) {
+							DWORD *pPixel = (DWORD*)((BYTE*)lrDst.pBits + row * lrDst.Pitch);
+							UINT col;
+							for (col = 0; col < (UINT)width; col++) {
+								pPixel[col] |= 0xFF000000;
+							}
+						}
+					}
+				} else if (d3dsd.Format == D3DFMT_R5G6B5) {
+					// 16-bit RGB565 to 32-bit ARGB8888
+					UINT row;
+					for (row = 0; row < (UINT)height; row++) {
+						WORD *pSrcPixel = (WORD*)((BYTE*)lrSrc.pBits + row * lrSrc.Pitch);
+						DWORD *pDstPixel = (DWORD*)((BYTE*)lrDst.pBits + row * lrDst.Pitch);
+						UINT col;
+						for (col = 0; col < (UINT)width; col++) {
+							WORD s = pSrcPixel[col];
+							BYTE r = (BYTE)(((s >> 11) & 0x1F) * 255 / 31);
+							BYTE g = (BYTE)(((s >> 5) & 0x3F) * 255 / 63);
+							BYTE b = (BYTE)((s & 0x1F) * 255 / 31);
+							pDstPixel[col] = 0xFF000000 | (r << 16) | (g << 8) | b;
+						}
+					}
+				} else if (d3dsd.Format == D3DFMT_X1R5G5B5 || d3dsd.Format == D3DFMT_A1R5G5B5) {
+					// 16-bit X/A1R5G5B5 to 32-bit ARGB8888
+					UINT row;
+					for (row = 0; row < (UINT)height; row++) {
+						WORD *pSrcPixel = (WORD*)((BYTE*)lrSrc.pBits + row * lrSrc.Pitch);
+						DWORD *pDstPixel = (DWORD*)((BYTE*)lrDst.pBits + row * lrDst.Pitch);
+						UINT col;
+						for (col = 0; col < (UINT)width; col++) {
+							WORD s = pSrcPixel[col];
+							BYTE a = (d3dsd.Format == D3DFMT_A1R5G5B5) ? ((s & 0x8000) ? 0xFF : 0x00) : 0xFF;
+							BYTE r = (BYTE)(((s >> 10) & 0x1F) * 255 / 31);
+							BYTE g = (BYTE)(((s >> 5) & 0x1F) * 255 / 31);
+							BYTE b = (BYTE)((s & 0x1F) * 255 / 31);
+							pDstPixel[col] = ((DWORD)a << 24) | (r << 16) | (g << 8) | b;
+						}
+					}
+				} else {
+					// Unsupported format — zero fill
+					UINT row;
+					for (row = 0; row < (UINT)height; row++) {
+						memset((BYTE*)lrDst.pBits + row * lrDst.Pitch, 0, width * 4);
+					}
+				}
+				IDirect3DSurface9_UnlockRect(pCanonicalImage);
+			}
+			IDirect3DSurface9_UnlockRect(pNativeImage);
+		}
+	}
 	if (FAILED(hr)) {
 		goto gld_ReadPixels_DX9_return;
 	}
@@ -1220,16 +1288,39 @@ void gld_CopyPixels_DX9(
 	OffsetRect(&rcSrc, srcx, GLD_FLIP_HEIGHT(srcy, height));
 	ptDst.x = ptDst.y = 0;
 
-	hr = D3DXLoadSurfaceFromSurface(
-			pImage,				// Dest surface
-			NULL,				// Dest palette
-			&rcSrc,				// Dest rect
-			pBackbuffer,		// Src surface
-			NULL,				// Src palette
-			&rcSrc,				// Src rect
-			D3DX_FILTER_POINT,	// Filter
-			0					// Colorkey (0=no colorkey)
-		);
+	// Copy backbuffer sub-rect to scratch surface via GetRenderTargetData + lock/memcpy
+	{
+		IDirect3DSurface9 *pRTCopy = NULL;
+		D3DSURFACE_DESC bbDesc;
+		IDirect3DSurface9_GetDesc(pBackbuffer, &bbDesc);
+
+		hr = IDirect3DDevice9_CreateOffscreenPlainSurface(
+			gld->pDev, bbDesc.Width, bbDesc.Height,
+			bbDesc.Format, D3DPOOL_SYSTEMMEM, &pRTCopy, NULL);
+		if (SUCCEEDED(hr)) {
+			hr = IDirect3DDevice9_GetRenderTargetData(gld->pDev, pBackbuffer, pRTCopy);
+			if (SUCCEEDED(hr)) {
+				D3DLOCKED_RECT lrSrc, lrDst;
+				if (SUCCEEDED(IDirect3DSurface9_LockRect(pRTCopy, &lrSrc, &rcSrc, D3DLOCK_READONLY)) &&
+				    SUCCEEDED(IDirect3DSurface9_LockRect(pImage, &lrDst, NULL, 0))) {
+					UINT row;
+					UINT bpp = (d3dsd.Format == D3DFMT_A8R8G8B8 || d3dsd.Format == D3DFMT_X8R8G8B8) ? 4 :
+					           (d3dsd.Format == D3DFMT_R5G6B5 || d3dsd.Format == D3DFMT_X1R5G5B5 || d3dsd.Format == D3DFMT_A1R5G5B5) ? 2 : 4;
+					UINT copyBytes = width * bpp;
+					for (row = 0; row < (UINT)height; row++) {
+						memcpy((BYTE*)lrDst.pBits + row * lrDst.Pitch,
+						       (BYTE*)lrSrc.pBits + row * lrSrc.Pitch,
+						       copyBytes);
+					}
+					IDirect3DSurface9_UnlockRect(pImage);
+					IDirect3DSurface9_UnlockRect(pRTCopy);
+				} else {
+					hr = E_FAIL;
+				}
+			}
+			IDirect3DSurface9_Release(pRTCopy);
+		}
+	}
 	IDirect3DSurface9_Release(pBackbuffer);
 	if (FAILED(hr)) {
 		IDirect3DSurface9_Release(pImage);
@@ -1385,16 +1476,38 @@ void _gldAllocateTexture(
 	}
 
 	d3dFormat = _gldGLFormatToD3DFormat(texImage->IntFormat);
-	D3DXCreateTexture(
-		gld->pDev,
-		texImage->Width,
-		texImage->Height,
-		// TODO: Re-evaluate mipmapping
-		(glb.bUseMipmaps) ? D3DX_DEFAULT : 1,
-		0,				// Usage
-		d3dFormat,
-		D3DPOOL_MANAGED,
-		&pTex);
+	// Pure D3D9: IDirect3DDevice9_CreateTexture replaces D3DXCreateTexture.
+	// When mipmaps are requested, use 0 (full chain) instead of D3DX_DEFAULT.
+	{
+		UINT mipLevels = (glb.bUseMipmaps) ? 0 : 1;
+		HRESULT hr = IDirect3DDevice9_CreateTexture(
+			gld->pDev,
+			texImage->Width,
+			texImage->Height,
+			mipLevels,
+			0,				// Usage
+			d3dFormat,
+			D3DPOOL_MANAGED,
+			&pTex,
+			NULL);
+		if (FAILED(hr)) {
+			// If the requested format isn't supported, fall back to A8R8G8B8
+			if (d3dFormat != D3DFMT_A8R8G8B8) {
+				hr = IDirect3DDevice9_CreateTexture(
+					gld->pDev,
+					texImage->Width,
+					texImage->Height,
+					mipLevels,
+					0,
+					D3DFMT_A8R8G8B8,
+					D3DPOOL_MANAGED,
+					&pTex,
+					NULL);
+			}
+			if (FAILED(hr))
+				pTex = NULL;
+		}
+	}
 	tObj->DriverData = pTex;
 }
 
@@ -1546,17 +1659,22 @@ void gld_TexImage2D_DX9(
 		format, type, pixels, packing);
 
 	SetRect(&rcSrcRect, 0, 0, width, height);
-	D3DXLoadSurfaceFromMemory(
-		pSurface,
-		NULL,
-		NULL,
-		tempImage,
-		D3DFMT_A8R8G8B8,
-		width * texelBytes,
-		NULL,
-		&rcSrcRect,
-		D3DX_FILTER_POINT,
-		0);
+	// Pure D3D9: lock surface, memcpy pixel data, unlock
+	{
+		D3DLOCKED_RECT lrDst;
+		hr = IDirect3DSurface9_LockRect(pSurface, &lrDst, NULL, 0);
+		if (SUCCEEDED(hr)) {
+			UINT row;
+			UINT srcPitch = width * texelBytes;
+			UINT copyBytes = (srcPitch < (UINT)lrDst.Pitch) ? srcPitch : (UINT)lrDst.Pitch;
+			for (row = 0; row < (UINT)height; row++) {
+				memcpy((BYTE*)lrDst.pBits + row * lrDst.Pitch,
+				       (BYTE*)tempImage + row * srcPitch,
+				       copyBytes);
+			}
+			IDirect3DSurface9_UnlockRect(pSurface);
+		}
+	}
 
 	FREE(tempImage);
 	IDirect3DSurface9_Release(pSurface);
@@ -1576,7 +1694,6 @@ static void gldTexImage2DScaled(
 	const struct gl_pixelstore_attrib *packing,
 	struct gl_texture_image *texImage)
 {
-	RECT			rcSrcRect;
 	const GLint		texelBytes = 4;
 	GLvoid			*tempImage;
 
@@ -1595,18 +1712,27 @@ static void gldTexImage2DScaled(
 		0, // dstImageStride
 		format, type, pixels, packing);
 
-	SetRect(&rcSrcRect, 0, 0, width, height);
-	D3DXLoadSurfaceFromMemory(
-		pSurface,
-		NULL,
-		NULL,
-		tempImage,
-		D3DFMT_A8R8G8B8,
-		width * texelBytes,
-		NULL,
-		&rcSrcRect,
-		D3DX_DEFAULT,
-		0);
+	// Pure D3D9: lock surface, memcpy pixel data, unlock
+	// When the dest surface is smaller than the source, we copy only
+	// what fits (the D3D9 managed texture may have been created at a
+	// different size than requested).
+	{
+		D3DSURFACE_DESC d3dsd;
+		D3DLOCKED_RECT lrDst;
+		IDirect3DSurface9_GetDesc(pSurface, &d3dsd);
+		if (SUCCEEDED(IDirect3DSurface9_LockRect(pSurface, &lrDst, NULL, 0))) {
+			UINT srcPitch = width * texelBytes;
+			UINT copyRows = ((UINT)height < d3dsd.Height) ? (UINT)height : d3dsd.Height;
+			UINT copyBytes = ((UINT)(width * texelBytes) < (UINT)lrDst.Pitch) ? (UINT)(width * texelBytes) : (UINT)lrDst.Pitch;
+			UINT row;
+			for (row = 0; row < copyRows; row++) {
+				memcpy((BYTE*)lrDst.pBits + row * lrDst.Pitch,
+				       (BYTE*)tempImage + row * srcPitch,
+				       copyBytes);
+			}
+			IDirect3DSurface9_UnlockRect(pSurface);
+		}
+	}
 
 	FREE(tempImage);
 	IDirect3DSurface9_Release(pSurface);
@@ -1774,17 +1900,22 @@ void gld_TexSubImage2D_DX9( GLcontext *ctx, GLenum target, GLint level,
 	SetRect(&rcDstRect, 0, 0, width, height);
 	OffsetRect(&rcDstRect, xoffset, yoffset);
 
-	D3DXLoadSurfaceFromMemory(
-		pSurface,
-		NULL,
-		&rcDstRect,
-		tempImage,
-		D3DFMT_A8R8G8B8,
-		width * texelBytes,
-		NULL,
-		&rcSrcRect,
-		D3DX_FILTER_POINT,
-		0);
+	// Pure D3D9: lock dest sub-rect, memcpy pixel data, unlock
+	{
+		D3DLOCKED_RECT lrDst;
+		hr = IDirect3DSurface9_LockRect(pSurface, &lrDst, &rcDstRect, 0);
+		if (SUCCEEDED(hr)) {
+			UINT row;
+			UINT srcPitch = width * texelBytes;
+			UINT copyBytes = (srcPitch < (UINT)lrDst.Pitch) ? srcPitch : (UINT)lrDst.Pitch;
+			for (row = 0; row < (UINT)height; row++) {
+				memcpy((BYTE*)lrDst.pBits + row * lrDst.Pitch,
+				       (BYTE*)tempImage + row * srcPitch,
+				       copyBytes);
+			}
+			IDirect3DSurface9_UnlockRect(pSurface);
+		}
+	}
 
 	FREE(tempImage);
 	IDirect3DSurface9_Release(pSurface);
@@ -1807,7 +1938,6 @@ static void gldTexSubImage2DScaled(
 	struct gl_texture_image *texImage,
 	D3DSURFACE_DESC *d3dsd)
 {
-	RECT			rcSrcRect;
 	RECT			rcDstRect;
 	const GLint		texelBytes = 4;
 	GLvoid			*tempImage;
@@ -1827,23 +1957,27 @@ static void gldTexSubImage2DScaled(
 		0, // dstImageStride
 		format, type, pixels, packing);
 
-	SetRect(&rcSrcRect, 0, 0, width, height);
-
 	// Dest rectangle must be offset to dest image
-	SetRect(&rcDstRect, 0, 0, d3dsd->Width, d3dsd->Height);
+	SetRect(&rcDstRect, 0, 0, width, height);
 	OffsetRect(&rcDstRect, xoffset, yoffset);
 
-	D3DXLoadSurfaceFromMemory(
-		pSurface,
-		NULL,
-		&rcDstRect,
-		tempImage,
-		D3DFMT_A8R8G8B8,
-		width * texelBytes,
-		NULL,
-		&rcSrcRect,
-		D3DX_FILTER_POINT,
-		0);
+	// Pure D3D9: lock dest sub-rect, memcpy pixel data, unlock
+	{
+		D3DLOCKED_RECT lrDst;
+		HRESULT hr = IDirect3DSurface9_LockRect(pSurface, &lrDst, &rcDstRect, 0);
+		if (SUCCEEDED(hr)) {
+			UINT srcPitch = width * texelBytes;
+			UINT copyRows = ((UINT)height < d3dsd->Height) ? (UINT)height : d3dsd->Height;
+			UINT copyBytes = ((UINT)(width * texelBytes) < (UINT)lrDst.Pitch) ? (UINT)(width * texelBytes) : (UINT)lrDst.Pitch;
+			UINT row;
+			for (row = 0; row < copyRows; row++) {
+				memcpy((BYTE*)lrDst.pBits + row * lrDst.Pitch,
+				       (BYTE*)tempImage + row * srcPitch,
+				       copyBytes);
+			}
+			IDirect3DSurface9_UnlockRect(pSurface);
+		}
+	}
 
 	FREE(tempImage);
 	IDirect3DSurface9_Release(pSurface);

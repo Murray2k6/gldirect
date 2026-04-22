@@ -37,7 +37,7 @@
 
 #include "gld_context.h"
 #include "gld_driver.h"
-#include "gld_dxerr9.h"
+/* dxerr removed — DXGetErrorString replaced with pure D3D9 HRESULT lookup */
 #include "gldirect5.h"
 #include "mesa_compat.h"
 
@@ -148,20 +148,42 @@ BOOL gldGetDXErrorString_DX(
 	char *buf,
 	int nBufSize)
 {
-	//
-	// Return a string describing the input HRESULT error code
-	//
+	/* Pure D3D9 HRESULT to string — no dxerr.lib needed */
+	const char *pStr;
+	switch (hr) {
+	case D3D_OK:                         pStr = "D3D_OK"; break;
+	case D3DERR_WRONGTEXTUREFORMAT:      pStr = "D3DERR_WRONGTEXTUREFORMAT"; break;
+	case D3DERR_UNSUPPORTEDCOLOROPERATION: pStr = "D3DERR_UNSUPPORTEDCOLOROPERATION"; break;
+	case D3DERR_UNSUPPORTEDCOLORARG:     pStr = "D3DERR_UNSUPPORTEDCOLORARG"; break;
+	case D3DERR_UNSUPPORTEDALPHAOPERATION: pStr = "D3DERR_UNSUPPORTEDALPHAOPERATION"; break;
+	case D3DERR_UNSUPPORTEDALPHAARG:     pStr = "D3DERR_UNSUPPORTEDALPHAARG"; break;
+	case D3DERR_TOOMANYOPERATIONS:       pStr = "D3DERR_TOOMANYOPERATIONS"; break;
+	case D3DERR_CONFLICTINGTEXTUREFILTER: pStr = "D3DERR_CONFLICTINGTEXTUREFILTER"; break;
+	case D3DERR_UNSUPPORTEDFACTORVALUE:  pStr = "D3DERR_UNSUPPORTEDFACTORVALUE"; break;
+	case D3DERR_CONFLICTINGRENDERSTATE:  pStr = "D3DERR_CONFLICTINGRENDERSTATE"; break;
+	case D3DERR_UNSUPPORTEDTEXTUREFILTER: pStr = "D3DERR_UNSUPPORTEDTEXTUREFILTER"; break;
+	case D3DERR_CONFLICTINGTEXTUREPALETTE: pStr = "D3DERR_CONFLICTINGTEXTUREPALETTE"; break;
+	case D3DERR_DRIVERINTERNALERROR:     pStr = "D3DERR_DRIVERINTERNALERROR"; break;
+	case D3DERR_NOTFOUND:                pStr = "D3DERR_NOTFOUND"; break;
+	case D3DERR_MOREDATA:                pStr = "D3DERR_MOREDATA"; break;
+	case D3DERR_DEVICELOST:              pStr = "D3DERR_DEVICELOST"; break;
+	case D3DERR_DEVICENOTRESET:          pStr = "D3DERR_DEVICENOTRESET"; break;
+	case D3DERR_NOTAVAILABLE:            pStr = "D3DERR_NOTAVAILABLE"; break;
+	case D3DERR_OUTOFVIDEOMEMORY:        pStr = "D3DERR_OUTOFVIDEOMEMORY"; break;
+	case D3DERR_INVALIDDEVICE:           pStr = "D3DERR_INVALIDDEVICE"; break;
+	case D3DERR_INVALIDCALL:             pStr = "D3DERR_INVALIDCALL"; break;
+	case D3DERR_DRIVERINVALIDCALL:       pStr = "D3DERR_DRIVERINVALIDCALL"; break;
+	case D3DERR_WASSTILLDRAWING:         pStr = "D3DERR_WASSTILLDRAWING"; break;
+	case E_FAIL:                         pStr = "E_FAIL"; break;
+	case E_INVALIDARG:                   pStr = "E_INVALIDARG"; break;
+	case E_OUTOFMEMORY:                  pStr = "E_OUTOFMEMORY"; break;
+	default:                             pStr = "Unknown HRESULT"; break;
+	}
 
-	const char *pStr = DXGetErrorString(hr);
-
-	if (pStr == NULL)
-		return FALSE;
-
-	if (strlen(pStr) > nBufSize)
-		strncpy(buf, pStr, nBufSize);
-	else
-		strcpy(buf, pStr);
-
+	if (nBufSize > 0) {
+		strncpy(buf, pStr, nBufSize - 1);
+		buf[nBufSize - 1] = '\0';
+	}
 	return TRUE;
 }
 
@@ -516,11 +538,15 @@ SkipDirectDrawCreate:
 	}
 
 	// Dump the IHV driver level
-	// This should return:
-	// 700 - DirectX 7.0 level driver
-	// 800 - DirectX 8.0 level driver
-	// 900 - DirectX 9.0 level driver
-	uiDriverLevel = D3DXGetDriverLevel(lpCtx->pDev);
+	// D3DXGetDriverLevel removed — use D3DCAPS9 to infer driver level instead.
+	{
+		UINT inferredLevel = 700; // Default to DX7
+		if (lpCtx->d3dCaps9.VertexShaderVersion >= D3DVS_VERSION(2,0))
+			inferredLevel = 900;
+		else if (lpCtx->d3dCaps9.VertexShaderVersion >= D3DVS_VERSION(1,0))
+			inferredLevel = 800;
+		uiDriverLevel = inferredLevel;
+	}
 	gldLogPrintf(GLDLOG_SYSTEM, "[DDI Driver Level : %d]", uiDriverLevel);
 
 	// Dump some useful stats
@@ -546,7 +572,8 @@ SkipDirectDrawCreate:
 	gldLogPrintf(GLDLOG_INFO, "Can Scissor: %s", lpCtx->bCanScissor ? "Yes" : "No");
 
 	// Init projection matrix for D3D TnL
-	D3DXMatrixIdentity(&lpCtx->matProjection);
+	ZeroMemory(&lpCtx->matProjection, sizeof(D3DMATRIX));
+	lpCtx->matProjection._11 = lpCtx->matProjection._22 = lpCtx->matProjection._33 = lpCtx->matProjection._44 = 1.0f;
 	lpCtx->matModelView = lpCtx->matProjection;
 
 skip_direct3ddevice_create:
@@ -627,9 +654,11 @@ BOOL gldResizeDrawable_DX(
 	_gldDestroyPrimitiveBuffer(gld);
 
 	// Notify Effects of impending Reset
-	for (i=0; i<gld->nEffects; i++) {
-		ID3DXEffect_OnLostDevice(gld->Effects[i].pEffect);
-	}
+	// Fixed-function pipeline: no D3DX effect resources to release.
+	// Just reset the effect cache.
+	gld->nEffects = 0;
+	gld->iCurEffect = -1;
+	gld->iLastEffect = -1;
 
 	// Clear the presentation parameters (sets all members to zero)
 	ZeroMemory(&d3dpp, sizeof(d3dpp));
@@ -729,9 +758,8 @@ BOOL gldResizeDrawable_DX(
 	_gldCreatePrimitiveBuffer(gld);
 
 	// Notify Effects that Reset has been called
-	for (i=0; i<gld->nEffects; i++) {
-		ID3DXEffect_OnResetDevice(gld->Effects[i].pEffect);
-	}
+	// Fixed-function pipeline: no D3DX effect resources to restore.
+	// State will be re-applied on next gldUpdateShaders call.
 
 	// Necessary for D3D HW TnL resize when normals not present.(DaveM)
 	if (gld->bHasHWTnL)
@@ -1121,7 +1149,7 @@ BOOL gldInitialiseMesa_DX(
 	GLD_driver_dx9	*gld = NULL;
 	int				MaxTextureSize, TextureLevels;
 	BOOL			bSoftwareTnL;
-	D3DXMATRIX		vm;
+	D3DMATRIX		vm;
 
 	if (lpCtx == NULL)
 		return FALSE;
@@ -1171,7 +1199,8 @@ BOOL gldInitialiseMesa_DX(
 		(lpCtx->lpPF->dwDriverData!=D3DFMT_UNKNOWN) ? D3DZB_TRUE : D3DZB_FALSE);
 
 	// Set the view matrix
-	D3DXMatrixIdentity(&vm);
+	ZeroMemory(&vm, sizeof(D3DMATRIX));
+	vm._11 = vm._22 = vm._33 = vm._44 = 1.0f;
 	IDirect3DDevice9_SetTransform(gld->pDev, D3DTS_VIEW, &vm);
 
 	if (gld->bHasHWTnL) {

@@ -751,8 +751,9 @@ int WINAPI DllMain(
 		gldInitGlobals();
 		gldDiagLog("DllMain: gldInitGlobals done");
 
-		// Initialize Mesa proxy (optional — falls back to GLD if mesa_gl.dll not found)
-		mesaProxyInit();
+		// Mesa proxy init is deferred to first WGL call to avoid
+		// loader lock deadlocks (CreateWindow during DLL_PROCESS_ATTACH
+		// can cause hangs/crashes with Mesa's DLL chain).
 
         // Defer rest of DLL initialization to 1st WGL function call
 		break;

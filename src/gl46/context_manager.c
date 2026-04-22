@@ -198,16 +198,26 @@ HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor)
         return NULL;
     }
 
-    // Set up presentation parameters
+    // Set up presentation parameters — explicit size for DXVK compatibility
     ZeroMemory(&d3dpp, sizeof(d3dpp));
     d3dpp.Windowed               = TRUE;
     d3dpp.SwapEffect             = D3DSWAPEFFECT_DISCARD;
     d3dpp.BackBufferFormat        = d3ddm.Format;
     d3dpp.BackBufferCount         = 1;
-    d3dpp.EnableAutoDepthStencil  = TRUE;
-    d3dpp.AutoDepthStencilFormat  = D3DFMT_D24S8;
+    d3dpp.EnableAutoDepthStencil  = FALSE;
+    /* d3dpp.AutoDepthStencilFormat not needed — presentation only */
     d3dpp.hDeviceWindow           = hWnd;
     d3dpp.PresentationInterval    = D3DPRESENT_INTERVAL_DEFAULT;
+    {
+        RECT rc;
+        if (hWnd && GetClientRect(hWnd, &rc) && rc.right > 0 && rc.bottom > 0) {
+            d3dpp.BackBufferWidth  = rc.right;
+            d3dpp.BackBufferHeight = rc.bottom;
+        } else {
+            d3dpp.BackBufferWidth  = d3ddm.Width;
+            d3dpp.BackBufferHeight = d3ddm.Height;
+        }
+    }
 
     if (!glb.bWaitForRetrace) {
         if (d3dCaps.PresentationIntervals & D3DPRESENT_INTERVAL_IMMEDIATE)
@@ -307,6 +317,13 @@ BOOL _gldEnsureDevice(HWND hWnd)
     if (!hWnd)
         hWnd = GetDesktopWindow();
 
+    // Don't create device for zero-size windows (DXVK will fail)
+    {
+        RECT rc;
+        if (GetClientRect(hWnd, &rc) && rc.right == 0 && rc.bottom == 0)
+            return FALSE;
+    }
+
     // Use the existing D3D9 interface (created in gldInitContext46)
     pD3D = gl46Globals.pD3D;
     if (!pD3D) {
@@ -330,16 +347,25 @@ BOOL _gldEnsureDevice(HWND hWnd)
         return FALSE;
     }
 
-    // Set up presentation parameters
+    // Set up presentation parameters — explicit size for DXVK compatibility
     ZeroMemory(&d3dpp, sizeof(d3dpp));
     d3dpp.Windowed               = TRUE;
     d3dpp.SwapEffect             = D3DSWAPEFFECT_DISCARD;
     d3dpp.BackBufferFormat        = d3ddm.Format;
     d3dpp.BackBufferCount         = 1;
-    d3dpp.EnableAutoDepthStencil  = TRUE;
-    d3dpp.AutoDepthStencilFormat  = D3DFMT_D24S8;
+    d3dpp.EnableAutoDepthStencil  = FALSE;
     d3dpp.hDeviceWindow           = hWnd;
-    d3dpp.PresentationInterval    = D3DPRESENT_INTERVAL_DEFAULT;
+    d3dpp.PresentationInterval    = D3DPRESENT_INTERVAL_IMMEDIATE;
+    {
+        RECT rc;
+        if (hWnd && GetClientRect(hWnd, &rc) && rc.right > 0 && rc.bottom > 0) {
+            d3dpp.BackBufferWidth  = rc.right;
+            d3dpp.BackBufferHeight = rc.bottom;
+        } else {
+            d3dpp.BackBufferWidth  = d3ddm.Width;
+            d3dpp.BackBufferHeight = d3ddm.Height;
+        }
+    }
 
     if (!glb.bWaitForRetrace) {
         if (d3dCaps.PresentationIntervals & D3DPRESENT_INTERVAL_IMMEDIATE)

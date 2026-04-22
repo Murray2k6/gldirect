@@ -58,6 +58,7 @@
 
 #include "imports.h"
 #include "context.h"
+#include <stdint.h>
 
 
 #define MAXSTRING 4000  /* for vsnprintf() */
@@ -123,16 +124,16 @@ _mesa_free(void *ptr)
 void *
 _mesa_align_malloc(size_t bytes, unsigned long alignment)
 {
-   unsigned long ptr, buf;
+   uintptr_t ptr, buf;
 
    ASSERT( alignment > 0 );
 
-   ptr = (unsigned long) _mesa_malloc(bytes + alignment + sizeof(void *));
+   ptr = (uintptr_t) _mesa_malloc(bytes + alignment + sizeof(void *));
    if (!ptr)
       return NULL;
 
-   buf = (ptr + alignment + sizeof(void *)) & ~(unsigned long)(alignment - 1);
-   *(unsigned long *)(buf - sizeof(void *)) = ptr;
+   buf = (ptr + alignment + sizeof(void *)) & ~(uintptr_t)(alignment - 1);
+   *(uintptr_t *)(buf - sizeof(void *)) = ptr;
 
 #ifdef DEBUG
    /* mark the non-aligned area */
@@ -150,16 +151,16 @@ _mesa_align_malloc(size_t bytes, unsigned long alignment)
 void *
 _mesa_align_calloc(size_t bytes, unsigned long alignment)
 {
-   unsigned long ptr, buf;
+   uintptr_t ptr, buf;
 
    ASSERT( alignment > 0 );
 
-   ptr = (unsigned long) _mesa_calloc(bytes + alignment + sizeof(void *));
+   ptr = (uintptr_t) _mesa_calloc(bytes + alignment + sizeof(void *));
    if (!ptr)
       return NULL;
 
-   buf = (ptr + alignment + sizeof(void *)) & ~(unsigned long)(alignment - 1);
-   *(unsigned long *)(buf - sizeof(void *)) = ptr;
+   buf = (ptr + alignment + sizeof(void *)) & ~(uintptr_t)(alignment - 1);
+   *(uintptr_t *)(buf - sizeof(void *)) = ptr;
 
 #ifdef DEBUG
    /* mark the non-aligned area */
@@ -1072,12 +1073,13 @@ default_warning(__GLcontext *gc, char *str)
    _mesa_warning(gc, str);
 }
 
-/** Wrapper around _mesa_problem() */
+/** Wrapper around _mesa_problem() — do NOT abort, just log */
 static void
 default_fatal(__GLcontext *gc, char *str)
 {
    _mesa_problem(gc, str);
-   abort();
+   /* GLDirect: removed abort() — Mesa 26 proxy handles real GL work,
+    * so Mesa 5.1 fatals are non-critical and should not kill the process. */
 }
 
 /** Wrapper around atoi() */

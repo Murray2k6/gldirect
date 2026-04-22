@@ -62,8 +62,6 @@ GLboolean _mesa_validate_DrawElements(GLcontext *ctx,GLenum mode, GLsizei count,
 extern HGLRC	iCurrentContext;
 extern HWND		g_hwndList; // Handle to error-output listbox in editor window
 
-HRESULT _ParseEffectParameters(ID3DXEffect *pEffect, IDirect3DDevice9 *pDevice, const char *pszEffectFile);
-
 void gld_NEW_PROJECTION(GLcontext *ctx);
 void gld_NEW_MODELVIEW(GLcontext *ctx);
 
@@ -100,7 +98,10 @@ GLenum gldReducedPrim(
 	// Convert input primitive type to a reduced primitive type, since
 	// we can only send points, lines and triangles to the graphics card.
 
-	ASSERT((mode >= GL_POINTS) && (mode <= GL_POLYGON));
+	if (mode < GL_POINTS || mode > GL_POLYGON) {
+		gldLogPrintf(GLDLOG_WARN, "gldReducedPrim: invalid mode 0x%X, defaulting to GL_POINTS", mode);
+		return GL_POINTS;
+	}
 
 	return _ReducedPrimitive[mode];
 }
@@ -161,7 +162,7 @@ static void _SetColorvaluev(D3DCOLORVALUE *cv, const GLfloat *f)
 
 //---------------------------------------------------------------------------
 
-static void _GLFloatToD3DXVEC4(D3DXVECTOR4 *vec, const GLfloat *f)
+static void _GLFloatToVEC4(GLD_VEC4 *vec, const GLfloat *f)
 {
 	vec->x = f[0];
 	vec->y = f[1];
@@ -178,7 +179,11 @@ static void _gldEnlargePrimitiveBuffer(
 	// Enlarge in chunks of vertices; adding a single vertex at a time is Not Good
 	gld->dwMaxPrimVerts += GLD_PRIM_BLOCK_SIZE;
 	gld->pPrim = realloc(gld->pPrim, GLD_4D_VERTEX_SIZE * gld->dwMaxPrimVerts);
-	ASSERT(gld->pPrim);
+	if (!gld->pPrim) {
+		gldLogPrintf(GLDLOG_ERROR, "Out of memory enlarging primitive buffer to %d verts", gld->dwMaxPrimVerts);
+		gld->dwMaxPrimVerts = 0;
+		return;
+	}
 #ifdef DEBUG
 	// Useful info to know; dump it in Debug builds
 	gldLogPrintf(GLDLOG_SYSTEM, "** Primitive buffer enlarged to %d verts **", gld->dwMaxPrimVerts);
@@ -901,7 +906,12 @@ static void GLAPIENTRY d3dEnd(void)
 		count			= nD3DPrimitives;
 		break;
 	default:
-		ASSERT(0); // BANG!
+		/* Unknown primitive — treat as points */
+		nGLPrimitives	= gld->dwPrimVert;
+		nD3DPrimitives	= nGLPrimitives;
+		nD3DVertices	= nGLPrimitives;
+		count			= gld->dwPrimVert;
+		break;
 	}
 
 #if 0
@@ -1044,7 +1054,11 @@ static void GLAPIENTRY d3dEnd(void)
 		}
 		break;
 	default:
-		ASSERT(0); // Sanity test...
+		/* Unknown primitive — copy vertices as-is */
+		for (j=0; j<count && j<(int)gld->dwPrimVert; j++, pDst++) {
+			*pDst = pSrc[j];
+		}
+		break;
 	}
 
 	// Unlock vertex buffer
@@ -1108,8 +1122,10 @@ static void d3dFlushVertices(
 	case PRIM_UNKNOWN:
 		return; // Invalid primitive type
 	default:
-		ASSERT(0);
-		return;
+		/* Unrecognized reduced primitive — treat as points */
+		d3dpt		= D3DPT_POINTLIST;
+		nPrimitives	= nVertices;
+		break;
 	}
 
 	// Bail if nothing to do
@@ -1119,14 +1135,9 @@ static void d3dFlushVertices(
 
 #if 1
 	//
-	// Runtime Shaders. Should use these all the time.
+	// Fixed-function pipeline. State already applied via gldUpdateShaders.
+	// No ID3DXEffect_CommitChanges needed — D3D9 fixed-function is immediate.
 	//
-
-	{
-		GLD_effect	*pGLDEffect;
-		pGLDEffect = &gld->Effects[gld->iCurEffect];
-		ID3DXEffect_CommitChanges(pGLDEffect->pEffect);
-	}
 
 	// TODO: Reduce redundant SetStreamSource() calls
 	_GLD_DX9_DEV(SetStreamSource(gld->pDev, 0, gld->pVB, 0, GLD_4D_VERTEX_SIZE));
@@ -1342,10 +1353,9 @@ BOOL gldInstallD3DTnl(GLcontext *ctx)
 		gld->LightDir[i].x = 0.0f;
 	}
 
-	// Create en effect pool to allow vars to be shared between effects
-	D3DXCreateEffectPool(&gld->pEffectPool);
+	// Fixed-function pipeline — no effect pool needed (was D3DXCreateEffectPool)
 
-	// Update the runtime shader generator
+	// Update the fixed-function pipeline state
 	gldUpdateShaders(ctx);
 
 	// Set some state

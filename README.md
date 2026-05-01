@@ -1,3 +1,7 @@
+UPDATED to where the wrapper uses all gl versions with mesa to wrap to the Direct X 9 API
+
+
+
 # gldirect
 Updating the open source GLDirect v5, a Direct3D Device Driver for Mesa
 

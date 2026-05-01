@@ -14,6 +14,10 @@
 
 #include <windows.h>
 
+/* OpenGL types needed for function prototypes */
+typedef unsigned char GLubyte;
+typedef unsigned int GLenum;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,6 +44,7 @@ typedef int   (WINAPI *PFN_wglDescribePixelFormat)(HDC, int, UINT, PIXELFORMATDE
 typedef int   (WINAPI *PFN_wglGetPixelFormat)(HDC);
 typedef BOOL  (WINAPI *PFN_wglSetPixelFormat)(HDC, int, const PIXELFORMATDESCRIPTOR*);
 typedef BOOL  (WINAPI *PFN_wglSwapBuffers)(HDC);
+typedef const GLubyte* (WINAPI *PFN_glGetString)(GLenum);
 
 typedef struct {
     HMODULE                  hMesaDLL;
@@ -55,6 +60,7 @@ typedef struct {
     PFN_wglGetPixelFormat    wglGetPixelFormat;
     PFN_wglSetPixelFormat    wglSetPixelFormat;
     PFN_wglSwapBuffers       wglSwapBuffers;
+    PFN_glGetString          glGetString;
     BOOL                     initialized;
 } MesaProxy;
 

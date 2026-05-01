@@ -318,6 +318,103 @@ static void _gldApplyFixedFunctionState(
 				// Set texture
 				if (tObj && tObj->DriverData) {
 					IDirect3DDevice9_SetTexture(pDev, i, (IDirect3DBaseTexture9*)tObj->DriverData);
+
+					// Sampler state — set every frame for d3d9.dll wrapper compatibility
+					{
+						D3DTEXTUREFILTERTYPE minF = D3DTEXF_POINT, mipF = D3DTEXF_NONE;
+						D3DTEXTUREFILTERTYPE magF = (tObj->MagFilter == GL_LINEAR) ? D3DTEXF_LINEAR : D3DTEXF_POINT;
+						switch (tObj->MinFilter) {
+						case GL_NEAREST:                minF = D3DTEXF_POINT;  mipF = D3DTEXF_NONE;   break;
+						case GL_LINEAR:                 minF = D3DTEXF_LINEAR; mipF = D3DTEXF_NONE;   break;
+						case GL_NEAREST_MIPMAP_NEAREST: minF = D3DTEXF_POINT;  mipF = D3DTEXF_POINT;  break;
+						case GL_LINEAR_MIPMAP_NEAREST:  minF = D3DTEXF_LINEAR; mipF = D3DTEXF_POINT;  break;
+						case GL_NEAREST_MIPMAP_LINEAR:  minF = D3DTEXF_POINT;  mipF = D3DTEXF_LINEAR; break;
+						case GL_LINEAR_MIPMAP_LINEAR:   minF = D3DTEXF_LINEAR; mipF = D3DTEXF_LINEAR; break;
+						}
+						IDirect3DDevice9_SetSamplerState(pDev, i, D3DSAMP_MINFILTER, minF);
+						IDirect3DDevice9_SetSamplerState(pDev, i, D3DSAMP_MIPFILTER, mipF);
+						IDirect3DDevice9_SetSamplerState(pDev, i, D3DSAMP_MAGFILTER, magF);
+						IDirect3DDevice9_SetSamplerState(pDev, i, D3DSAMP_ADDRESSU,
+							(tObj->WrapS == GL_CLAMP || tObj->WrapS == GL_CLAMP_TO_EDGE) ? D3DTADDRESS_CLAMP : D3DTADDRESS_WRAP);
+						IDirect3DDevice9_SetSamplerState(pDev, i, D3DSAMP_ADDRESSV,
+							(tObj->WrapT == GL_CLAMP || tObj->WrapT == GL_CLAMP_TO_EDGE) ? D3DTADDRESS_CLAMP : D3DTADDRESS_WRAP);
+					}
+
+					// Texture environment — set color/alpha ops per stage
+					{
+						GLenum baseFormat = GL_RGBA;
+						GLenum envMode = pUnit->EnvMode;
+						// Determine base format from D3D texture
+						D3DSURFACE_DESC texDesc;
+						IDirect3DTexture9 *pTex9 = (IDirect3DTexture9*)tObj->DriverData;
+						if (SUCCEEDED(IDirect3DTexture9_GetLevelDesc(pTex9, 0, &texDesc))) {
+							switch (texDesc.Format) {
+							case D3DFMT_A8R8G8B8: case D3DFMT_A1R5G5B5: case D3DFMT_A4R4G4B4:
+							case D3DFMT_A8L8: case D3DFMT_A4L4: case D3DFMT_DXT1:
+							case D3DFMT_DXT3: case D3DFMT_DXT5:
+								baseFormat = GL_RGBA; break;
+							case D3DFMT_A8:
+								baseFormat = GL_ALPHA; break;
+							default:
+								baseFormat = GL_RGB; break;
+							}
+						}
+						// Set texture stage ops based on env mode
+						switch (envMode) {
+						case GL_REPLACE:
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+							if (baseFormat == GL_RGBA || baseFormat == GL_ALPHA) {
+								IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+								IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+							} else {
+								IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
+								IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+							}
+							break;
+						case GL_DECAL:
+							if (baseFormat == GL_RGBA) {
+								IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLOROP, D3DTOP_BLENDTEXTUREALPHA);
+							} else {
+								IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+							}
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+							break;
+						case GL_BLEND:
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLOROP, D3DTOP_LERP);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+							break;
+						case GL_ADD:
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLOROP, D3DTOP_ADD);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+							break;
+						case GL_MODULATE:
+						default:
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLOROP, D3DTOP_MODULATE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+							IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+							if (baseFormat == GL_RGBA || baseFormat == GL_ALPHA) {
+								IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+								IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+								IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+							} else {
+								IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
+								IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+							}
+							break;
+						}
+					}
 				} else {
 					IDirect3DDevice9_SetTexture(pDev, i, NULL);
 				}
@@ -337,11 +434,7 @@ static void _gldApplyFixedFunctionState(
 						dwTexCoordIndex = D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR | i;
 					} else if (pUnit->_GenBitS & TEXGEN_EYE_LINEAR) {
 						dwTexCoordIndex = D3DTSS_TCI_CAMERASPACEPOSITION | i;
-					}
-					// Note: Object linear texgen has no direct D3D9 equivalent;
-					// it would need custom vertex processing. For the fixed-function
-					// fallback we use camera-space position as the closest approximation.
-					else if (pUnit->_GenBitS & TEXGEN_OBJ_LINEAR) {
+					} else if (pUnit->_GenBitS & TEXGEN_OBJ_LINEAR) {
 						dwTexCoordIndex = D3DTSS_TCI_CAMERASPACEPOSITION | i;
 					}
 					IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_TEXCOORDINDEX, dwTexCoordIndex);
@@ -350,6 +443,8 @@ static void _gldApplyFixedFunctionState(
 				}
 			} else {
 				IDirect3DDevice9_SetTexture(pDev, i, NULL);
+				IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_COLOROP, D3DTOP_DISABLE);
+				IDirect3DDevice9_SetTextureStageState(pDev, i, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 			}
 		}
 		// Disable texture stages beyond what we use

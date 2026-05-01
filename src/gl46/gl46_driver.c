@@ -367,13 +367,86 @@ static const char *WINAPI _wglGetExtensionsStringEXT(void)
 static HGLRC WINAPI _wglCreateContextAttribsARB(HDC hDC, HGLRC hShareContext, const int *attribList)
 {
 	// The wrapper accepts any version request — we emulate everything via DX9.
-	// Replicate what wglCreateContext does internally.
-	extern int gldGetPixelFormat(void);
+	// Always use the eager real-window path (gldCreateContext) so the D3D9
+	// device is bound to the actual HWND the app provided.
+	extern int   gldGetPixelFormat(void);
+	extern void  gldSetPixelFormat(int iPixelFormat);
+	extern BOOL  gldValidate(void);
 	extern HGLRC gldCreateContext(HDC a, const GLD_pixelFormat *lpPF);
-	int ipf = gldGetPixelFormat();
-	if (ipf < 1 || ipf > glb.nPixelFormatCount)
+	extern BOOL  IsValidPFD(int iPFD);
+	extern int   gldResolvePFDForDC(HDC hDC);
+
+	int   ipf = 0;
+	HGLRC hglrc = NULL;
+
+	gldLogMessage(GLDLOG_SYSTEM, "GL46: wglCreateContextAttribsARB called\n");
+
+	if (hDC == NULL) {
+		gldLogMessage(GLDLOG_ERROR,
+			"GL46: wglCreateContextAttribsARB: NULL HDC\n");
+		SetLastError(ERROR_INVALID_HANDLE);
 		return NULL;
-	return gldCreateContext(hDC, &glb.lpPF[ipf-1]);
+	}
+
+	// License gate (matches wglCreateContext)
+	if (!gldValidate()) {
+		gldLogMessage(GLDLOG_ERROR,
+			"GL46: wglCreateContextAttribsARB: gldValidate failed\n");
+		SetLastError(ERROR_ACCESS_DENIED);
+		return NULL;
+	}
+
+	// Make sure the pixel format table exists.
+	if (glb.nPixelFormatCount == 0 || glb.lpPF == NULL) {
+		gldLogMessage(GLDLOG_WARN, "GL46: PF table empty, building it now\n");
+		gldBuildPixelFormatList46();
+	}
+	if (glb.nPixelFormatCount == 0 || glb.lpPF == NULL) {
+		gldLogMessage(GLDLOG_ERROR,
+			"GL46: wglCreateContextAttribsARB FAILED (no pixel formats available)\n");
+		SetLastError(ERROR_INVALID_PIXEL_FORMAT);
+		return NULL;
+	}
+
+	// 1. Resolve the real OS-level PF on the DC and translate it to our
+	//    wrapper's PF index by matching the actual PIXELFORMATDESCRIPTOR.
+	ipf = gldResolvePFDForDC(hDC);
+
+	// 2. Fall back to the wrapper's thread-local current PF.
+	if (!IsValidPFD(ipf))
+		ipf = gldGetPixelFormat();
+
+	// 3. Last-resort fallback to PF 1. This wrapper emulates *every*
+	//    GL version (1.x through 4.6) via DX9 regardless of which PF
+	//    is selected, so any valid PF satisfies any GL version request.
+	//    Refusing the context here would break games that call
+	//    wglCreateContextAttribsARB on a DC whose PF we couldn't
+	//    successfully translate.
+	if (!IsValidPFD(ipf)) {
+		gldLogPrintf(GLDLOG_WARN,
+			"GL46: wglCreateContextAttribsARB: could not resolve PF for DC, using wrapper PF 1");
+		ipf = 1;
+	}
+
+	// Sync the wrapper's internal current-PF.
+	gldSetPixelFormat(ipf);
+
+	// Eager real-window context creation. D3D9 device is bound to the real
+	// HWND derived from hDC inside gldCreateContextBuffers.
+	hglrc = gldCreateContext(hDC, &glb.lpPF[ipf - 1]);
+
+	if (hglrc == NULL) {
+		gldLogMessage(GLDLOG_ERROR,
+			"GL46: wglCreateContextAttribsARB: gldCreateContext returned NULL\n");
+		SetLastError(ERROR_INVALID_OPERATION);
+	} else {
+		gldLogPrintf(GLDLOG_SYSTEM,
+			"GL46: wglCreateContextAttribsARB: real-window context created (HGLRC=%d, PF=%d)",
+			(int)(INT_PTR)hglrc, ipf);
+	}
+	(void)hShareContext;
+	(void)attribList;
+	return hglrc;
 }
 
 static BOOL WINAPI _wglChoosePixelFormatARB(HDC hDC, const int *piAttribIList,

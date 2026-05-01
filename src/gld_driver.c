@@ -429,36 +429,35 @@ static BOOL _DestroyPrivateGlobals_NOP(void)
 
 //---------------------------------------------------------------------------
 
-static GLD_pixelFormat pfNOP =
-{
-    {
-	sizeof(PIXELFORMATDESCRIPTOR),	// Size of the data structure
-		1,							// Structure version - should be 1
-									// Flags:
-		PFD_DRAW_TO_WINDOW |		// The buffer can draw to a window or device surface.
-		PFD_DRAW_TO_BITMAP |		// The buffer can draw to a bitmap. (DaveM)
-		PFD_SUPPORT_GDI |			// The buffer supports GDI drawing. (DaveM)
-		PFD_SUPPORT_OPENGL |		// The buffer supports OpenGL drawing.
-		PFD_DOUBLEBUFFER |			// The buffer is double-buffered.
-		0,							// Placeholder for easy commenting of above flags
-		PFD_TYPE_RGBA,				// Pixel type RGBA.
-		16,							// Total colour bitplanes (excluding alpha bitplanes)
-		5, 0,						// Red bits, shift
-		5, 0,						// Green bits, shift
-		5, 0,						// Blue bits, shift
-		0, 0,						// Alpha bits, shift (destination alpha)
-		0,							// Accumulator bits (total)
-		0, 0, 0, 0,					// Accumulator bits: Red, Green, Blue, Alpha
-		0,							// Depth bits
-		0,							// Stencil bits
-		0,							// Number of auxiliary buffers
-		0,							// Layer type
-		0,							// Specifies the number of overlay and underlay planes.
-		0,							// Layer mask
-		0,							// Specifies the transparent color or index of an underlay plane.
-		0							// Damage mask
+static GLD_pixelFormat pfNOP = {
+	{
+		sizeof(PIXELFORMATDESCRIPTOR),	// Size of the data structure
+		1,								// Structure version - should be 1
+		// Flags:
+		PFD_DRAW_TO_WINDOW |			// The buffer can draw to a window or device surface.
+		PFD_DRAW_TO_BITMAP |			// The buffer can draw to a bitmap. (DaveM)
+		PFD_SUPPORT_GDI |				// The buffer supports GDI drawing. (DaveM)
+		PFD_SUPPORT_OPENGL |			// The buffer supports OpenGL drawing.
+		PFD_DOUBLEBUFFER |				// The buffer is double-buffered.
+		0,								// Placeholder for easy commenting of above flags
+		PFD_TYPE_RGBA,					// Pixel type RGBA.
+		16,								// Total colour bitplanes (excluding alpha bitplanes)
+		5, 0,							// Red bits, shift
+		5, 0,							// Green bits, shift
+		5, 0,							// Blue bits, shift
+		0, 0,							// Alpha bits, shift (destination alpha)
+		0,								// Accumulator bits (total)
+		0, 0, 0, 0,						// Accumulator bits: Red, Green, Blue, Alpha
+		0,								// Depth bits
+		0,								// Stencil bits
+		0,								// Number of auxiliary buffers
+		0,								// Layer type
+		0,								// Specifies the number of overlay and underlay planes.
+		0,								// Layer mask
+		0,								// Specifies the transparent color or index of an underlay plane.
+		0								// Damage mask
 	},
-	0,	// Driver data
+	0	// Driver data
 };
 
 static BOOL _BuildPixelformatList_NOP(void)
@@ -542,12 +541,12 @@ BOOL gldInitDriverPointers(
 	return TRUE;
 #endif
 
-	if (dwDriver == GLDS_DRIVER_MESA_SW) {
+	if (dwDriver == GLDS_DRIVER_MESA_SW_E) {
 		// Mesa Software driver
 		return FALSE;
 	}
 	
-	if ((dwDriver == GLDS_DRIVER_REF) || (dwDriver == GLDS_DRIVER_HAL)) {
+	if ((dwDriver == GLDS_DRIVER_REF_E) || (dwDriver == GLDS_DRIVER_HAL_E)) {
 		// Direct3D driver, either HW or SW
 		_gldDriver.CreateDrawable			= gldCreateDrawable_DX;
 		_gldDriver.ResizeDrawable			= gldResizeDrawable_DX;
@@ -562,7 +561,7 @@ BOOL gldInitDriverPointers(
 		return TRUE;
 	};
 
-	if (dwDriver == GLDS_DRIVER_GL46) {
+	if (dwDriver == GLDS_DRIVER_GL46_E) {
 		// OpenGL 4.6 core profile backend
 		_gldDriver.GetDXErrorString			= gldGetDXErrorString_GL46;
 		_gldDriver.CreateDrawable			= gldCreateDrawable_GL46;

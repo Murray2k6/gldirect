@@ -37,6 +37,7 @@
 
 #include "gld_context.h"
 #include "gld_log.h"
+#include "../gld_diag.h"
 #include "gldirect5.h"
 
 // TODO: Mesa includes removed - will be replaced by GL46 modules in later tasks
@@ -175,19 +176,17 @@ static void _GLFloatToVEC4(GLD_VEC4 *vec, const GLfloat *f)
 static void _gldEnlargePrimitiveBuffer(
 	GLD_driver_dx9 *gld)
 {
-	// Ran out of space in the primitive buffer. Enlarge it.
-	// Enlarge in chunks of vertices; adding a single vertex at a time is Not Good
-	gld->dwMaxPrimVerts += GLD_PRIM_BLOCK_SIZE;
+	// Double the buffer size for amortized O(1) growth instead of linear realloc
+	DWORD newSize = gld->dwMaxPrimVerts * 2;
+	if (newSize < gld->dwMaxPrimVerts + GLD_PRIM_BLOCK_SIZE)
+		newSize = gld->dwMaxPrimVerts + GLD_PRIM_BLOCK_SIZE;
+	gld->dwMaxPrimVerts = newSize;
 	gld->pPrim = realloc(gld->pPrim, GLD_4D_VERTEX_SIZE * gld->dwMaxPrimVerts);
 	if (!gld->pPrim) {
 		gldLogPrintf(GLDLOG_ERROR, "Out of memory enlarging primitive buffer to %d verts", gld->dwMaxPrimVerts);
 		gld->dwMaxPrimVerts = 0;
 		return;
 	}
-#ifdef DEBUG
-	// Useful info to know; dump it in Debug builds
-	gldLogPrintf(GLDLOG_SYSTEM, "** Primitive buffer enlarged to %d verts **", gld->dwMaxPrimVerts);
-#endif
 }
 
 //---------------------------------------------------------------------------
@@ -1122,7 +1121,6 @@ static void d3dFlushVertices(
 	case PRIM_UNKNOWN:
 		return; // Invalid primitive type
 	default:
-		/* Unrecognized reduced primitive — treat as points */
 		d3dpt		= D3DPT_POINTLIST;
 		nPrimitives	= nVertices;
 		break;
@@ -1133,25 +1131,45 @@ static void d3dFlushVertices(
 		goto bail;
 	}
 
-#if 1
-	//
-	// Fixed-function pipeline. State already applied via gldUpdateShaders.
-	// No ID3DXEffect_CommitChanges needed — D3D9 fixed-function is immediate.
-	//
+	// Set transforms explicitly before every draw call.
+	// D3D9 wrappers (DXVK Remix, dgVoodoo) need current state per draw.
+	IDirect3DDevice9_SetTransform(gld->pDev, D3DTS_PROJECTION, &gld->matProjection);
+	IDirect3DDevice9_SetTransform(gld->pDev, D3DTS_WORLD, &gld->matModelView);
+	{
+		D3DMATRIX ident;
+		ZeroMemory(&ident, sizeof(ident));
+		ident._11 = ident._22 = ident._33 = ident._44 = 1.0f;
+		IDirect3DDevice9_SetTransform(gld->pDev, D3DTS_VIEW, &ident);
+	}
 
-	// TODO: Reduce redundant SetStreamSource() calls
-	_GLD_DX9_DEV(SetStreamSource(gld->pDev, 0, gld->pVB, 0, GLD_4D_VERTEX_SIZE));
-	_GLD_DX9_DEV(DrawPrimitive(gld->pDev, d3dpt, gld->dwFirstVBVert, nPrimitives));
-#else
-	//
-	// Fixed Function. For testing only.
-	//
-	_GLD_DX9_DEV(SetTransform(gld->pDev, D3DTS_PROJECTION, &gld->matProjection));
-	_GLD_DX9_DEV(SetTransform(gld->pDev, D3DTS_WORLD, &gld->matModelView));
-	_GLD_DX9_DEV(SetPixelShader(gld->pDev, NULL));
-	_GLD_DX9_DEV(SetVertexShader(gld->pDev, NULL));
-	_GLD_DX9_DEV(DrawPrimitive(gld->pDev, d3dpt, gld->dwFirstVBVert, nPrimitives));
-#endif
+	// Ensure fixed-function pipeline (no shaders)
+	IDirect3DDevice9_SetVertexShader(gld->pDev, NULL);
+	IDirect3DDevice9_SetPixelShader(gld->pDev, NULL);
+
+	// Use DrawPrimitiveUP — sends vertex data directly to D3D9.
+	// This gives d3d9.dll wrappers stable vertex data for geometry hashing
+	// and avoids dynamic VB issues with DISCARD/NOOVERWRITE.
+	{
+		GLD_4D_VERTEX *pVerts;
+		HRESULT hr;
+
+		// Lock the VB to get the vertex pointer for the current batch
+		hr = IDirect3DVertexBuffer9_Lock(gld->pVB,
+			GLD_4D_VERTEX_SIZE * gld->dwFirstVBVert,
+			GLD_4D_VERTEX_SIZE * nVertices,
+			(void**)&pVerts, D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE);
+		if (SUCCEEDED(hr)) {
+			// Set vertex declaration and draw with UP data
+			IDirect3DDevice9_SetStreamSource(gld->pDev, 0, NULL, 0, 0);
+			IDirect3DDevice9_SetVertexDeclaration(gld->pDev, gld->pVertDecl);
+			IDirect3DDevice9_DrawPrimitiveUP(gld->pDev, d3dpt, nPrimitives,
+				pVerts, GLD_4D_VERTEX_SIZE);
+			IDirect3DVertexBuffer9_Unlock(gld->pVB);
+
+			// Restore stream source for next batch fill
+			IDirect3DDevice9_SetStreamSource(gld->pDev, 0, gld->pVB, 0, GLD_4D_VERTEX_SIZE);
+		}
+	}
 
 bail:
 	gld->dwFirstVBVert		= gld->dwNextVBVert;
@@ -1224,13 +1242,22 @@ BOOL gldInstallD3DTnl(GLcontext *ctx)
 	GLvertexformat			*vf;
 	int						i;
 
+	gldDiagLog("gldInstallD3DTnl: enter ctx=%p gldCtx=%p gld=%p", (void*)ctx, (void*)gldCtx, (void*)gld);
+	if (!ctx || !gldCtx || !gld) {
+		gldDiagLog("gldInstallD3DTnl: required pointer NULL, aborting");
+		return FALSE;
+	}
+
 	// Initialize the arrayelt helper
+	gldDiagLog("gldInstallD3DTnl: -> _ae_create_context");
 	if (!_ae_create_context( ctx ))
 		return FALSE;
+	gldDiagLog("gldInstallD3DTnl: _ae_create_context OK");
 
 	// Create our own vertexformat struct
 	// NOTE: CALLOC sets all function pointers to NULL
 	vf = gld->vfExec = (GLvertexformat*)CALLOC(sizeof(GLvertexformat));
+	gldDiagLog("gldInstallD3DTnl: vf=%p", (void*)vf);
 	if (vf == NULL)
 		return FALSE;
 
@@ -1275,7 +1302,9 @@ BOOL gldInstallD3DTnl(GLcontext *ctx)
 	vf->TexCoord4fv				= d3dTexCoord4fv;
 */
 	// Let Mesa handle fill in default callbacks
+	gldDiagLog("gldInstallD3DTnl: -> _mesa_noop_vtxfmt_init");
 	_mesa_noop_vtxfmt_init(vf);
+	gldDiagLog("gldInstallD3DTnl: _mesa_noop_vtxfmt_init OK");
 
 	//
 	// Plug in our functions
@@ -1318,7 +1347,9 @@ BOOL gldInstallD3DTnl(GLcontext *ctx)
 #endif
 
 	// Install our own vertexformat
+	gldDiagLog("gldInstallD3DTnl: -> _mesa_install_exec_vtxfmt");
 	_mesa_install_exec_vtxfmt(ctx, vf);
+	gldDiagLog("gldInstallD3DTnl: _mesa_install_exec_vtxfmt OK");
 
 	//
 	// Install stub functions. Use Mesa display list functionality.
@@ -1327,14 +1358,18 @@ BOOL gldInstallD3DTnl(GLcontext *ctx)
 	vf->CallLists				= _mesa_CallLists;
 
 	// Plug in our optimised display list support
+	gldDiagLog("gldInstallD3DTnl: -> _gld_install_save_vtxfmt");
 	_gld_install_save_vtxfmt(ctx);
+	gldDiagLog("gldInstallD3DTnl: _gld_install_save_vtxfmt OK");
 
 	// Install our tnl function pointers
+	gldDiagLog("gldInstallD3DTnl: assigning ctx->Driver.* (ctx=%p)", (void*)ctx);
 	ctx->Driver.FlushVertices			= d3dFlushVertices;
 	ctx->Driver.MakeCurrent				= d3dMakeCurrent;
 	ctx->Driver.NeedFlush				= FLUSH_UPDATE_CURRENT;
 	ctx->Driver.CurrentExecPrimitive	= PRIM_OUTSIDE_BEGIN_END;
 	ctx->Driver.CurrentSavePrimitive	= PRIM_OUTSIDE_BEGIN_END;
+	gldDiagLog("gldInstallD3DTnl: ctx->Driver.* assigned");
 
 	//gld->GLPrim							= PRIM_UNKNOWN;
 	gld->GLReducedPrim					= PRIM_UNKNOWN;

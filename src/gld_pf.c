@@ -132,9 +132,11 @@ BOOL IsValidPFD(int iPFD)
 		(glb.nPixelFormatCount == 0))
 		return FALSE;
 
-	// Check PFD range
+	// Check PFD range. Don't log here: IsValidPFD is used as a predicate
+	// by callers (e.g. wglCreateContext) that intentionally probe with
+	// iPFD=0 before resolving the real PF from the DC. Logging here
+	// produces misleading "(ERR) PFD out of range" spam on every probe.
 	if ( (iPFD < 1) || (iPFD > glb.nPixelFormatCount) ) {
-		gldLogMessage(GLDLOG_ERROR, "PFD out of range\n");
 		return FALSE; // PFD is invalid
 	}
 
@@ -154,6 +156,129 @@ BOOL IsValidPFD(int iPFD)
 	}
 
 	return TRUE; // PFD is valid
+}
+
+// ***********************************************************************
+// gldFindMatchingPFD
+//
+// Translate an arbitrary Win32 PIXELFORMATDESCRIPTOR into the index
+// (1-based) of the wrapper's closest matching pixel format.
+//
+// Scoring rules (higher = better match):
+//   - color depth (cColorBits)        : exact +100, within 8 bits +50
+//   - depth buffer (cDepthBits)       : exact +60,  any depth >= req +30
+//   - stencil buffer (cStencilBits)   : exact +40,  any stencil >= req +20
+//   - double buffer flag              : match +30
+//   - draw-to-window flag             : match +20
+//   - support OpenGL flag             : match +10
+//
+// If no formats exist, returns 0. Otherwise always returns a valid
+// 1-based index (worst case the first format).
+// ***********************************************************************
+
+int gldFindMatchingPFD(const PIXELFORMATDESCRIPTOR *pfdRequested)
+{
+	int i;
+	int bestIndex = 1;
+	int bestScore = -1;
+	const GLD_pixelFormat *lpPF;
+
+	if (glb.lpPF == NULL || glb.nPixelFormatCount == 0)
+		return 0;
+
+	if (pfdRequested == NULL)
+		return 1;
+
+	for (i = 0, lpPF = glb.lpPF; i < glb.nPixelFormatCount; i++, lpPF++) {
+		const PIXELFORMATDESCRIPTOR *pfdCandidate = &lpPF->pfd;
+		int score = 0;
+		int colorDelta;
+		BOOL reqDouble = (pfdRequested->dwFlags & PFD_DOUBLEBUFFER) != 0;
+		BOOL candDouble = (pfdCandidate->dwFlags & PFD_DOUBLEBUFFER) != 0;
+		BOOL reqWindow = (pfdRequested->dwFlags & PFD_DRAW_TO_WINDOW) != 0;
+		BOOL candWindow = (pfdCandidate->dwFlags & PFD_DRAW_TO_WINDOW) != 0;
+		BOOL reqGL = (pfdRequested->dwFlags & PFD_SUPPORT_OPENGL) != 0;
+		BOOL candGL = (pfdCandidate->dwFlags & PFD_SUPPORT_OPENGL) != 0;
+
+		/* Color depth */
+		if (pfdRequested->cColorBits == 0) {
+			score += 25; /* don't care */
+		} else if (pfdCandidate->cColorBits == pfdRequested->cColorBits) {
+			score += 100;
+		} else {
+			colorDelta = (int)pfdCandidate->cColorBits - (int)pfdRequested->cColorBits;
+			if (colorDelta < 0) colorDelta = -colorDelta;
+			if (colorDelta <= 8) score += 50;
+			else if (colorDelta <= 16) score += 20;
+		}
+
+		/* Depth buffer */
+		if (pfdRequested->cDepthBits == 0) {
+			score += 15; /* don't care */
+		} else if (pfdCandidate->cDepthBits == pfdRequested->cDepthBits) {
+			score += 60;
+		} else if (pfdCandidate->cDepthBits >= pfdRequested->cDepthBits) {
+			score += 30;
+		}
+
+		/* Stencil buffer */
+		if (pfdRequested->cStencilBits == 0) {
+			score += 10; /* don't care */
+		} else if (pfdCandidate->cStencilBits == pfdRequested->cStencilBits) {
+			score += 40;
+		} else if (pfdCandidate->cStencilBits >= pfdRequested->cStencilBits) {
+			score += 20;
+		}
+
+		/* Double buffering */
+		if (reqDouble == candDouble)
+			score += 30;
+
+		/* Draw-to-window */
+		if (reqWindow == candWindow)
+			score += 20;
+
+		/* OpenGL support */
+		if (reqGL == candGL)
+			score += 10;
+
+		if (score > bestScore) {
+			bestScore = score;
+			bestIndex = i + 1;
+		}
+	}
+
+	return bestIndex;
+}
+
+// ***********************************************************************
+// gldResolvePFDForDC
+//
+// Query the OS for the HDC's current pixel format, fetch the matching
+// PFD via Win32 DescribePixelFormat, and translate to the wrapper's
+// internal PF index. Returns 0 if the DC has no PF set or describing
+// it failed.
+// ***********************************************************************
+
+int gldResolvePFDForDC(HDC hDC)
+{
+	int osPf;
+	PIXELFORMATDESCRIPTOR pfd;
+
+	if (hDC == NULL)
+		return 0;
+
+	osPf = GetPixelFormat(hDC);
+	if (osPf < 1)
+		return 0;
+
+	memset(&pfd, 0, sizeof(pfd));
+	pfd.nSize = sizeof(pfd);
+	pfd.nVersion = 1;
+	if (DescribePixelFormat(hDC, osPf, sizeof(pfd), &pfd) == 0)
+		return 0;
+
+	return gldFindMatchingPFD(&pfd);
 }
 
 // ***********************************************************************

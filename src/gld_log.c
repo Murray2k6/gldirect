@@ -111,6 +111,7 @@ void gldLogMessage(
 	if (severity >= gldDebugLevel) {
 		sprintf(buf, "GLD: (%s) %s", gldLogSeverityMessages[severity], message);
 		fputs(buf, fpGLDLog); // Write string to file
+		fflush(fpGLDLog);     // Flush every line so a crash doesn't lose output
 		OutputDebugString(buf); // Echo to debugger
 	}
 

@@ -116,6 +116,13 @@ BOOL _gldEnsureDevice(HWND hWnd);
  */
 IDirect3D9* gldGetD3D46(void);
 
+/*
+ * Check if NVIDIA DXVK Remix d3d9.dll was detected.
+ * When TRUE, the wrapper should use D3D9 fixed-function pipeline
+ * for draw calls so Remix can intercept geometry for path tracing.
+ */
+BOOL gldIsRemixDetected(void);
+
 #ifdef  __cplusplus
 }
 #endif

@@ -238,19 +238,17 @@ static void _gldEnlargeSavePrimitiveBuffer(
 	GLcontext *ctx,
 	GLD_display_list *dl)
 {
-	// Ran out of space in the primitive buffer. Enlarge it.
-	// Enlarge in chunks of vertices; adding a single vertex at a time is Not Good
-	dl->dwMaxPrimVerts += GLD_PRIM_BLOCK_SIZE;
+	// Double the buffer for amortized O(1) growth
+	DWORD newSize = dl->dwMaxPrimVerts * 2;
+	if (newSize < dl->dwMaxPrimVerts + GLD_PRIM_BLOCK_SIZE)
+		newSize = dl->dwMaxPrimVerts + GLD_PRIM_BLOCK_SIZE;
+	dl->dwMaxPrimVerts = newSize;
 	dl->pPrim = realloc(dl->pPrim, GLD_4D_VERTEX_SIZE * dl->dwMaxPrimVerts);
 	if (!dl->pPrim) {
 		gldLogPrintf(GLDLOG_ERROR, "Out of memory enlarging primitive buffer for list %d", ctx->ListState.CurrentListNum);
 		dl->dwMaxPrimVerts = 0;
 		return;
 	}
-#ifdef DEBUG
-	// Useful info to know; dump it in Debug builds
-	gldLogPrintf(GLDLOG_SYSTEM, "** Primitive Save buffer (list %d) enlarged to %d verts **", ctx->ListState.CurrentListNum, dl->dwMaxPrimVerts);
-#endif
 }
 
 //---------------------------------------------------------------------------

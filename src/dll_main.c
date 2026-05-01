@@ -167,7 +167,7 @@ BOOL ReadINIFile(
 
 	// Read settings from private INI file.
 	// Note that defaults are contained in the calls.
-	ini.dwDriver = GetPrivateProfileInt(szSectionName, "dwDriver", 3, szINIFile);
+	ini.dwDriver = GetPrivateProfileInt(szSectionName, "dwDriver", 2, szINIFile);
 	ini.bMipmapping = GetPrivateProfileInt(szSectionName, "bMipmapping", 1, szINIFile);
 	ini.bMultitexture = GetPrivateProfileInt(szSectionName, "bMultitexture", 1, szINIFile);
 	ini.bWaitForRetrace = GetPrivateProfileInt(szSectionName, "bWaitForRetrace", 0, szINIFile);
@@ -213,12 +213,12 @@ BOOL dllReadRegistry(
 		};
 		// Set globals
 		glb.bPrimary = 1;
-		glb.bHardware = (ini.dwDriver == 2) ? 1 : 0;
+		glb.bHardware = (ini.dwDriver == 2 || ini.dwDriver == 3) ? 1 : 0;  // HAL or GL46
 		strcpy(glb.szDDName, "Primary");
 		if (ini.dwDriver <= 3)
 			strcpy(glb.szD3DName, szRendering[ini.dwDriver]);
 		else
-			strcpy(glb.szD3DName, szRendering[2]);
+			strcpy(glb.szD3DName, szRendering[2]);  // Default to HAL
 		glb.dwRendering = ini.dwDriver;
 		glb.bUseMipmaps = ini.bMipmapping;
 		glb.bMultitexture = ini.bMultitexture;
@@ -622,14 +622,14 @@ BOOL gldInitDriver(void)
 
 	// Read registry or INI file settings
 	if (!dllReadRegistry(hInstanceDll)) {
-		// No valid INI found — default to GL46 backend instead of failing.
-		gldLogMessage(GLDLOG_SYSTEM, "No INI file found, defaulting to GL46 backend (dwDriver=3)\n");
-		glb.dwDriver    = GLDS_DRIVER_GL46;
-		glb.dwRendering = GLDS_DRIVER_GL46;
+		// No valid INI found — default to D3D9 hardware backend for proper hardware acceleration.
+		gldLogMessage(GLDLOG_SYSTEM, "No INI file found, defaulting to D3D9 hardware backend (dwDriver=2)\n");
+		glb.dwDriver    = 2;  // GLDS_DRIVER_HAL
+		glb.dwRendering = 2;  // GLDS_DRIVER_HAL
 		glb.bPrimary    = 1;
-		glb.bHardware   = 0;
+		glb.bHardware   = 1;  // Enable hardware acceleration
 		strcpy(glb.szDDName, "Primary");
-		strcpy(glb.szD3DName, "OpenGL 4.6 Core");
+		strcpy(glb.szD3DName, "Direct3D Hardware Renderer");
 		dwLogging       = 1;  // Enable normal logging by default
 	}
 

@@ -701,7 +701,7 @@ _mesa_strstr( const char *haystack, const char *needle )
 #if defined(XFree86LOADER) && defined(IN_MODULE)
    return xf86strstr(haystack, needle);
 #else
-   return strstr(haystack, needle);
+   return (char *)strstr(haystack, needle);
 #endif
 }
 

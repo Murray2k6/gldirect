@@ -40,6 +40,7 @@
 /* dxerr removed — DXGetErrorString replaced with pure D3D9 HRESULT lookup */
 #include "gldirect5.h"
 #include "mesa_compat.h"
+#include "../gld_diag.h"
 
 // Copied from gld_context.c
 #define GLDERR_NONE     0
@@ -269,13 +270,13 @@ HRESULT _gldCreatePrimitiveBuffer(
 	GLD_driver_dx9 *gld)
 {
 	HRESULT		hr;
-	char		*szCreateVertexBufferFailed = "CreateVertexBuffer failed";
 	DWORD		dwUsage;
 
 	if (gld == NULL)
 		return E_FAIL;
 
 	// Create a system-memory buffer to hold the vertices of the current primitive.
+	// Start large to avoid early reallocs — games can push thousands of verts per frame.
 	gld->dwMaxPrimVerts	= GLD_PRIM_BLOCK_SIZE;
 	gld->pPrim = malloc(GLD_4D_VERTEX_SIZE * gld->dwMaxPrimVerts);
 	if (gld->pPrim == NULL)
@@ -283,8 +284,9 @@ HRESULT _gldCreatePrimitiveBuffer(
 	gld->dwPrimVert = 0;
 
 	// Create a Direct3D Vertex Buffer to hold vertices to be passed to hardware.
-	gld->dwMaxVBVerts	= 65535;
-	dwUsage = D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY;	// We will lock frequently and never read from buffer (write only).
+	// 256K verts (~16MB) gives plenty of room before needing to flush.
+	gld->dwMaxVBVerts	= 262144;
+	dwUsage = D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY;
 	if (!gld->bHasHWTnL)
 		dwUsage	|= D3DUSAGE_SOFTWAREPROCESSING;
 	hr = IDirect3DDevice9_CreateVertexBuffer(
@@ -296,14 +298,26 @@ HRESULT _gldCreatePrimitiveBuffer(
 		&gld->pVB,
 		NULL);
 	if (FAILED(hr)) {
-		gldLogMessage(GLDLOG_CRITICAL_OR_WARN, szCreateVertexBufferFailed);
-		SAFE_FREE(gld->pPrim); // Clean up before bail
-		return hr; // FAILED
+		// Fall back to smaller buffer if GPU can't allocate 16MB
+		gld->dwMaxVBVerts = 65535;
+		hr = IDirect3DDevice9_CreateVertexBuffer(
+			gld->pDev,
+			GLD_4D_VERTEX_SIZE * gld->dwMaxVBVerts,
+			dwUsage,
+			0,
+			D3DPOOL_DEFAULT,
+			&gld->pVB,
+			NULL);
+		if (FAILED(hr)) {
+			gldLogMessage(GLDLOG_ERROR, "CreateVertexBuffer failed\n");
+			SAFE_FREE(gld->pPrim);
+			return hr;
+		}
 	}
 
 	gldResetPrimitiveBuffer(gld);
 
-	return S_OK; // SUCCEEDED
+	return S_OK;
 }
 
 //---------------------------------------------------------------------------
@@ -315,27 +329,34 @@ BOOL IsDX9DriverLame(
 {
 	HRESULT		hr;
 	D3DCAPS9	d3dCaps;
-	DWORD		dwMinVSVer = D3DVS_VERSION(1,0); // DX8.0 support
-	DWORD		dwMinPSVer = D3DPS_VERSION(1,0); // DX8.0 support
 
 	hr = IDirect3D9_GetDeviceCaps(pD3D, uiAdapter, d3dDevType, &d3dCaps);
-	if (FAILED(hr))
-		return TRUE; // Can't get caps? Must be lame...
-
-	{
-		// Dump out some stats.
-		// We do this before the lameness test so if we bail we can what VS and PS values caused us to bail.
-		gldLogPrintf(GLDLOG_SYSTEM, "Vertex Shader    : %d.%d", D3DSHADER_VERSION_MAJOR(d3dCaps.VertexShaderVersion), D3DSHADER_VERSION_MINOR(d3dCaps.VertexShaderVersion));
-		gldLogPrintf(GLDLOG_SYSTEM, "Pixel Shader     : %d.%d", D3DSHADER_VERSION_MAJOR(d3dCaps.PixelShaderVersion), D3DSHADER_VERSION_MINOR(d3dCaps.PixelShaderVersion));
+	if (FAILED(hr)) {
+		// Caps unavailable. Don't refuse the adapter on this alone —
+		// translation layers (DXVK, dxvk-remix, vkd3d-proj, wined3d on
+		// Linux, software wrappers) often expose only a subset of caps.
+		// Log it and proceed.
+		gldLogPrintf(GLDLOG_WARN, "GetDeviceCaps failed (0x%08X) — proceeding anyway", hr);
+		return FALSE;
 	}
 
-	if (d3dCaps.VertexShaderVersion < dwMinVSVer)
-		return TRUE; // LAME!
+	// Dump out some stats for diagnostics. The original SciTech build
+	// used these numbers to gate ancient (DX7-class) integrated GPUs.
+	// That gate is no longer meaningful: this wrapper emulates
+	// fixed-function and shader work on top of plain D3D9, and modern
+	// translation layers (DXVK / Remix / wined3d) may report 0.0 for
+	// VertexShaderVersion / PixelShaderVersion because they handle
+	// shaders at a higher level. Refusing them aborts driver init and
+	// produces the "graphics adapter does not meet minimum specification"
+	// dialog even when the underlying device is perfectly capable.
+	gldLogPrintf(GLDLOG_SYSTEM, "Vertex Shader    : %d.%d",
+		D3DSHADER_VERSION_MAJOR(d3dCaps.VertexShaderVersion),
+		D3DSHADER_VERSION_MINOR(d3dCaps.VertexShaderVersion));
+	gldLogPrintf(GLDLOG_SYSTEM, "Pixel Shader     : %d.%d",
+		D3DSHADER_VERSION_MAJOR(d3dCaps.PixelShaderVersion),
+		D3DSHADER_VERSION_MINOR(d3dCaps.PixelShaderVersion));
 
-	if (d3dCaps.PixelShaderVersion < dwMinPSVer)
-		return TRUE; // LAME!
-
-	// Meets bare minimum specification, at least.
+	// Always accept any adapter that returns a D3DCAPS9 structure.
 	return FALSE;
 }
 
@@ -375,7 +396,7 @@ BOOL gldCreateDrawable_DX(
 //		ZeroMemory(lpCtx, sizeof(lpCtx));
 	}
 
-	d3dDevType = (glb.dwDriver == GLDS_DRIVER_HAL) ? D3DDEVTYPE_HAL : D3DDEVTYPE_REF;
+	d3dDevType = (glb.dwDriver == GLDS_DRIVER_HAL_E) ? D3DDEVTYPE_HAL : D3DDEVTYPE_REF;
 	// TODO: Check this
 //	if (bDefaultDriver)
 //		d3dDevType = D3DDEVTYPE_REF;
@@ -404,19 +425,47 @@ BOOL gldCreateDrawable_DX(
 	}
 SkipDirectDrawCreate:
 
-	// Get the display mode so we can make a compatible backbuffer
+	// Get the display mode so we can make a compatible backbuffer.
+	// Translation layers (DXVK / dxvk-remix / vkd3d-proton over wine) may
+	// fail this query for the proxy D3D9 adapter even though the device
+	// itself is usable. Fall back to the user's real desktop settings so
+	// fullscreen presents at the resolution / refresh / bpp the user has.
 	hResult = IDirect3D9_GetAdapterDisplayMode(lpCtx->pD3D, glb.dwAdapter, &d3ddm);
 	if (FAILED(hResult)) {
-        nContextError = GLDERR_D3D;
-		goto return_with_error;
+		DEVMODEA dm;
+		ZeroMemory(&dm, sizeof(dm));
+		dm.dmSize = sizeof(dm);
+		ZeroMemory(&d3ddm, sizeof(d3ddm));
+		if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm)) {
+			d3ddm.Width       = dm.dmPelsWidth;
+			d3ddm.Height      = dm.dmPelsHeight;
+			d3ddm.RefreshRate = dm.dmDisplayFrequency;
+			d3ddm.Format      = (dm.dmBitsPerPel <= 16) ? D3DFMT_R5G6B5 : D3DFMT_X8R8G8B8;
+			gldLogPrintf(GLDLOG_WARN,
+				"CreateDrawable: GetAdapterDisplayMode failed (0x%08X); using desktop %ux%u@%uHz %ubpp",
+				hResult, d3ddm.Width, d3ddm.Height, d3ddm.RefreshRate, dm.dmBitsPerPel);
+		} else {
+			d3ddm.Width       = (DWORD)GetSystemMetrics(SM_CXSCREEN);
+			d3ddm.Height      = (DWORD)GetSystemMetrics(SM_CYSCREEN);
+			if (d3ddm.Width  == 0) d3ddm.Width  = 1024;
+			if (d3ddm.Height == 0) d3ddm.Height = 768;
+			d3ddm.RefreshRate = 60;
+			d3ddm.Format      = D3DFMT_X8R8G8B8;
+			gldLogPrintf(GLDLOG_WARN,
+				"CreateDrawable: GetAdapterDisplayMode failed (0x%08X), EnumDisplaySettings failed; using %ux%u",
+				hResult, d3ddm.Width, d3ddm.Height);
+		}
 	}
 
 	// Check if fullscreen window for page-flipping option. (DaveM)
+	// The game's HWND client size already reflects its fullscreen-vs-windowed
+	// choice, so when it equals the current display mode we treat it as
+	// fullscreen and present at the matching resolution.
 	if (!glb.bFullscreenBlit) {
 		RECT r;
 		GetClientRect(ctx->hWnd, &r);
-		if ((r.right - r.left == d3ddm.Width) &&
-			(r.bottom - r.top == d3ddm.Height))
+		if ((r.right - r.left == (LONG)d3ddm.Width) &&
+			(r.bottom - r.top == (LONG)d3ddm.Height))
 			ctx->bFullscreen = TRUE;
 	}
 
@@ -638,7 +687,7 @@ BOOL gldResizeDrawable_DX(
 		ctx->bSceneStarted = FALSE;
 	}
 
-	d3dDevType = (glb.dwDriver == GLDS_DRIVER_HAL) ? D3DDEVTYPE_HAL : D3DDEVTYPE_REF;
+	d3dDevType = (glb.dwDriver == GLDS_DRIVER_HAL_E) ? D3DDEVTYPE_HAL : D3DDEVTYPE_REF;
 	if (!bDefaultDriver)
 		d3dDevType = D3DDEVTYPE_REF; // Force Direct3D Reference Rasterise (software)
 
@@ -748,9 +797,6 @@ BOOL gldResizeDrawable_DX(
 		IDirect3DDevice9_Clear(gld->pDev,0,NULL,D3DCLEAR_TARGET,0,1.0f,0);
 		IDirect3DDevice9_SetViewport(gld->pDev, &d3dvp2);
 	}
-
-	// Set Dither back on again. Some drivers switch this off in the Reset() call...
-	IDirect3DDevice9_SetRenderState(gld->pDev, D3DRS_DITHERENABLE, TRUE);
 
 	//
 	// Recreate POOL_DEFAULT objects
@@ -1020,7 +1066,29 @@ BOOL gldBuildPixelformatList_DX(void)
 	}
 
 	// Work out which D3D device we eant to test with
-	d3dDevType = (glb.dwDriver == GLDS_DRIVER_HAL) ? D3DDEVTYPE_HAL : D3DDEVTYPE_REF;
+	d3dDevType = (glb.dwDriver == GLDS_DRIVER_HAL_E) ? D3DDEVTYPE_HAL : D3DDEVTYPE_REF;
+
+	// Validate / clamp adapter ordinal. Many translation layers expose
+	// a single adapter; an INI value of 1 (or higher) would otherwise
+	// cause every D3D query below to fail with D3DERR_INVALIDCALL and
+	// abort driver initialization.
+	{
+		UINT uAdapterCount = IDirect3D9_GetAdapterCount(pD3D);
+		gldLogPrintf(GLDLOG_SYSTEM, "D3D9 adapters    : %u (requested ordinal %u)",
+			uAdapterCount, glb.dwAdapter);
+		if (uAdapterCount == 0) {
+			// No adapters at all - fall back to DEFAULT and hope for the best
+			glb.dwAdapter = D3DADAPTER_DEFAULT;
+		} else if (glb.dwAdapter >= uAdapterCount) {
+			// Silent clamp: this is expected on modern systems where
+			// the configured ordinal exceeds what the driver/translation
+			// layer exposes. Log at INFO level so it's available for
+			// diagnostics but doesn't appear as a warning.
+			gldLogPrintf(GLDLOG_INFO, "Adapter ordinal %u >= count %u, using 0",
+				glb.dwAdapter, uAdapterCount);
+			glb.dwAdapter = D3DADAPTER_DEFAULT;
+		}
+	}
 
 	// Test for Lame device. This is as early as we dare test for this.
 	if (IsDX9DriverLame(pD3D, glb.dwAdapter, d3dDevType)) {
@@ -1034,8 +1102,33 @@ BOOL gldBuildPixelformatList_DX(void)
 	// rendertarget/depth-stencil surfaces.
 	hr = IDirect3D9_GetAdapterDisplayMode(pD3D, glb.dwAdapter, &d3ddm);
 	if (FAILED(hr)) {
-		IDirect3D9_Release(pD3D);
-		return FALSE;
+		// Translation layers / headless adapters may not report a display
+		// mode. Fall back to the user's actual desktop settings via
+		// EnumDisplaySettings so any subsequent fullscreen present matches
+		// the resolution / refresh-rate / bit-depth the user is running.
+		DEVMODEA dm;
+		ZeroMemory(&dm, sizeof(dm));
+		dm.dmSize = sizeof(dm);
+		ZeroMemory(&d3ddm, sizeof(d3ddm));
+		if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm)) {
+			d3ddm.Width       = dm.dmPelsWidth;
+			d3ddm.Height      = dm.dmPelsHeight;
+			d3ddm.RefreshRate = dm.dmDisplayFrequency;
+			d3ddm.Format      = (dm.dmBitsPerPel <= 16) ? D3DFMT_R5G6B5 : D3DFMT_X8R8G8B8;
+			gldLogPrintf(GLDLOG_WARN,
+				"GetAdapterDisplayMode failed (0x%08X); using current desktop %ux%u@%uHz %ubpp",
+				hr, d3ddm.Width, d3ddm.Height, d3ddm.RefreshRate, dm.dmBitsPerPel);
+		} else {
+			d3ddm.Width       = (DWORD)GetSystemMetrics(SM_CXSCREEN);
+			d3ddm.Height      = (DWORD)GetSystemMetrics(SM_CYSCREEN);
+			if (d3ddm.Width  == 0) d3ddm.Width  = 1024;
+			if (d3ddm.Height == 0) d3ddm.Height = 768;
+			d3ddm.RefreshRate = 60;
+			d3ddm.Format      = D3DFMT_X8R8G8B8;
+			gldLogPrintf(GLDLOG_WARN,
+				"GetAdapterDisplayMode failed (0x%08X) and EnumDisplaySettings failed; using %ux%u",
+				hr, d3ddm.Width, d3ddm.Height);
+		}
 	}
 	
 	// Run through the possible formats and detect supported formats
@@ -1043,7 +1136,7 @@ BOOL gldBuildPixelformatList_DX(void)
 		hr = IDirect3D9_CheckDeviceFormat(
 			pD3D,
 			glb.dwAdapter,
-			glb.dwDriver==GLDS_DRIVER_HAL ? D3DDEVTYPE_HAL : D3DDEVTYPE_REF,
+			glb.dwDriver==GLDS_DRIVER_HAL_E ? D3DDEVTYPE_HAL : D3DDEVTYPE_REF,
             d3ddm.Format,
 			D3DUSAGE_DEPTHSTENCIL,
 			D3DRTYPE_SURFACE,
@@ -1056,7 +1149,7 @@ BOOL gldBuildPixelformatList_DX(void)
 	    hr = IDirect3D9_CheckDepthStencilMatch(
 				pD3D,
 				glb.dwAdapter,
-                glb.dwDriver==GLDS_DRIVER_HAL ? D3DDEVTYPE_HAL : D3DDEVTYPE_REF,
+                glb.dwDriver==GLDS_DRIVER_HAL_E ? D3DDEVTYPE_HAL : D3DDEVTYPE_REF,
                 d3ddm.Format,
                 d3ddm.Format,
                 DepthStencil[i]);
@@ -1070,8 +1163,19 @@ BOOL gldBuildPixelformatList_DX(void)
 
 	IDirect3D9_Release(pD3D);
 
-	if (nSupportedFormats == 0)
-		return FALSE; // Bail: no compliant pixelformats
+	if (nSupportedFormats == 0) {
+		// Translation layers (DXVK, dxvk-remix, vkd3d) sometimes refuse
+		// CheckDeviceFormat / CheckDepthStencilMatch for the proxy
+		// adapter even when an actual D3D9 device would create fine.
+		// Synthesize the universally-supported depth/stencil formats so
+		// init succeeds; the device creation below will surface any
+		// real problem when it happens.
+		gldLogPrintf(GLDLOG_WARN,
+			"No depth-stencil formats reported by adapter; synthesizing defaults");
+		fmt[0] = D3DFMT_D24S8;
+		fmt[1] = D3DFMT_D16;
+		nSupportedFormats = 2;
+	}
 
 	// Dump DX version
 	gldLogMessage(GLDLOG_SYSTEM, "DirectX Version  : 9.0 or above\n");
@@ -1191,7 +1295,6 @@ BOOL gldInitialiseMesa_DX(
 
 	IDirect3DDevice9_SetRenderState(gld->pDev, D3DRS_LIGHTING, FALSE);
 	IDirect3DDevice9_SetRenderState(gld->pDev, D3DRS_CULLMODE, D3DCULL_NONE);
-	IDirect3DDevice9_SetRenderState(gld->pDev, D3DRS_DITHERENABLE, TRUE);
 	IDirect3DDevice9_SetRenderState(gld->pDev, D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
 	IDirect3DDevice9_SetRenderState(gld->pDev, D3DRS_CLIPPING, TRUE); // KeithH
 
@@ -1221,16 +1324,32 @@ BOOL gldInitialiseMesa_DX(
 		gld->bHasHWTnL ? (bSoftwareTnL ? "Disabled" : "Enabled") : "Unavailable");
 //#endif
 
+	gldDiagLog("gldInitialiseMesa_DX: glCtx=%p", (void*)lpCtx->glCtx);
+	if (!lpCtx->glCtx) {
+		gldLogMessage(GLDLOG_CRITICAL, "gldInitialiseMesa_DX: glCtx is NULL, aborting init\n");
+		return FALSE;
+	}
+	gldDiagLog("gldInitialiseMesa_DX: -> gldEnableExtensions_DX9");
 	gldEnableExtensions_DX9(lpCtx->glCtx);
+	gldDiagLog("gldInitialiseMesa_DX: -> gldInstallD3DTnl");
 	gldInstallD3DTnl(lpCtx->glCtx); // Our own D3D TnL module
+	gldDiagLog("gldInitialiseMesa_DX: -> gldSetupDriverPointers_DX9");
 	gldSetupDriverPointers_DX9(lpCtx->glCtx);
+	gldDiagLog("gldInitialiseMesa_DX: Driver.UpdateState=%p", (void*)lpCtx->glCtx->Driver.UpdateState);
 
 	// Signal a complete state update
-	lpCtx->glCtx->Driver.UpdateState(lpCtx->glCtx, _NEW_ALL);
+	if (lpCtx->glCtx->Driver.UpdateState) {
+		lpCtx->glCtx->Driver.UpdateState(lpCtx->glCtx, _NEW_ALL);
+		gldDiagLog("gldInitialiseMesa_DX: UpdateState returned");
+	} else {
+		gldDiagLog("gldInitialiseMesa_DX: UpdateState is NULL, skipping");
+	}
 
 	// Start a scene
+	gldDiagLog("gldInitialiseMesa_DX: -> BeginScene (pDev=%p)", (void*)gld->pDev);
 	IDirect3DDevice9_BeginScene(gld->pDev);
 	lpCtx->bSceneStarted = TRUE;
+	gldDiagLog("gldInitialiseMesa_DX: complete");
 
 	return TRUE;
 }

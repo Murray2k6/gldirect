@@ -334,8 +334,8 @@
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
-      <AdditionalIncludeDirectories>mesa\src\mesa;mesa\src\mesa\main;mesa\src\mesa\glapi;mesa\src\mesa\math;mesa\src\mesa\tnl;mesa\src\mesa\swrast;mesa\src\mesa\swrast_setup;mesa\src\mesa\array_cache;mesa\include;mesa\include\GL;src;src\glad\include;snap_sdk_3.1-r23-src\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;_WIN32;__WIN32__;__MSC__;NO_LICENSE;BUILD_GL32;MESA_MINWARN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>mesa\src\mesa;mesa\src\mesa\main;mesa\src\mesa\glapi;mesa\src\mesa\math;mesa\include;mesa\include\GL;src;src\glad\include;src\gl46;$(DXSDK_DIR)Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;_WIN32;__WIN32__;__MSC__;NO_LICENSE;BUILD_GL32;GLDS_DRIVER_GL46;_CRT_SECURE_NO_WARNINGS=1;MESA_MINWARN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <FunctionLevelLinking>true</FunctionLevelLinking>
@@ -355,10 +355,10 @@
       <AdditionalIncludeDirectories>\private\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>legacy_stdio_definitions.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d9.lib;dxguid.lib;legacy_stdio_definitions.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)opengl32.dll</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
-      <AdditionalLibraryDirectories>\mssdk\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(DXSDK_DIR)Lib\x86;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <ModuleDefinitionFile>.\opengl32.def</ModuleDefinitionFile>
       <ImportLibrary>$(OutDir)opengl32.lib</ImportLibrary>
       <TargetMachine>MachineX86</TargetMachine>
@@ -382,8 +382,8 @@
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
-      <AdditionalIncludeDirectories>mesa\src\mesa;mesa\src\mesa\main;mesa\src\mesa\glapi;mesa\src\mesa\math;mesa\src\mesa\tnl;mesa\src\mesa\swrast;mesa\src\mesa\swrast_setup;mesa\src\mesa\array_cache;mesa\include;mesa\include\GL;src;src\glad\include;snap_sdk_3.1-r23-src\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;_WIN32;__WIN32__;__MSC__;NO_LICENSE;BUILD_GL32;MESA_MINWARN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>mesa\src\mesa;mesa\src\mesa\main;mesa\src\mesa\glapi;mesa\src\mesa\math;mesa\include;mesa\include\GL;src;src\glad\include;src\gl46;$(DXSDK_DIR)Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;_WIN32;__WIN32__;__MSC__;NO_LICENSE;BUILD_GL32;GLDS_DRIVER_GL46;_CRT_SECURE_NO_WARNINGS=1;MESA_MINWARN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <StringPooling>true</StringPooling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <FunctionLevelLinking>true</FunctionLevelLinking>
@@ -403,10 +403,10 @@
       <AdditionalIncludeDirectories>\private\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>legacy_stdio_definitions.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d9.lib;dxguid.lib;legacy_stdio_definitions.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(OutDir)opengl32.dll</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
-      <AdditionalLibraryDirectories>\mssdk\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(DXSDK_DIR)Lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <ModuleDefinitionFile>.\opengl32.def</ModuleDefinitionFile>
       <ImportLibrary>$(OutDir)opengl32.lib</ImportLibrary>
     </Link>
@@ -424,8 +424,12 @@
     <ClCompile Include="src\dx9\gld_dlist.c" />
     <ClCompile Include="src\dx9\gld_shaders.c" />
     <ClCompile Include="src\dx9\gld_tnl_dx9.c" />
-    <!-- gld_arrayelt.c removed — Mesa api_arrayelt.c provides these functions -->
-    <!-- <ClCompile Include="src\gld_arrayelt.c" /> -->
+    <!-- Use our trivial stub instead of Mesa's api_arrayelt.c. The Mesa version
+         expects the original (huge) GLcontext layout with aelt_context at a
+         specific offset; our trimmed mesa_compat.h GLcontext does not have that
+         field, so Mesa's _ae_create_context writes through a wild offset and
+         corrupts the heap. -->
+    <ClCompile Include="src\gld_arrayelt.c" />
     <ClCompile Include="src\gld_context.c" />
     <ClCompile Include="src\gld_driver.c" />
     <ClCompile Include="src\gld_globals.c" />
@@ -433,8 +437,6 @@
     <ClCompile Include="src\gld_pf.c" />
     <ClCompile Include="src\gld_wgl.c" />
     <ClCompile Include="src\mesa_proxy.c" />
-    <ClCompile Include="src\glapi_shim.c" />
-    <ClCompile Include="src\gl_mesa_forward.c" />
     <ClCompile Include="src\gl_ext_dsa.c" />
     <ClCompile Include="src\glad\src\gl.c" />
     <ClCompile Include="src\glad\src\wgl.c" />
@@ -457,10 +459,27 @@
     <ClCompile Include="src\gl46\gl46_driver.c" />
     <ClCompile Include="src\gl46\gl_state.c" />
     <ClCompile Include="src\gl46\gl_impl.c" />
+    <ClCompile Include="src\gl46\gl_dx9_compat.c" />
+    <ClCompile Include="src\gl46\glsl_to_hlsl.c" />
+    <!-- Mesa source files — Mesa provides the OpenGL state machine, D3D9 is the renderer -->
     <ClCompile Include="mesa\src\mesa\array_cache\ac_context.c" />
     <ClCompile Include="mesa\src\mesa\array_cache\ac_import.c" />
+    <ClCompile Include="mesa\src\mesa\glapi\glapi.c" />
+    <ClCompile Include="mesa\src\mesa\glapi\glthread.c" />
+    <ClCompile Include="mesa\src\mesa\math\m_debug_clip.c" />
+    <ClCompile Include="mesa\src\mesa\math\m_debug_norm.c" />
+    <ClCompile Include="mesa\src\mesa\math\m_debug_xform.c" />
+    <ClCompile Include="mesa\src\mesa\math\m_eval.c" />
+    <ClCompile Include="mesa\src\mesa\math\m_matrix.c" />
+    <ClCompile Include="mesa\src\mesa\math\m_translate.c" />
+    <ClCompile Include="mesa\src\mesa\math\m_vector.c" />
+    <ClCompile Include="mesa\src\mesa\math\m_xform.c" />
     <ClCompile Include="mesa\src\mesa\main\accum.c" />
-    <ClCompile Include="mesa\src\mesa\main\api_arrayelt.c" />
+    <!-- api_arrayelt.c removed — replaced by src/gld_arrayelt.c stub.
+         The Mesa version expects the original (huge) Mesa GLcontext layout
+         with an aelt_context field at a specific offset, but our trimmed
+         GLcontext (mesa_compat.h) has no such field, causing heap corruption. -->
+    <!-- <ClCompile Include="mesa\src\mesa\main\api_arrayelt.c" /> -->
     <ClCompile Include="mesa\src\mesa\main\api_loopback.c" />
     <ClCompile Include="mesa\src\mesa\main\api_noop.c" />
     <ClCompile Include="mesa\src\mesa\main\api_validate.c" />
@@ -478,6 +497,7 @@
     <ClCompile Include="mesa\src\mesa\main\convolve.c" />
     <ClCompile Include="mesa\src\mesa\main\debug.c" />
     <ClCompile Include="mesa\src\mesa\main\depth.c" />
+    <ClCompile Include="mesa\src\mesa\main\dispatch.c" />
     <ClCompile Include="mesa\src\mesa\main\dlist.c" />
     <ClCompile Include="mesa\src\mesa\main\drawpix.c" />
     <ClCompile Include="mesa\src\mesa\main\enable.c" />
@@ -516,213 +536,12 @@
     <ClCompile Include="mesa\src\mesa\main\texutil.c" />
     <ClCompile Include="mesa\src\mesa\main\varray.c" />
     <ClCompile Include="mesa\src\mesa\main\vtxfmt.c" />
-    <ClCompile Include="mesa\src\mesa\math\m_eval.c" />
-    <ClCompile Include="mesa\src\mesa\math\m_matrix.c" />
-    <ClCompile Include="mesa\src\mesa\math\m_translate.c" />
-    <ClCompile Include="mesa\src\mesa\math\m_vector.c" />
-    <ClCompile Include="mesa\src\mesa\math\m_xform.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_aaline.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_aatriangle.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_accum.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_alpha.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_alphabuf.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_bitmap.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_blend.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_buffers.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_context.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_copypix.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_depth.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_drawpix.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_feedback.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_fog.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_imaging.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_lines.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_logic.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_masking.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_nvfragprog.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_pixeltex.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_points.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_readpix.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_span.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_stencil.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_texstore.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_texture.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_triangle.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_zoom.c" />
-    <ClCompile Include="mesa\src\mesa\swrast_setup\ss_context.c" />
-    <ClCompile Include="mesa\src\mesa\swrast_setup\ss_triangle.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_array_api.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_array_import.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_context.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_pipeline.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_save_api.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_save_loopback.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_save_playback.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_fog.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_light.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_normals.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_points.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_program.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_render.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_texgen.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_texmat.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_vertex.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vertex.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vtx_api.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vtx_eval.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vtx_exec.c" />
-    <ClCompile Include="mesa\src\mesa\array_cache\ac_context.c" />
-    <ClCompile Include="mesa\src\mesa\array_cache\ac_import.c" />
-    <ClCompile Include="mesa\src\mesa\main\accum.c" />
-    <ClCompile Include="mesa\src\mesa\main\api_arrayelt.c" />
-    <ClCompile Include="mesa\src\mesa\main\api_loopback.c" />
-    <ClCompile Include="mesa\src\mesa\main\api_noop.c" />
-    <ClCompile Include="mesa\src\mesa\main\api_validate.c" />
-    <ClCompile Include="mesa\src\mesa\main\arbfragparse.c" />
-    <ClCompile Include="mesa\src\mesa\main\arbparse.c" />
-    <ClCompile Include="mesa\src\mesa\main\arbprogram.c" />
-    <ClCompile Include="mesa\src\mesa\main\arbvertparse.c" />
-    <ClCompile Include="mesa\src\mesa\main\attrib.c" />
-    <ClCompile Include="mesa\src\mesa\main\blend.c" />
-    <ClCompile Include="mesa\src\mesa\main\bufferobj.c" />
-    <ClCompile Include="mesa\src\mesa\main\buffers.c" />
-    <ClCompile Include="mesa\src\mesa\main\clip.c" />
-    <ClCompile Include="mesa\src\mesa\main\colortab.c" />
-    <ClCompile Include="mesa\src\mesa\main\context.c" />
-    <ClCompile Include="mesa\src\mesa\main\convolve.c" />
-    <ClCompile Include="mesa\src\mesa\main\debug.c" />
-    <ClCompile Include="mesa\src\mesa\main\depth.c" />
-    <ClCompile Include="mesa\src\mesa\main\dlist.c" />
-    <ClCompile Include="mesa\src\mesa\main\drawpix.c" />
-    <ClCompile Include="mesa\src\mesa\main\enable.c" />
-    <ClCompile Include="mesa\src\mesa\main\enums.c" />
-    <ClCompile Include="mesa\src\mesa\main\eval.c" />
-    <ClCompile Include="mesa\src\mesa\main\extensions.c" />
-    <ClCompile Include="mesa\src\mesa\main\feedback.c" />
-    <ClCompile Include="mesa\src\mesa\main\fog.c" />
-    <ClCompile Include="mesa\src\mesa\main\get.c" />
-    <ClCompile Include="mesa\src\mesa\main\hash.c" />
-    <ClCompile Include="mesa\src\mesa\main\hint.c" />
-    <ClCompile Include="mesa\src\mesa\main\histogram.c" />
-    <ClCompile Include="mesa\src\mesa\main\image.c" />
-    <ClCompile Include="mesa\src\mesa\main\imports.c" />
-    <ClCompile Include="mesa\src\mesa\main\light.c" />
-    <ClCompile Include="mesa\src\mesa\main\lines.c" />
-    <ClCompile Include="mesa\src\mesa\main\matrix.c" />
-    <ClCompile Include="mesa\src\mesa\main\nvfragparse.c" />
-    <ClCompile Include="mesa\src\mesa\main\nvprogram.c" />
-    <ClCompile Include="mesa\src\mesa\main\nvvertexec.c" />
-    <ClCompile Include="mesa\src\mesa\main\nvvertparse.c" />
-    <ClCompile Include="mesa\src\mesa\main\occlude.c" />
-    <ClCompile Include="mesa\src\mesa\main\pixel.c" />
-    <ClCompile Include="mesa\src\mesa\main\points.c" />
-    <ClCompile Include="mesa\src\mesa\main\polygon.c" />
-    <ClCompile Include="mesa\src\mesa\main\program.c" />
-    <ClCompile Include="mesa\src\mesa\main\rastpos.c" />
-    <ClCompile Include="mesa\src\mesa\main\state.c" />
-    <ClCompile Include="mesa\src\mesa\main\stencil.c" />
-    <ClCompile Include="mesa\src\mesa\main\texcompress.c" />
-    <ClCompile Include="mesa\src\mesa\main\texformat.c" />
-    <ClCompile Include="mesa\src\mesa\main\teximage.c" />
-    <ClCompile Include="mesa\src\mesa\main\texobj.c" />
-    <ClCompile Include="mesa\src\mesa\main\texstate.c" />
-    <ClCompile Include="mesa\src\mesa\main\texstore.c" />
-    <ClCompile Include="mesa\src\mesa\main\texutil.c" />
-    <ClCompile Include="mesa\src\mesa\main\varray.c" />
-    <ClCompile Include="mesa\src\mesa\main\vtxfmt.c" />
-    <ClCompile Include="mesa\src\mesa\math\m_eval.c" />
-    <ClCompile Include="mesa\src\mesa\math\m_matrix.c" />
-    <ClCompile Include="mesa\src\mesa\math\m_translate.c" />
-    <ClCompile Include="mesa\src\mesa\math\m_vector.c" />
-    <ClCompile Include="mesa\src\mesa\math\m_xform.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_aaline.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_aatriangle.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_accum.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_alpha.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_alphabuf.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_bitmap.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_blend.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_buffers.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_context.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_copypix.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_depth.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_drawpix.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_feedback.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_fog.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_imaging.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_lines.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_logic.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_masking.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_nvfragprog.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_pixeltex.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_points.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_readpix.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_span.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_stencil.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_texstore.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_texture.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_triangle.c" />
-    <ClCompile Include="mesa\src\mesa\swrast\s_zoom.c" />
-    <ClCompile Include="mesa\src\mesa\swrast_setup\ss_context.c" />
-    <ClCompile Include="mesa\src\mesa\swrast_setup\ss_triangle.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_array_api.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_array_import.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_context.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_pipeline.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_save_api.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_save_loopback.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_save_playback.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_fog.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_light.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_normals.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_points.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_program.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_render.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_texgen.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_texmat.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vb_vertex.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vertex.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vtx_api.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vtx_eval.c" />
-    <ClCompile Include="mesa\src\mesa\tnl\t_vtx_exec.c" />
     <!-- mesa_compat.c removed — real Mesa source files provide these functions -->
     <!-- <ClCompile Include="src\mesa_compat.c" /> -->
     <!-- gl_legacy_stubs.c removed — Mesa dispatch.c provides all GL functions -->
     <!-- <ClCompile Include="src\gl_legacy_stubs.c" /> -->
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="mesa\include\GL\glext.h" />
-    <ClInclude Include="mesa\include\GL\internal\glcore.h" />
-    <ClInclude Include="mesa\include\GL\mesa_wgl.h" />
-    <ClInclude Include="mesa\src\mesa\glapi\glapi.h" />
-    <ClInclude Include="mesa\src\mesa\glapi\glapitable.h" />
-    <ClInclude Include="mesa\src\mesa\glapi\glthread.h" />
-    <ClInclude Include="mesa\src\mesa\main\api_arrayelt.h" />
-    <ClInclude Include="mesa\src\mesa\main\api_noop.h" />
-    <ClInclude Include="mesa\src\mesa\main\colormac.h" />
-    <ClInclude Include="mesa\src\mesa\main\config.h" />
-    <ClInclude Include="mesa\src\mesa\main\context.h" />
-    <ClInclude Include="mesa\src\mesa\main\dd.h" />
-    <ClInclude Include="mesa\src\mesa\main\depth.h" />
-    <ClInclude Include="mesa\src\mesa\main\dlist.h" />
-    <ClInclude Include="mesa\src\mesa\main\drawpix.h" />
-    <ClInclude Include="mesa\src\mesa\main\extensions.h" />
-    <ClInclude Include="mesa\src\mesa\main\get.h" />
-    <ClInclude Include="mesa\src\mesa\main\glheader.h" />
-    <ClInclude Include="mesa\src\mesa\main\image.h" />
-    <ClInclude Include="mesa\src\mesa\main\imports.h" />
-    <ClInclude Include="mesa\src\mesa\main\macros.h" />
-    <ClInclude Include="mesa\src\mesa\main\matrix.h" />
-    <ClInclude Include="mesa\src\mesa\main\mtypes.h" />
-    <ClInclude Include="mesa\src\mesa\main\state.h" />
-    <ClInclude Include="mesa\src\mesa\main\texformat.h" />
-    <ClInclude Include="mesa\src\mesa\main\teximage.h" />
-    <ClInclude Include="mesa\src\mesa\main\texstore.h" />
-    <ClInclude Include="mesa\src\mesa\main\vtxfmt.h" />
-    <ClInclude Include="mesa\src\mesa\math\m_matrix.h" />
-    <ClInclude Include="mesa\src\mesa\x86\common_x86_asm.h" />
-    <ClInclude Include="mesa\src\mesa\x86\common_x86_features.h" />
-    <ClInclude Include="src\dll_main.h" />
     <ClInclude Include="src\dx9\gldirect5.h" />
     <ClInclude Include="src\dx9\gld_dxerr9.h" />
     <ClInclude Include="src\gld_api.h" />
@@ -754,8 +573,13 @@
     <ClInclude Include="src\gl46\gl46_driver.h" />
     <ClInclude Include="src\gl46\gl_state.h" />
     <ClInclude Include="src\gl46\gl_impl.h" />
+    <ClInclude Include="src\gl46\gl_dx9_compat.h" />
+    <ClInclude Include="src\gl46\glsl_to_hlsl.h" />
     <ClInclude Include="src\mesa_compat.h" />
     <ClInclude Include="src\mesa_proxy.h" />
+    <ClInclude Include="src\dll_main.h" />
+    <!-- Mesa headers excluded when using D3D9 hardware rendering -->
+    <!-- Mesa headers are only needed for software rendering (dwDriver=0) -->
   </ItemGroup>
   <ItemGroup>
     <None Include="opengl32.def" />

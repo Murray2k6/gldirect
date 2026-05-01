@@ -58,6 +58,7 @@ typedef struct {
     BOOL                bDirect3DDevice;    // Persistant Direct3DDevice9 exists
     IDirect3D9          *pD3D;              // Persistant Direct3D9
     IDirect3DDevice9    *pDev;              // Persistant Direct3DDevice9
+    BOOL                bRemixDetected;     // NVIDIA DXVK Remix d3d9.dll detected
 } GLD_gl46_dx9_globals;
 
 static GLD_gl46_dx9_globals gl46Globals;
@@ -86,6 +87,29 @@ BOOL gldInitContext46(void)
         gl46Globals.hD3D9DLL = LoadLibraryA(dllPath);
         if (gl46Globals.hD3D9DLL) {
             gldLogPrintf(GLDLOG_SYSTEM, "GL46: Loaded d3d9.dll from %s", dllPath);
+
+            // Detect NVIDIA DXVK Remix — it exports "Direct3DCreate9Ex" and
+            // has a "remixInitialize" or ".trex" folder nearby, or exports
+            // remix-specific functions. Check for the Remix bridge marker.
+            {
+                PROC pRemixInit = GetProcAddress(gl46Globals.hD3D9DLL, "remixapi_InitializeLibrary");
+                if (!pRemixInit) {
+                    // Also check for .trex folder which is the Remix bridge
+                    char trexPath[MAX_PATH];
+                    strcpy(trexPath, modulePath);
+                    strcat(trexPath, ".trex");
+                    DWORD attr = GetFileAttributesA(trexPath);
+                    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                        pRemixInit = (PROC)1; // marker
+                    }
+                }
+                if (pRemixInit) {
+                    gl46Globals.bRemixDetected = TRUE;
+                    gldLogMessage(GLDLOG_SYSTEM, "GL46: NVIDIA DXVK Remix detected — will use D3D9 fixed-function pipeline\n");
+                } else {
+                    gl46Globals.bRemixDetected = FALSE;
+                }
+            }
         }
     }
 
@@ -256,7 +280,6 @@ HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor)
     IDirect3DDevice9_SetRenderState(pDev, D3DRS_LIGHTING, FALSE);
     IDirect3DDevice9_SetRenderState(pDev, D3DRS_ZENABLE, D3DZB_TRUE);
     IDirect3DDevice9_SetRenderState(pDev, D3DRS_CULLMODE, D3DCULL_NONE);
-    IDirect3DDevice9_SetRenderState(pDev, D3DRS_DITHERENABLE, TRUE);
     IDirect3DDevice9_SetRenderState(pDev, D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
     IDirect3DDevice9_SetRenderState(pDev, D3DRS_CLIPPING, TRUE);
 
@@ -402,7 +425,6 @@ BOOL _gldEnsureDevice(HWND hWnd)
     IDirect3DDevice9_SetRenderState(pDev, D3DRS_LIGHTING, FALSE);
     IDirect3DDevice9_SetRenderState(pDev, D3DRS_ZENABLE, D3DZB_TRUE);
     IDirect3DDevice9_SetRenderState(pDev, D3DRS_CULLMODE, D3DCULL_NONE);
-    IDirect3DDevice9_SetRenderState(pDev, D3DRS_DITHERENABLE, TRUE);
 
     gldLogPrintf(GLDLOG_SYSTEM, "GL46: D3D9 device created lazily for HWND=%p", (void*)hWnd);
     return TRUE;
@@ -495,4 +517,13 @@ IDirect3DDevice9* gldGetD3DDevice46(void)
 IDirect3D9* gldGetD3D46(void)
 {
     return gl46Globals.pD3D;
+}
+
+// ***********************************************************************
+// Check if NVIDIA DXVK Remix d3d9.dll was detected.
+// ***********************************************************************
+
+BOOL gldIsRemixDetected(void)
+{
+    return gl46Globals.bRemixDetected;
 }

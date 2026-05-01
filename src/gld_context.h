@@ -182,6 +182,7 @@ GLD_ctx*			gldGetContextAddress(const HGLRC a);
 HDC 				gldGetCurrentDC(void);
 HGLRC 				gldGetCurrentContext(void);
 HGLRC				gldCreateContext(HDC a, const GLD_pixelFormat *lpPF);
+HGLRC				gldCreateContextLazy(HDC a, const GLD_pixelFormat *lpPF);
 BOOL				gldMakeCurrent(HDC a, HGLRC b);
 BOOL				gldDeleteContext(HGLRC a);
 BOOL				gldSwapBuffers(HDC hDC);

@@ -38,6 +38,7 @@
 #include "gld_context.h"
 
 #include "gld_driver.h"
+#include "gld_diag.h"
 #include "mesa_compat.h"
 #include "gl46/context_manager.h"
 
@@ -725,7 +726,10 @@ BOOL gldCreateContextBuffers(
 	// Stencil support based on pixel format
 	lpCtx->bStencil = (lpPFD->cStencilBits > 0) ? TRUE : FALSE;
 
+	gldDiagLog("gldCreateContextBuffers: -> InitialiseMesa (lpCtx=%p, glCtx=%p)",
+		(void*)lpCtx, (void*)lpCtx->glCtx);
 	_gldDriver.InitialiseMesa(lpCtx);
+	gldDiagLog("gldCreateContextBuffers: InitialiseMesa returned");
 
 	// ** If we have made it to here then we can enable rendering **
 	lpCtx->bCanRender = TRUE;
@@ -898,6 +902,66 @@ HGLRC gldCreateContext(
 }
 
 // ***********************************************************************
+// gldCreateContextLazy
+//
+// Create a GLDirect context WITHOUT creating D3D9 device.
+// D3D9 device is created later in wglMakeCurrent.
+// This avoids DXVK/Nvidia Remix crash on fake windows.
+// ***********************************************************************
+
+HGLRC gldCreateContextLazy(
+	HDC a,
+	const GLD_pixelFormat *lpPF)
+{
+	int i;
+	HGLRC				hGLRC;
+	GLD_ctx*			lpCtx;
+	DWORD				dwThreadId = GetCurrentThreadId();
+	HWND				hWndCheck;
+
+	gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContextLazy for HDC=%X, ThreadId=%X", a, dwThreadId);
+
+	// Check if a context already exists for this HDC or window
+	hWndCheck = WindowFromDC(a);
+	for (i=0; i<GLD_MAX_CONTEXTS; i++) {
+		if (ctxlist[i].bAllocated &&
+			(ctxlist[i].hDC == a || (hWndCheck && ctxlist[i].hWnd == hWndCheck))) {
+			hGLRC = (HGLRC)(INT_PTR)(i+1);
+			gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContextLazy: reusing existing HGLRC=%d", (int)(INT_PTR)hGLRC);
+			return hGLRC;
+		}
+	}
+
+	// Find next free context
+	hGLRC = 0;
+	for (i=0; i<GLD_MAX_CONTEXTS; i++) {
+		if (!ctxlist[i].bAllocated) {
+			hGLRC = (HGLRC)(INT_PTR)(i+1);
+			break;
+		}
+	}
+
+	if (!hGLRC) {
+		gldLogPrintf(GLDLOG_ERROR, "gldCreateContextLazy: no free context slots");
+		return NULL;
+	}
+
+	// Set up context
+	lpCtx = gldGetContextAddress(hGLRC);
+	ZeroMemory(lpCtx, sizeof(GLD_ctx));
+	lpCtx->bAllocated = TRUE;
+	lpCtx->bHasBeenCurrent = FALSE;
+	lpCtx->lpPF = (GLD_pixelFormat *)lpPF;
+	lpCtx->bCanRender = FALSE;
+	lpCtx->hDC = a;
+	lpCtx->hWnd = hWndCheck;
+
+	gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContextLazy succeeded for HGLRC=%d (NO D3D9 DEVICE)", (int)(INT_PTR)hGLRC);
+
+	return hGLRC;
+}
+
+// ***********************************************************************
 // Make a GLDirect context current
 // Used by wgl functions and gld functions
 BOOL gldMakeCurrent(
@@ -1025,7 +1089,17 @@ BOOL gldMakeCurrent(
 	}
 
 	// The first time we call MakeCurrent we set the initial viewport size
+	// For lazy contexts (created without D3D9 device), create the device now
 	if (lpCtx->bHasBeenCurrent == FALSE) {
+		// Check if this is a lazy context (no D3D9 device yet)
+		if (!lpCtx->bCanRender && lpCtx->lpPF) {
+			gldLogPrintf(GLDLOG_SYSTEM, "gldMakeCurrent: creating D3D9 device for lazy context HGLRC=%d", context);
+			if (!gldCreateContextBuffers(a, lpCtx, FALSE)) {
+				gldLogPrintf(GLDLOG_ERROR, "gldMakeCurrent: failed to create D3D9 device for lazy context");
+				return FALSE;
+			}
+		}
+
 		lpCtx->gl46Ctx.viewportX      = 0;
 		lpCtx->gl46Ctx.viewportY      = 0;
 		lpCtx->gl46Ctx.viewportWidth  = (GLsizei)lpCtx->dwWidth;

@@ -377,7 +377,7 @@ typedef struct {
 #define GLD_GET_DX9_DRIVER(c) (GLD_driver_dx9*)(c)->glPriv
 
 // If we run out of space in the primitive buffer (pPrim) then enlarge it by this amount.
-#define GLD_PRIM_BLOCK_SIZE		2000 // Number of vertices to add to primitive buffer
+#define GLD_PRIM_BLOCK_SIZE		16384 // Number of vertices to add to primitive buffer
 
 //---------------------------------------------------------------------------
 // Function prototypes

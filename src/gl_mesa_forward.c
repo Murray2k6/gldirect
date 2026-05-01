@@ -10,6 +10,7 @@
 
 #include <windows.h>
 #include "mesa_proxy.h"
+#include "gl46/gl_dx9_compat.h"
 
 /* Helper: get a GL function pointer from Mesa, cache it */
 #define MESA_FORWARD_VOID(name, params, args) \
@@ -35,6 +36,20 @@
         } \
         if (pfn_##name) return pfn_##name args; \
         return (rettype)0; \
+    }
+
+/* Hooked version: forwards to Mesa AND calls D3D9 compat layer */
+#define MESA_FORWARD_VOID_HOOK(name, params, args, hookCall) \
+    typedef void (APIENTRY *PFN_##name) params; \
+    static PFN_##name pfn_##name = NULL; \
+    void APIENTRY name params { \
+        if (!pfn_##name) { \
+            if (!g_mesaProxy.initialized) mesaProxyInit(); \
+            pfn_##name = (PFN_##name)mesaProxyGetProcAddress(#name); \
+            if (!pfn_##name) pfn_##name = (PFN_##name)GetProcAddress(g_mesaProxy.hMesaDLL, #name); \
+        } \
+        if (pfn_##name) pfn_##name args; \
+        hookCall; \
     }
 
 /* Suppress warnings */
@@ -68,13 +83,13 @@ MESA_FORWARD_VOID(glAlphaFunc, (GLenum func, GLfloat ref), (func, ref))
 MESA_FORWARD_VOID(glBegin, (GLenum mode), (mode))
 MESA_FORWARD_VOID(glEnd, (void), ())
 MESA_FORWARD_VOID(glBitmap, (GLsizei w, GLsizei h, GLfloat xo, GLfloat yo, GLfloat xm, GLfloat ym, const GLubyte *bm), (w,h,xo,yo,xm,ym,bm))
-MESA_FORWARD_VOID(glBlendFunc, (GLenum s, GLenum d), (s,d))
+MESA_FORWARD_VOID_HOOK(glBlendFunc, (GLenum s, GLenum d), (s,d), gldCompatBlendFunc(s,d))
 MESA_FORWARD_VOID(glCallList, (GLuint list), (list))
 MESA_FORWARD_VOID(glCallLists, (GLsizei n, GLenum type, const GLvoid *lists), (n,type,lists))
-MESA_FORWARD_VOID(glClear, (GLbitfield mask), (mask))
+MESA_FORWARD_VOID_HOOK(glClear, (GLbitfield mask), (mask), gldCompatClear(mask))
 MESA_FORWARD_VOID(glClearAccum, (GLfloat r, GLfloat g, GLfloat b, GLfloat a), (r,g,b,a))
-MESA_FORWARD_VOID(glClearColor, (GLfloat r, GLfloat g, GLfloat b, GLfloat a), (r,g,b,a))
-MESA_FORWARD_VOID(glClearDepth, (GLdouble d), (d))
+MESA_FORWARD_VOID_HOOK(glClearColor, (GLfloat r, GLfloat g, GLfloat b, GLfloat a), (r,g,b,a), gldCompatClearColor(r,g,b,a))
+MESA_FORWARD_VOID_HOOK(glClearDepth, (GLdouble d), (d), gldCompatClearDepth(d))
 MESA_FORWARD_VOID(glClearIndex, (GLfloat c), (c))
 MESA_FORWARD_VOID(glClearStencil, (GLint s), (s))
 MESA_FORWARD_VOID(glClipPlane, (GLenum p, const GLdouble *eq), (p,eq))
@@ -121,20 +136,20 @@ MESA_FORWARD_VOID(glCopyTexSubImage1D, (GLenum t, GLint l, GLint xo, GLint x, GL
 MESA_FORWARD_VOID(glCopyTexSubImage2D, (GLenum t, GLint l, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h), (t,l,xo,yo,x,y,w,h))
 MESA_FORWARD_VOID(glCullFace, (GLenum mode), (mode))
 MESA_FORWARD_VOID(glDeleteLists, (GLuint list, GLsizei range), (list,range))
-MESA_FORWARD_VOID(glDeleteTextures, (GLsizei n, const GLuint *t), (n,t))
-MESA_FORWARD_VOID(glDepthFunc, (GLenum func), (func))
-MESA_FORWARD_VOID(glDepthMask, (GLboolean flag), (flag))
+MESA_FORWARD_VOID_HOOK(glDeleteTextures, (GLsizei n, const GLuint *t), (n,t), gldCompatDeleteTextures(n,t))
+MESA_FORWARD_VOID_HOOK(glDepthFunc, (GLenum func), (func), gldCompatDepthFunc(func))
+MESA_FORWARD_VOID_HOOK(glDepthMask, (GLboolean flag), (flag), gldCompatDepthMask(flag))
 MESA_FORWARD_VOID(glDepthRange, (GLdouble n, GLdouble f), (n,f))
-MESA_FORWARD_VOID(glDisable, (GLenum cap), (cap))
+MESA_FORWARD_VOID_HOOK(glDisable, (GLenum cap), (cap), gldCompatDisable(cap))
 MESA_FORWARD_VOID(glDisableClientState, (GLenum a), (a))
-MESA_FORWARD_VOID(glDrawArrays, (GLenum mode, GLint first, GLsizei count), (mode,first,count))
+MESA_FORWARD_VOID_HOOK(glDrawArrays, (GLenum mode, GLint first, GLsizei count), (mode,first,count), gldCompatDrawArrays(mode,first,count))
 MESA_FORWARD_VOID(glDrawBuffer, (GLenum mode), (mode))
-MESA_FORWARD_VOID(glDrawElements, (GLenum mode, GLsizei count, GLenum type, const GLvoid *idx), (mode,count,type,idx))
+MESA_FORWARD_VOID_HOOK(glDrawElements, (GLenum mode, GLsizei count, GLenum type, const GLvoid *idx), (mode,count,type,idx), gldCompatDrawElements(mode,count,type,idx))
 MESA_FORWARD_VOID(glDrawPixels, (GLsizei w, GLsizei h, GLenum fmt, GLenum type, const GLvoid *pix), (w,h,fmt,type,pix))
 MESA_FORWARD_VOID(glEdgeFlag, (GLboolean flag), (flag))
 MESA_FORWARD_VOID(glEdgeFlagv, (const GLboolean *flag), (flag))
 MESA_FORWARD_VOID(glEdgeFlagPointer, (GLsizei stride, const GLvoid *p), (stride,p))
-MESA_FORWARD_VOID(glEnable, (GLenum cap), (cap))
+MESA_FORWARD_VOID_HOOK(glEnable, (GLenum cap), (cap), gldCompatEnable(cap))
 MESA_FORWARD_VOID(glEnableClientState, (GLenum a), (a))
 MESA_FORWARD_VOID(glEvalCoord1d, (GLdouble u), (u))
 MESA_FORWARD_VOID(glEvalCoord1f, (GLfloat u), (u))
@@ -176,7 +191,20 @@ MESA_FORWARD_VOID(glGetPixelMapuiv, (GLenum m, GLuint *v), (m,v))
 MESA_FORWARD_VOID(glGetPixelMapusv, (GLenum m, GLushort *v), (m,v))
 MESA_FORWARD_VOID(glGetPointerv, (GLenum p, GLvoid **v), (p,v))
 MESA_FORWARD_VOID(glGetPolygonStipple, (GLubyte *m), (m))
-MESA_FORWARD_RET(const GLubyte*, glGetString, (GLenum name), (name))
+
+/* glGetString - MUST use GLDirect's implementation for valid GL strings */
+const GLubyte * APIENTRY glGetString(GLenum name) {
+    extern const GLubyte* _gldGetStringGeneric(void *ctx, GLenum name);
+    return _gldGetStringGeneric(NULL, name);
+}
+
+/* glGetStringi - MUST use GLDirect's implementation */
+const GLubyte * APIENTRY glGetStringi(GLenum name, GLuint index) {
+    extern const GLubyte* _gldGetStringGeneric(void *ctx, GLenum name);
+    (void)index; /* index is for extension strings, we return single extensions string */
+    return _gldGetStringGeneric(NULL, name);
+}
+
 MESA_FORWARD_VOID(glGetTexEnvfv, (GLenum t, GLenum p, GLfloat *v), (t,p,v))
 MESA_FORWARD_VOID(glGetTexEnviv, (GLenum t, GLenum p, GLint *v), (t,p,v))
 MESA_FORWARD_VOID(glGetTexGendv, (GLenum c, GLenum p, GLdouble *v), (c,p,v))
@@ -393,7 +421,7 @@ MESA_FORWARD_VOID(glTexGeniv, (GLenum coord, GLenum pname, const GLint *params),
 
 /* glTexImage */
 MESA_FORWARD_VOID(glTexImage1D, (GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const GLvoid *pixels), (target,level,internalformat,width,border,format,type,pixels))
-MESA_FORWARD_VOID(glTexImage2D, (GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels), (target,level,internalformat,width,height,border,format,type,pixels))
+MESA_FORWARD_VOID_HOOK(glTexImage2D, (GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels), (target,level,internalformat,width,height,border,format,type,pixels), gldCompatTexImage2D(target,level,internalformat,width,height,border,format,type,pixels))
 
 /* glTexParameter */
 MESA_FORWARD_VOID(glTexParameterf, (GLenum target, GLenum pname, GLfloat param), (target,pname,param))
@@ -403,7 +431,7 @@ MESA_FORWARD_VOID(glTexParameteriv, (GLenum target, GLenum pname, const GLint *p
 
 /* glTexSubImage */
 MESA_FORWARD_VOID(glTexSubImage1D, (GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const GLvoid *pixels), (target,level,xoffset,width,format,type,pixels))
-MESA_FORWARD_VOID(glTexSubImage2D, (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels), (target,level,xoffset,yoffset,width,height,format,type,pixels))
+MESA_FORWARD_VOID_HOOK(glTexSubImage2D, (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels), (target,level,xoffset,yoffset,width,height,format,type,pixels), gldCompatTexSubImage2D(target,level,xoffset,yoffset,width,height,format,type,pixels))
 
 /* Translate */
 MESA_FORWARD_VOID(glTranslated, (GLdouble x, GLdouble y, GLdouble z), (x,y,z))
@@ -437,12 +465,12 @@ MESA_FORWARD_VOID(glVertex4iv, (const GLint *v), (v))
 MESA_FORWARD_VOID(glVertex4sv, (const GLshort *v), (v))
 MESA_FORWARD_VOID(glVertexPointer, (GLint size, GLenum type, GLsizei stride, const GLvoid *p), (size,type,stride,p))
 
-MESA_FORWARD_VOID(glViewport, (GLint x, GLint y, GLsizei w, GLsizei h), (x,y,w,h))
+MESA_FORWARD_VOID_HOOK(glViewport, (GLint x, GLint y, GLsizei w, GLsizei h), (x,y,w,h), gldCompatViewport(x,y,w,h))
 
 /* Missing from first batch */
 MESA_FORWARD_RET(GLboolean, glAreTexturesResident, (GLsizei n, const GLuint *textures, GLboolean *residences), (n,textures,residences))
 MESA_FORWARD_VOID(glArrayElement, (GLint i), (i))
-MESA_FORWARD_VOID(glBindTexture, (GLenum target, GLuint texture), (target,texture))
+MESA_FORWARD_VOID_HOOK(glBindTexture, (GLenum target, GLuint texture), (target,texture), gldCompatBindTexture(target,texture))
 MESA_FORWARD_RET(GLuint, glGenLists, (GLsizei range), (range))
 
 /*---------------------------------------------------------------------------

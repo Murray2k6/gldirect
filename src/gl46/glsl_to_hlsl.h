@@ -24,69 +24,51 @@
 *  |THE SOFTWARE.                                                                |
 *  ===============================================================================
 *
-*  ===============================================================================
-*  |        Original Author: Keith Harrison <sio2@users.sourceforge.net>         |
-*  ===============================================================================
-*
 * Language:     ANSI C
-* Environment:  Windows 9x (Win32)
+* Environment:  Windows 9x/NT/2000/XP (Win32)
 *
-* Description:  Pixel Formats.
+* Description:  GLSL to HLSL Shader Model 3.0 transpiler for D3D9.
+*               Performs text-based GLSL to HLSL conversion, compiles
+*               via d3dcompiler_47.dll (loaded dynamically), and creates
+*               IDirect3DVertexShader9 / IDirect3DPixelShader9 objects.
 *
 *********************************************************************************/
 
-#ifndef __GLD_PF_H
-#define __GLD_PF_H
-
-#ifndef STRICT
-#define STRICT
-#endif // STRICT
-#define WIN32_LEAN_AND_MEAN
+#ifndef GLSL_TO_HLSL_H
+#define GLSL_TO_HLSL_H
 
 #include <windows.h>
+#include <d3d9.h>
 
-/*---------------------- Macros and type definitions ----------------------*/
-
-typedef struct {
-	PIXELFORMATDESCRIPTOR	pfd;		// Win32 Pixel Format Descriptor
-	// Driver-specific data.
-	// Example: The DX8 driver uses this to hold an index into a
-	// list of depth-stencil descriptions.
-	DWORD					dwDriverData;
-} GLD_pixelFormat;
-
-#include "gld_globals.h"
-
-/*------------------------- Function Prototypes ---------------------------*/
-
-#ifdef  __cplusplus
+#ifdef __cplusplus
 extern "C" {
 #endif
 
-BOOL	IsValidPFD(int iPFD);
-BOOL	gldBuildPixelFormatList();
-void	gldReleasePixelFormatList();
+/* Initialize the transpiler — loads d3dcompiler_47.dll */
+BOOL glslTranspilerInit(void);
 
-/*
- * Find the wrapper's pixel format index (1-based) that best matches the
- * given Win32 PIXELFORMATDESCRIPTOR. Used to translate an OS-level PF
- * (set via Win32 SetPixelFormat or via the Mesa proxy) into our wrapper's
- * internal PF index. Returns 0 if no formats are available.
- *
- * Matching is done by scoring each candidate against the requested PFD:
- * exact color/depth/stencil/double-buffer matches score highest, with
- * gradual fallback to the closest available format.
- */
-int		gldFindMatchingPFD(const PIXELFORMATDESCRIPTOR *pfdRequested);
+/* Transpile GLSL to HLSL and compile to D3D9 shader bytecode.
+ * shaderType: 0 = vertex shader, 1 = pixel/fragment shader
+ * glslSource: null-terminated GLSL source code
+ * ppBytecode: receives compiled shader bytecode (caller must free with glslFreeBytecode)
+ * pBytecodeSize: receives size of bytecode
+ * Returns TRUE on success */
+BOOL glslTranspileAndCompile(int shaderType, const char *glslSource,
+    void **ppBytecode, DWORD *pBytecodeSize);
 
-/*
- * Resolve the effective wrapper PF index for an HDC by querying the OS
- * for the DC's current pixel format and translating it via
- * gldFindMatchingPFD. Returns 0 if the DC has no format set.
- */
-int		gldResolvePFDForDC(HDC hDC);
+/* Create D3D9 vertex/pixel shader from compiled bytecode */
+BOOL glslCreateVertexShader(IDirect3DDevice9 *pDev, const void *bytecode, DWORD size,
+    IDirect3DVertexShader9 **ppShader);
+BOOL glslCreatePixelShader(IDirect3DDevice9 *pDev, const void *bytecode, DWORD size,
+    IDirect3DPixelShader9 **ppShader);
 
-#ifdef  __cplusplus
+/* Free bytecode allocated by glslTranspileAndCompile */
+void glslFreeBytecode(void *pBytecode);
+
+/* Shut down — unload d3dcompiler */
+void glslTranspilerShutdown(void);
+
+#ifdef __cplusplus
 }
 #endif
 

@@ -28,17 +28,19 @@
 
 /*
  * The DX9 backend uses GET_CURRENT_CONTEXT(ctx) to obtain a GLcontext*.
- * We maintain a thread-local pointer that is set when gldMakeCurrent is
- * called. For now, we use a simple static — the DX9 backend is single-
- * threaded in practice.
+ * mesa_compat.h now defines _mesa_compat_set_current_context as a macro
+ * that forwards to Mesa's _glapi_set_context, so we don't define those
+ * functions here. Keep a (now-unused) static for any internal references.
  */
 static GLcontext *_mesa_compat_current_ctx = NULL;
 
+#undef _mesa_compat_set_current_context
 void _mesa_compat_set_current_context(GLcontext *ctx)
 {
     _mesa_compat_current_ctx = ctx;
 }
 
+#undef _mesa_compat_get_current_context
 GLcontext* _mesa_compat_get_current_context(void)
 {
     return _mesa_compat_current_ctx;

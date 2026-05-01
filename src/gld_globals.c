@@ -36,6 +36,7 @@
 *********************************************************************************/
 
 #include "gld_globals.h"
+#include <float.h>
 
 // =======================================================================
 // Global Variables
@@ -123,7 +124,12 @@ void gldInitGlobals()
 	glb.dwAdapter				= 0;	// Primary DX9 adapter
 	glb.dwTnL					= 0;	// TnL setting
 	glb.dwMultisample			= 0;	// Multisample Auto
-	glb.dwDriver				= 2;	// Direct3D HW
+	// Default to the GL46 backend (driver 3). It is the modern, self-contained
+	// path that supports OpenGL 1.0 through 4.6 by translating each call to
+	// D3D9. The legacy DX9 backend (driver 2) shares struct layouts with the
+	// stock Mesa source files compiled into this DLL, which causes silent
+	// heap corruption during context init on modern systems.
+	glb.dwDriver				= 3;	// OpenGL 4.6 core renderer (D3D9 GPU)
 
 	// Signal a pixelformat list rebuild
 	glb.bPixelformatsDirty		= TRUE;

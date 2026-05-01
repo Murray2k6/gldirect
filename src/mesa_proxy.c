@@ -155,6 +155,19 @@ PROC mesaProxyGetProcAddress(LPCSTR name)
     if (!g_mesaProxy.initialized)
         return NULL;
 
+    /* Override glGetString, glGetStringi, glGetError to return GLDirect's implementations */
+    if (strcmp(name, "glGetString") == 0 || strcmp(name, "glGetStringi") == 0 || strcmp(name, "glGetError") == 0) {
+        static HMODULE hSelf = NULL;
+        if (!hSelf) hSelf = GetModuleHandleA("opengl32.dll");
+        if (hSelf) {
+            p = GetProcAddress(hSelf, name);
+            if (p) {
+                gldDiagLog("mesaProxyGetProcAddress: \"%s\" -> GLDirect (overriding Mesa)", name);
+                return p;
+            }
+        }
+    }
+
     /* First try Mesa's wglGetProcAddress (for GL extensions, needs current context) */
     if (g_mesaProxy.wglGetProcAddress) {
         p = g_mesaProxy.wglGetProcAddress(name);

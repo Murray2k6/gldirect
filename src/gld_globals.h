@@ -38,6 +38,12 @@
 #ifndef __GLD_GLOBALS_H
 #define __GLD_GLOBALS_H
 
+#ifndef STRICT
+#define STRICT
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
 #include "gld_context.h"
 #include "gld_pf.h"		// Pixel format
 
@@ -46,21 +52,21 @@
 typedef enum {
 	GLD_RENDER_MESASW		= 0,
 	GLD_RENDER_D3D			= 1,
-	GLD_RENDER_FORCE_DWORD	= 0x7ffffff,
+	GLD_RENDER_FORCE_DWORD	= 0x7FFFFFFF
 } GLD_renderType;
 
 // Same as GLD_renderType? KeithH
 typedef enum {
-	GLDS_DRIVER_MESA_SW			= 0,	// Mesa SW rendering
-	GLDS_DRIVER_REF				= 1,	// Direct3D Reference Rasteriser
-	GLDS_DRIVER_HAL				= 2,	// Direct3D HW rendering
-	GLDS_DRIVER_GL46			= 3,	// OpenGL 4.6 core profile backend
+	GLDS_DRIVER_MESA_SW_E = 0,
+	GLDS_DRIVER_REF_E = 1,
+	GLDS_DRIVER_HAL_E = 2,
+	GLDS_DRIVER_GL46_E = 3
 } GLDS_DRIVER;
 
 typedef enum {
-	GLDS_TNL_DEFAULT			= 0,	// Choose best TnL method
-	GLDS_TNL_D3DSW				= 1,	// D3D Software TnL
-	GLDS_TNL_D3DHW				= 2,	// D3D Hardware TnL
+	GLDS_TNL_DEFAULT = 0,
+	GLDS_TNL_D3DSW = 1,
+	GLDS_TNL_D3DHW = 2
 } GLDS_TNL;
 
 typedef enum {

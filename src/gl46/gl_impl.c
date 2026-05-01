@@ -21,6 +21,7 @@
 #include "gl_state.h"
 #include "context_manager.h"
 #include "gld_diag.h"
+#include "gld_context.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -1432,6 +1433,10 @@ void _glsScissor(int x, int y, int width, int height)
 {
     GLS_State *s = glsGetState();
     IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+    HGLRC hGLRC;
+    GLD_ctx *ctx;
+    int renderTargetHeight;
+
     s->scissorX = x;
     s->scissorY = y;
     s->scissorW = width;
@@ -1439,10 +1444,25 @@ void _glsScissor(int x, int y, int width, int height)
 
     if (pDev) {
         RECT rc;
+
+        // Get current context to obtain render target dimensions
+        hGLRC = gldGetCurrentContext();
+        if (hGLRC) {
+            ctx = gldGetContextAddress(hGLRC);
+            if (ctx) {
+                renderTargetHeight = ctx->dwHeight;
+            } else {
+                renderTargetHeight = height; // Fallback
+            }
+        } else {
+            renderTargetHeight = height; // Fallback
+        }
+
+        // Convert OpenGL scissor (bottom-left origin) to D3D9 scissor (top-left origin)
         rc.left = x;
-        rc.top = y;
+        rc.top = renderTargetHeight - (y + height);
         rc.right = x + width;
-        rc.bottom = y + height;
+        rc.bottom = renderTargetHeight - y;
         __try {
             IDirect3DDevice9_SetScissorRect(pDev, &rc);
         } __except(EXCEPTION_EXECUTE_HANDLER) { }
@@ -1453,6 +1473,10 @@ void _glsViewport(int x, int y, int width, int height)
 {
     GLS_State *s = glsGetState();
     IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+    HGLRC hGLRC;
+    GLD_ctx *ctx;
+    int renderTargetHeight;
+
     s->viewportX = x;
     s->viewportY = y;
     s->viewportW = width;
@@ -1461,8 +1485,23 @@ void _glsViewport(int x, int y, int width, int height)
 
     if (pDev && width > 0 && height > 0) {
         D3DVIEWPORT9 vp;
+
+        // Get current context to obtain render target dimensions
+        hGLRC = gldGetCurrentContext();
+        if (hGLRC) {
+            ctx = gldGetContextAddress(hGLRC);
+            if (ctx) {
+                renderTargetHeight = ctx->dwHeight;
+            } else {
+                renderTargetHeight = height; // Fallback
+            }
+        } else {
+            renderTargetHeight = height; // Fallback
+        }
+
+        // Convert OpenGL viewport (bottom-left origin) to D3D9 viewport (top-left origin)
         vp.X = x;
-        vp.Y = y;
+        vp.Y = renderTargetHeight - (y + height);
         vp.Width = width;
         vp.Height = height;
         vp.MinZ = s->depthRangeNear;
@@ -1477,14 +1516,33 @@ void _glsDepthRange(double nearVal, double farVal)
 {
     GLS_State *s = glsGetState();
     IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+    HGLRC hGLRC;
+    GLD_ctx *ctx;
+    int renderTargetHeight;
+
     s->depthRangeNear = (float)nearVal;
     s->depthRangeFar = (float)farVal;
 
     /* Update D3D9 viewport with new depth range */
     if (pDev && s->viewportW > 0 && s->viewportH > 0) {
         D3DVIEWPORT9 vp;
+
+        // Get current context to obtain render target dimensions
+        hGLRC = gldGetCurrentContext();
+        if (hGLRC) {
+            ctx = gldGetContextAddress(hGLRC);
+            if (ctx) {
+                renderTargetHeight = ctx->dwHeight;
+            } else {
+                renderTargetHeight = s->viewportH; // Fallback
+            }
+        } else {
+            renderTargetHeight = s->viewportH; // Fallback
+        }
+
+        // Convert OpenGL viewport (bottom-left origin) to D3D9 viewport (top-left origin)
         vp.X = s->viewportX;
-        vp.Y = s->viewportY;
+        vp.Y = renderTargetHeight - (s->viewportY + s->viewportH);
         vp.Width = s->viewportW;
         vp.Height = s->viewportH;
         vp.MinZ = (float)nearVal;

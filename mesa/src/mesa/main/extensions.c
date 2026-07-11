@@ -29,9 +29,10 @@
 #include "extensions.h"
 #include "simple_list.h"
 #include "mtypes.h"
+#include <stddef.h>
 
 
-#define F(x) (int)(unsigned long)&(((struct gl_extensions *)0)->x)
+#define F(x) ((int) offsetof(struct gl_extensions, x))
 #define ON GL_TRUE
 #define OFF GL_FALSE
 

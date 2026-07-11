@@ -530,7 +530,7 @@ static void trans_4_GLubyte_4ub_raw(GLubyte (*t)[4],
    const GLubyte *f = (GLubyte *) Ptr + SRC_START * stride;
    GLuint i;
 
-   if (((((long) f | (long) stride)) & 3L) == 0L) {
+   if (((((size_t) f | (size_t) stride)) & 3U) == 0U) {
       /* Aligned.
        */
       for (i = DST_START ; i < n ; i++, f += stride) {

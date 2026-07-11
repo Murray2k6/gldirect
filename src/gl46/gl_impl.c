@@ -689,6 +689,8 @@ void _glsDeleteBuffers(int n, const unsigned int *buffers)
             if (buf->data) { free(buf->data); buf->data = NULL; }
             if (s->boundArrayBuffer == buffers[i]) s->boundArrayBuffer = 0;
             if (s->boundElementBuffer == buffers[i]) s->boundElementBuffer = 0;
+            if (s->boundPixelPackBuffer == buffers[i]) s->boundPixelPackBuffer = 0;
+            if (s->boundPixelUnpackBuffer == buffers[i]) s->boundPixelUnpackBuffer = 0;
             buf->allocated = FALSE;
         }
     }
@@ -709,6 +711,10 @@ void _glsBindBuffer(unsigned int target, unsigned int buffer)
         s->boundArrayBuffer = buffer;
     else if (target == GL_ELEMENT_ARRAY_BUFFER)
         s->boundElementBuffer = buffer;
+    else if (target == 0x88EB) /* GL_PIXEL_PACK_BUFFER */
+        s->boundPixelPackBuffer = buffer;
+    else if (target == 0x88EC) /* GL_PIXEL_UNPACK_BUFFER */
+        s->boundPixelUnpackBuffer = buffer;
     else if (target == 0x8F36) /* GL_COPY_READ_BUFFER */
         s->boundCopyReadBuffer = buffer;
     else if (target == 0x8F37) /* GL_COPY_WRITE_BUFFER */
@@ -1137,6 +1143,10 @@ static GLS_Buffer* _getBoundBuffer(unsigned int target)
         id = s->boundArrayBuffer;
     else if (target == GL_ELEMENT_ARRAY_BUFFER)
         id = s->boundElementBuffer;
+    else if (target == 0x88EB) /* GL_PIXEL_PACK_BUFFER */
+        id = s->boundPixelPackBuffer;
+    else if (target == 0x88EC) /* GL_PIXEL_UNPACK_BUFFER */
+        id = s->boundPixelUnpackBuffer;
     else if (target == 0x8F36) /* GL_COPY_READ_BUFFER */
         id = s->boundCopyReadBuffer;
     else if (target == 0x8F37) /* GL_COPY_WRITE_BUFFER */
@@ -2255,7 +2265,7 @@ void _glsGetIntegerv(unsigned int pname, int *params)
 
     /* Texture limits */
     case 0x0D33: /* GL_MAX_TEXTURE_SIZE */ *params = 16384; break;
-    case 0x851C: /* GL_MAX_TEXTURE_UNITS */ *params = 8; break;
+    case 0x851C: /* GL_MAX_CUBE_MAP_TEXTURE_SIZE */ *params = 16384; break;
     case 0x8824: /* GL_MAX_DRAW_BUFFERS */ *params = 8; break;
     case 0x8869: /* GL_MAX_VERTEX_ATTRIBS */ *params = 16; break;
     case 0x8872: /* GL_MAX_TEXTURE_IMAGE_UNITS */ *params = 16; break;
@@ -2270,7 +2280,11 @@ void _glsGetIntegerv(unsigned int pname, int *params)
     case 0x0D55: /* GL_STENCIL_BITS */ *params = 8; break;
 
     /* Extensions */
-    case 0x821D: /* GL_NUM_EXTENSIONS */ *params = 0; break;
+    case 0x821D: /* GL_NUM_EXTENSIONS */ {
+        extern int _gldGetExtensionCount(void);
+        *params = _gldGetExtensionCount();
+        break;
+    }
 
     /* Legacy limits */
     case 0x0D32: /* GL_MAX_CLIP_PLANES */ *params = 6; break;
@@ -2280,11 +2294,16 @@ void _glsGetIntegerv(unsigned int pname, int *params)
     case 0x0D39: /* GL_MAX_TEXTURE_STACK_DEPTH */ *params = 10; break;
     case 0x84E2: /* GL_MAX_TEXTURE_UNITS_ARB */ *params = 8; break;
     case 0x8073: /* GL_MAX_3D_TEXTURE_SIZE */ *params = 2048; break;
-    case 0x88FF: /* GL_MAX_CUBE_MAP_TEXTURE_SIZE */ *params = 16384; break;
-    case 0x8D57: /* GL_MAX_ARRAY_TEXTURE_LAYERS */ *params = 2048; break;
+    case 0x88FF: /* GL_MAX_ARRAY_TEXTURE_LAYERS */ *params = 2048; break;
+    case 0x8D57: /* GL_MAX_SAMPLES */ *params = 4; break;
+    case 0x910E: /* GL_MAX_COLOR_TEXTURE_SAMPLES */ *params = 4; break;
+    case 0x910F: /* GL_MAX_DEPTH_TEXTURE_SAMPLES */ *params = 4; break;
+    case 0x9110: /* GL_MAX_INTEGER_SAMPLES */ *params = 4; break;
+    case 0x84FF: /* GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT */ *params = 16; break;
     case 0x8B4D: /* GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS */ *params = 32; break;
     case 0x8A2B: /* GL_MAX_UNIFORM_BUFFER_BINDINGS */ *params = 36; break;
     case 0x8A30: /* GL_MAX_UNIFORM_BLOCK_SIZE */ *params = 65536; break;
+    case 0x8A34: /* GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT */ *params = 256; break;
     case 0x8DFB: /* GL_MAX_VARYING_FLOATS */ *params = 64; break;
     case 0x8871: /* GL_MAX_TEXTURE_COORDS */ *params = 8; break;
     case 0x0BA0: /* GL_MAX_ATTRIB_STACK_DEPTH */ *params = 16; break;
@@ -2356,13 +2375,15 @@ void _glsGetIntegerv(unsigned int pname, int *params)
     }
     case 0x8894: /* GL_ARRAY_BUFFER_BINDING */ *params = s->boundArrayBuffer; break;
     case 0x8895: /* GL_ELEMENT_ARRAY_BUFFER_BINDING */ *params = s->boundElementBuffer; break;
+    case 0x88ED: /* GL_PIXEL_PACK_BUFFER_BINDING */ *params = s->boundPixelPackBuffer; break;
+    case 0x88EF: /* GL_PIXEL_UNPACK_BUFFER_BINDING */ *params = s->boundPixelUnpackBuffer; break;
     case 0x85B5: /* GL_VERTEX_ARRAY_BINDING */ *params = s->boundVAO; break;
     case 0x8CA6: /* GL_DRAW_FRAMEBUFFER_BINDING */ *params = s->boundFBO; break;
     case 0x8CA7: /* GL_RENDERBUFFER_BINDING */ *params = s->boundRBO; break;
 
     /* Values that MUST NOT be zero (games divide by these) */
     case 0x0D3A: /* GL_MAX_VIEWPORT_DIMS */ params[0] = 16384; params[1] = 16384; break;
-    case 0x8D6B: /* GL_MAX_SAMPLES */ *params = 4; break;
+    case 0x8D6B: /* GL_MAX_ELEMENT_INDEX */ *params = 0x7FFFFFFF; break;
     case 0x8DFD: /* GL_MAX_ELEMENTS_INDICES */ *params = 65536; break;
     case 0x8DFE: /* GL_MAX_ELEMENTS_VERTICES */ *params = 65536; break;
     case 0x8C2B: /* GL_MAX_TEXTURE_BUFFER_SIZE */ *params = 65536; break;
@@ -2384,6 +2405,17 @@ void _glsGetIntegerv(unsigned int pname, int *params)
     case 0x91BB: /* GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS */ *params = 1024; break;
     case 0x8F38: /* GL_MAX_SERVER_WAIT_TIMEOUT */ *params = 0x7FFFFFFF; break;
     case 0x864B: /* GL_MAX_TEXTURE_LOD_BIAS */ *params = 16; break;
+
+    /* NVIDIA GPU memory information, reported in KiB. */
+    case 0x9047: /* GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX */
+    case 0x9048: /* GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX */
+    case 0x9049: /* GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX */
+        *params = (int)gldGetAvailableVideoMemoryKB46();
+        break;
+    case 0x904A: /* GL_GPU_MEMORY_INFO_EVICTION_COUNT_NVX */
+    case 0x904B: /* GL_GPU_MEMORY_INFO_EVICTED_MEMORY_NVX */
+        *params = 0;
+        break;
 
     default: *params = 0; break;
     }

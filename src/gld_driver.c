@@ -128,7 +128,7 @@ static char *g_szGLDVersion		= "4.6 GLDirect";
 // extensions
 // Extension string — report all extensions that DX9 can reasonably emulate.
 // Games check this via glGetString(GL_EXTENSIONS) to decide what features to use.
-static char *g_szGLDExtensions	=
+static char g_szGLDExtensions[]	=
 "GL_ARB_multitexture "
 "GL_ARB_texture_env_combine "
 "GL_ARB_texture_env_crossbar "
@@ -162,6 +162,7 @@ static char *g_szGLDExtensions	=
 "GL_ARB_sync "
 "GL_ARB_sampler_objects "
 "GL_ARB_texture_storage "
+"GL_ARB_texture_multisample "
 "GL_ARB_instanced_arrays "
 "GL_ARB_draw_instanced "
 "GL_ARB_draw_elements_base_vertex "
@@ -198,6 +199,54 @@ static char *g_szGLDExtensions	=
 "GL_S3_s3tc "
 "GL_KHR_debug "
 ;
+
+#define GLD_MAX_EXTENSION_COUNT 128
+static INIT_ONCE g_extensionInitOnce = INIT_ONCE_STATIC_INIT;
+static char g_extensionStorage[sizeof(g_szGLDExtensions)];
+static const char *g_extensionList[GLD_MAX_EXTENSION_COUNT];
+static int g_extensionCount = 0;
+
+static BOOL CALLBACK _gldInitExtensionList(PINIT_ONCE initOnce, PVOID parameter, PVOID *context)
+{
+	char *cursor;
+	(void)initOnce;
+	(void)parameter;
+	(void)context;
+
+	memcpy(g_extensionStorage, g_szGLDExtensions, sizeof(g_szGLDExtensions));
+	cursor = g_extensionStorage;
+
+	while (*cursor && g_extensionCount < GLD_MAX_EXTENSION_COUNT) {
+		while (*cursor == ' ')
+			++cursor;
+		if (!*cursor)
+			break;
+
+		g_extensionList[g_extensionCount++] = cursor;
+		while (*cursor && *cursor != ' ')
+			++cursor;
+		if (*cursor)
+			*cursor++ = '\0';
+	}
+
+	return TRUE;
+}
+
+int _gldGetExtensionCount(void)
+{
+	InitOnceExecuteOnce(&g_extensionInitOnce, _gldInitExtensionList, NULL, NULL);
+	return g_extensionCount;
+}
+
+const GLubyte* _gldGetStringiGeneric(GLenum name, GLuint index)
+{
+	InitOnceExecuteOnce(&g_extensionInitOnce, _gldInitExtensionList, NULL, NULL);
+
+	if (name != GL_EXTENSIONS || index >= (GLuint)g_extensionCount)
+		return NULL;
+
+	return (const GLubyte *)g_extensionList[index];
+}
 
 //---------------------------------------------------------------------------
 

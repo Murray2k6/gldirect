@@ -58,6 +58,7 @@ typedef struct {
     BOOL                bDirect3DDevice;    // Persistant Direct3DDevice9 exists
     IDirect3D9          *pD3D;              // Persistant Direct3D9
     IDirect3DDevice9    *pDev;              // Persistant Direct3DDevice9
+    UINT                availableTextureMem; // Last non-zero D3D9 memory estimate
     BOOL                bRemixDetected;     // NVIDIA DXVK Remix d3d9.dll detected
 } GLD_gl46_dx9_globals;
 
@@ -272,6 +273,11 @@ HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor)
     // Store the device
     gl46Globals.pDev = pDev;
     gl46Globals.bDirect3DDevice = TRUE;
+    {
+        UINT available = IDirect3DDevice9_GetAvailableTextureMem(pDev);
+        if (available)
+            gl46Globals.availableTextureMem = available;
+    }
 
     // Begin the first scene
     IDirect3DDevice9_BeginScene(pDev);
@@ -417,6 +423,11 @@ BOOL _gldEnsureDevice(HWND hWnd)
 
     gl46Globals.pDev = pDev;
     gl46Globals.bDirect3DDevice = TRUE;
+    {
+        UINT available = IDirect3DDevice9_GetAvailableTextureMem(pDev);
+        if (available)
+            gl46Globals.availableTextureMem = available;
+    }
 
     // Begin the first scene so glClear and draw calls work immediately
     IDirect3DDevice9_BeginScene(pDev);
@@ -508,6 +519,31 @@ BOOL gldDeleteContext46(GLD_ctx *ctx)
 IDirect3DDevice9* gldGetD3DDevice46(void)
 {
     return gl46Globals.pDev;
+}
+
+// ***********************************************************************
+// Return D3D9's current texture-memory estimate in KiB.  The last non-zero
+// value is retained because Wolfenstein queries this after deleting its
+// temporary capability-discovery context.
+// ***********************************************************************
+
+UINT gldGetAvailableVideoMemoryKB46(void)
+{
+    UINT available;
+
+    if (gl46Globals.pDev) {
+        available = IDirect3DDevice9_GetAvailableTextureMem(gl46Globals.pDev);
+        if (available)
+            gl46Globals.availableTextureMem = available;
+    }
+
+    if (!gl46Globals.availableTextureMem) {
+        /* D3D9 exposes this as a 32-bit byte count.  Use its maximum useful
+         * estimate when a wrapper does not implement the optional query. */
+        gl46Globals.availableTextureMem = 0xFFF00000u;
+    }
+
+    return gl46Globals.availableTextureMem / 1024u;
 }
 
 // ***********************************************************************

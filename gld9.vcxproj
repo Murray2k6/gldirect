@@ -464,8 +464,7 @@
     <!-- Mesa source files — Mesa provides the OpenGL state machine, D3D9 is the renderer -->
     <ClCompile Include="mesa\src\mesa\array_cache\ac_context.c" />
     <ClCompile Include="mesa\src\mesa\array_cache\ac_import.c" />
-    <ClCompile Include="mesa\src\mesa\glapi\glapi.c" />
-    <ClCompile Include="mesa\src\mesa\glapi\glthread.c" />
+    <ClCompile Include="src\glapi_shim.c" />
     <ClCompile Include="mesa\src\mesa\math\m_debug_clip.c" />
     <ClCompile Include="mesa\src\mesa\math\m_debug_norm.c" />
     <ClCompile Include="mesa\src\mesa\math\m_debug_xform.c" />
@@ -497,7 +496,6 @@
     <ClCompile Include="mesa\src\mesa\main\convolve.c" />
     <ClCompile Include="mesa\src\mesa\main\debug.c" />
     <ClCompile Include="mesa\src\mesa\main\depth.c" />
-    <ClCompile Include="mesa\src\mesa\main\dispatch.c" />
     <ClCompile Include="mesa\src\mesa\main\dlist.c" />
     <ClCompile Include="mesa\src\mesa\main\drawpix.c" />
     <ClCompile Include="mesa\src\mesa\main\enable.c" />
@@ -539,7 +537,7 @@
     <!-- mesa_compat.c removed — real Mesa source files provide these functions -->
     <!-- <ClCompile Include="src\mesa_compat.c" /> -->
     <!-- gl_legacy_stubs.c removed — Mesa dispatch.c provides all GL functions -->
-    <!-- <ClCompile Include="src\gl_legacy_stubs.c" /> -->
+    <ClCompile Include="src\gl_legacy_stubs.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\dx9\gldirect5.h" />

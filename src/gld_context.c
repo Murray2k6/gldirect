@@ -973,6 +973,7 @@ BOOL gldMakeCurrent(
 	HWND hWnd;
 	BOOL bNeedResize = FALSE;
 	BOOL bWindowChanged, bContextChanged;
+	BOOL bDeviceDeferred = FALSE;
 	DWORD dwThreadId = GetCurrentThreadId();
 
 	context = (int)(INT_PTR)b; // This is as a result of STRICT!
@@ -1075,7 +1076,6 @@ BOOL gldMakeCurrent(
 		lpCtx->gl46Ctx.viewportHeight = (GLsizei)(lpCtx->rcScreenRect.bottom - lpCtx->rcScreenRect.top);
 		lpCtx->dwWidth  = lpCtx->rcScreenRect.right - lpCtx->rcScreenRect.left;
 		lpCtx->dwHeight = lpCtx->rcScreenRect.bottom - lpCtx->rcScreenRect.top;
-		lpCtx->bHasBeenCurrent = TRUE;
 	}
 
 	// Don't want to spit this out *every* frame...
@@ -1093,27 +1093,41 @@ BOOL gldMakeCurrent(
 	if (lpCtx->bHasBeenCurrent == FALSE) {
 		// Check if this is a lazy context (no D3D9 device yet)
 		if (!lpCtx->bCanRender && lpCtx->lpPF) {
-			gldLogPrintf(GLDLOG_SYSTEM, "gldMakeCurrent: creating D3D9 device for lazy context HGLRC=%d", context);
-			if (!gldCreateContextBuffers(a, lpCtx, FALSE)) {
-				gldLogPrintf(GLDLOG_ERROR, "gldMakeCurrent: failed to create D3D9 device for lazy context");
-				return FALSE;
+			RECT drawableRect;
+			BOOL drawable = hWnd && IsWindow(hWnd) &&
+				GetClientRect(hWnd, &drawableRect) &&
+				(drawableRect.right > drawableRect.left) &&
+				(drawableRect.bottom > drawableRect.top);
+
+			if (!drawable) {
+				bDeviceDeferred = TRUE;
+				gldLogPrintf(GLDLOG_SYSTEM,
+					"gldMakeCurrent: deferring D3D9 device for non-drawable bootstrap context HGLRC=%d",
+					context);
+			} else {
+				gldLogPrintf(GLDLOG_SYSTEM, "gldMakeCurrent: creating D3D9 device for lazy context HGLRC=%d", context);
+				if (!gldCreateContextBuffers(a, lpCtx, FALSE)) {
+					gldLogPrintf(GLDLOG_ERROR, "gldMakeCurrent: failed to create D3D9 device for lazy context");
+					return FALSE;
+				}
 			}
 		}
 
-		lpCtx->gl46Ctx.viewportX      = 0;
-		lpCtx->gl46Ctx.viewportY      = 0;
-		lpCtx->gl46Ctx.viewportWidth  = (GLsizei)lpCtx->dwWidth;
-		lpCtx->gl46Ctx.viewportHeight = (GLsizei)lpCtx->dwHeight;
-		// Post a paint message asynchronously to avoid cross-thread deadlock.
-		// UpdateWindow() sends WM_PAINT synchronously which deadlocks when
-		// called from a worker thread on a window owned by the main thread.
-		if (lpCtx->hWnd) {
-			InvalidateRect(lpCtx->hWnd, NULL, TRUE);
-			PostMessage(lpCtx->hWnd, WM_PAINT, 0, 0);
+		if (!bDeviceDeferred) {
+			lpCtx->gl46Ctx.viewportX      = 0;
+			lpCtx->gl46Ctx.viewportY      = 0;
+			lpCtx->gl46Ctx.viewportWidth  = (GLsizei)lpCtx->dwWidth;
+			lpCtx->gl46Ctx.viewportHeight = (GLsizei)lpCtx->dwHeight;
+			// Post a paint message asynchronously to avoid cross-thread deadlock.
+			// UpdateWindow() sends WM_PAINT synchronously which deadlocks when
+			// called from a worker thread on a window owned by the main thread.
+			if (lpCtx->hWnd) {
+				InvalidateRect(lpCtx->hWnd, NULL, TRUE);
+				PostMessage(lpCtx->hWnd, WM_PAINT, 0, 0);
+			}
+			lpCtx->bHasBeenCurrent = TRUE;
 		}
 	}
-
-	lpCtx->bHasBeenCurrent = TRUE;
 
 #ifdef GLD_THREADS
 	// Release serialized access
@@ -1226,8 +1240,18 @@ BOOL gldSwapBuffers(
 	}
 
 	if (!lpCtx->bCanRender) {
-		// Don't return false else some apps will bail.
-		return TRUE;
+		RECT rc;
+		hWnd = WindowFromDC(hDC);
+		if (lpCtx->lpPF && hWnd && IsWindow(hWnd) && GetClientRect(hWnd, &rc) &&
+			(rc.right > rc.left) && (rc.bottom > rc.top)) {
+			gldLogMessage(GLDLOG_SYSTEM,
+				"gldSwapBuffers: creating deferred D3D9 device for drawable window\n");
+			if (!gldCreateContextBuffers(hDC, lpCtx, FALSE))
+				return TRUE;
+		} else {
+			// Don't return false else some apps will bail during bootstrap.
+			return TRUE;
+		}
 	}
 
 	hWnd = lpCtx->hWnd;
@@ -1258,8 +1282,13 @@ BOOL gldSwapBuffers(
 		EnterCriticalSection(&CriticalSection);
 #endif
 
-	// Flush GL commands before swap (replaces Mesa _mesa_notifySwapBuffers)
-	glFlush();
+	/*
+	 * Do not call the GLAD glFlush macro here.  GLAD is used only by the
+	 * optional native-OpenGL plumbing and its function table is deliberately
+	 * not initialised by the D3D9 backend.  Both D3D9 swap implementations
+	 * finish their own pending work before Present, so invoking glad_glFlush
+	 * here is both redundant and (for this backend) a NULL function call.
+	 */
 	// Now perform driver buffer swap
 	_gldDriver.SwapBuffers(lpCtx, hDC, hWnd);
 

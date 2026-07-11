@@ -105,9 +105,43 @@ static void    APIENTRY _stub_glGenFramebuffers(GLsizei n, GLuint *framebuffers)
 static void    APIENTRY _stub_glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers) { _glsDeleteFramebuffers(n, framebuffers); }
 static void    APIENTRY _stub_glBindFramebuffer(GLenum target, GLuint framebuffer) { _glsBindFramebuffer(target, framebuffer); }
 static GLenum  APIENTRY _stub_glCheckFramebufferStatus(GLenum target) { return _glsCheckFramebufferStatus(target); }
+static void    APIENTRY _stub_glFramebufferTexture1D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) { _glsFramebufferTexture2D(target, attachment, textarget, texture, level); }
 static void    APIENTRY _stub_glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) { _glsFramebufferTexture2D(target, attachment, textarget, texture, level); }
+static void    APIENTRY _stub_glFramebufferTexture3D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint zoffset) { (void)zoffset; _glsFramebufferTexture2D(target, attachment, textarget, texture, level); }
 static void    APIENTRY _stub_glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) { _glsFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer); }
-static GLboolean APIENTRY _stub_glIsFramebuffer(GLuint framebuffer) { return GL_FALSE; }
+static void    APIENTRY _stub_glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLenum pname, GLint *params) {
+    GLS_State *s = glsGetState();
+    GLS_FBO *fbo = glsFindFBO(s->boundFBO);
+    GLuint objectName = 0;
+    GLenum objectType = GL_NONE;
+    GLint level = 0;
+    int index = (attachment >= GL_COLOR_ATTACHMENT0 && attachment < GL_COLOR_ATTACHMENT0 + 4)
+        ? (int)(attachment - GL_COLOR_ATTACHMENT0) : -1;
+    (void)target;
+    if (!params) return;
+    if (fbo) {
+        if (index >= 0) {
+            if (fbo->colorAttachRB[index]) { objectName = fbo->colorAttachRB[index]; objectType = GL_RENDERBUFFER; }
+            else if (fbo->colorAttachment[index]) { objectName = fbo->colorAttachment[index]; objectType = GL_TEXTURE; level = fbo->colorAttachLevel[index]; }
+        } else if (attachment == GL_DEPTH_ATTACHMENT) {
+            if (fbo->depthAttachRB) { objectName = fbo->depthAttachRB; objectType = GL_RENDERBUFFER; }
+            else if (fbo->depthAttachment) { objectName = fbo->depthAttachment; objectType = GL_TEXTURE; }
+        } else if (attachment == GL_STENCIL_ATTACHMENT) {
+            if (fbo->stencilAttachRB) { objectName = fbo->stencilAttachRB; objectType = GL_RENDERBUFFER; }
+            else if (fbo->stencilAttachment) { objectName = fbo->stencilAttachment; objectType = GL_TEXTURE; }
+        } else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT) {
+            if (fbo->depthStencilAttachRB) { objectName = fbo->depthStencilAttachRB; objectType = GL_RENDERBUFFER; }
+            else if (fbo->depthStencilAttachment) { objectName = fbo->depthStencilAttachment; objectType = GL_TEXTURE; }
+        }
+    }
+    switch (pname) {
+    case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE: *params = (GLint)objectType; break;
+    case GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME: *params = (GLint)objectName; break;
+    case GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL: *params = level; break;
+    default: *params = 0; break;
+    }
+}
+static GLboolean APIENTRY _stub_glIsFramebuffer(GLuint framebuffer) { GLS_FBO *fbo = glsFindFBO(framebuffer); return (fbo && fbo->allocated) ? GL_TRUE : GL_FALSE; }
 static void    APIENTRY _stub_glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter) { _glsBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter); }
 
 /* ===== GL 3.0 — RBO ===== */
@@ -116,10 +150,27 @@ static void    APIENTRY _stub_glDeleteRenderbuffers(GLsizei n, const GLuint *ren
 static void    APIENTRY _stub_glBindRenderbuffer(GLenum target, GLuint renderbuffer) { _glsBindRenderbuffer(target, renderbuffer); }
 static void    APIENTRY _stub_glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height) { _glsRenderbufferStorage(target, internalformat, width, height); }
 static void    APIENTRY _stub_glRenderbufferStorageMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height) { _glsRenderbufferStorageMultisample(target, samples, internalformat, width, height); }
-static void    APIENTRY _stub_glGetRenderbufferParameteriv(GLenum target, GLenum pname, GLint *params) { if(params) *params=0; }
+static void    APIENTRY _stub_glGetRenderbufferParameteriv(GLenum target, GLenum pname, GLint *params) {
+    GLS_State *s = glsGetState();
+    GLS_RBO *rbo = glsFindRBO(s->boundRBO);
+    (void)target;
+    if (!params) return;
+    if (!rbo) { *params = 0; return; }
+    switch (pname) {
+    case GL_RENDERBUFFER_WIDTH: *params = rbo->width; break;
+    case GL_RENDERBUFFER_HEIGHT: *params = rbo->height; break;
+    case GL_RENDERBUFFER_INTERNAL_FORMAT: *params = (GLint)rbo->internalFormat; break;
+    case GL_RENDERBUFFER_SAMPLES: *params = rbo->samples; break;
+    default: *params = 0; break;
+    }
+}
+static GLboolean APIENTRY _stub_glIsRenderbuffer(GLuint renderbuffer) { GLS_RBO *rbo = glsFindRBO(renderbuffer); return (rbo && rbo->allocated) ? GL_TRUE : GL_FALSE; }
 
 /* ===== GL 3.0 — Misc ===== */
-static const GLubyte* APIENTRY _stub_glGetStringi(GLenum name, GLuint index) { return (const GLubyte*)""; }
+static const GLubyte* APIENTRY _stub_glGetStringi(GLenum name, GLuint index) {
+    extern const GLubyte* _gldGetStringiGeneric(GLenum name, GLuint index);
+    return _gldGetStringiGeneric(name, index);
+}
 static void    APIENTRY _stub_glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat *value) { _glsClearBufferfv(buffer, drawbuffer, value); }
 static void    APIENTRY _stub_glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint *value) { _glsClearBufferiv(buffer, drawbuffer, value); }
 static void    APIENTRY _stub_glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint *value) { _glsClearBufferuiv(buffer, drawbuffer, value); }
@@ -167,6 +218,17 @@ static void    APIENTRY _stub_glFramebufferTexture(GLenum target, GLenum attachm
 static void    APIENTRY _stub_glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64 *params) { if(params) *params=0; }
 static void    APIENTRY _stub_glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations) { _glsTexImage2DMultisample(target, samples, internalformat, width, height, fixedsamplelocations); }
 static void    APIENTRY _stub_glTexImage3DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations) { _glsTexImage3DMultisample(target, samples, internalformat, width, height, depth, fixedsamplelocations); }
+static void    APIENTRY _stub_glGetMultisamplefv(GLenum pname, GLuint index, GLfloat *val) {
+    (void)index;
+    if (!val) return;
+    if (pname == GL_SAMPLE_POSITION) {
+        val[0] = 0.5f;
+        val[1] = 0.5f;
+    } else {
+        val[0] = 0.0f;
+        val[1] = 0.0f;
+    }
+}
 static void    APIENTRY _stub_glSampleMaski(GLuint maskNumber, GLbitfield mask) { _glsSampleMaski(maskNumber, mask); }
 static void    APIENTRY _stub_glProvokingVertex(GLenum mode) { _glsProvokingVertex(mode); }
 
@@ -336,8 +398,11 @@ static const GLD_modernProcEntry g_modernGL[] = {
     { "glDeleteFramebuffers",       (PROC)_stub_glDeleteFramebuffers },
     { "glBindFramebuffer",          (PROC)_stub_glBindFramebuffer },
     { "glCheckFramebufferStatus",   (PROC)_stub_glCheckFramebufferStatus },
+    { "glFramebufferTexture1D",     (PROC)_stub_glFramebufferTexture1D },
     { "glFramebufferTexture2D",     (PROC)_stub_glFramebufferTexture2D },
+    { "glFramebufferTexture3D",     (PROC)_stub_glFramebufferTexture3D },
     { "glFramebufferRenderbuffer",  (PROC)_stub_glFramebufferRenderbuffer },
+    { "glGetFramebufferAttachmentParameteriv", (PROC)_stub_glGetFramebufferAttachmentParameteriv },
     { "glIsFramebuffer",            (PROC)_stub_glIsFramebuffer },
     { "glBlitFramebuffer",          (PROC)_stub_glBlitFramebuffer },
     /* GL 3.0 RBO */
@@ -347,6 +412,7 @@ static const GLD_modernProcEntry g_modernGL[] = {
     { "glRenderbufferStorage",      (PROC)_stub_glRenderbufferStorage },
     { "glRenderbufferStorageMultisample", (PROC)_stub_glRenderbufferStorageMultisample },
     { "glGetRenderbufferParameteriv", (PROC)_stub_glGetRenderbufferParameteriv },
+    { "glIsRenderbuffer",           (PROC)_stub_glIsRenderbuffer },
     /* GL 3.0 Misc */
     { "glGetStringi",               (PROC)_stub_glGetStringi },
     { "glClearBufferfv",            (PROC)_stub_glClearBufferfv },
@@ -393,6 +459,7 @@ static const GLD_modernProcEntry g_modernGL[] = {
     { "glGetBufferParameteri64v",   (PROC)_stub_glGetBufferParameteri64v },
     { "glTexImage2DMultisample",    (PROC)_stub_glTexImage2DMultisample },
     { "glTexImage3DMultisample",    (PROC)_stub_glTexImage3DMultisample },
+    { "glGetMultisamplefv",         (PROC)_stub_glGetMultisamplefv },
     { "glSampleMaski",              (PROC)_stub_glSampleMaski },
     { "glProvokingVertex",          (PROC)_stub_glProvokingVertex },
     /* GL 3.3 */
@@ -515,6 +582,26 @@ static const GLD_modernProcEntry g_modernGL[] = {
     { "glDrawRangeElementsEXT",     (PROC)_stub_glDrawRangeElements },
     { "glBlendEquationEXT",         (PROC)_stub_glBlendEquation },
     { "glActiveStencilFaceEXT",     (PROC)_stub_glActiveStencilFaceEXT },
+    /* EXT_framebuffer_object / EXT_framebuffer_blit aliases */
+    { "glBindFramebufferEXT",       (PROC)_stub_glBindFramebuffer },
+    { "glBindRenderbufferEXT",      (PROC)_stub_glBindRenderbuffer },
+    { "glBlitFramebufferEXT",       (PROC)_stub_glBlitFramebuffer },
+    { "glCheckFramebufferStatusEXT", (PROC)_stub_glCheckFramebufferStatus },
+    { "glDeleteFramebuffersEXT",    (PROC)_stub_glDeleteFramebuffers },
+    { "glDeleteRenderbuffersEXT",   (PROC)_stub_glDeleteRenderbuffers },
+    { "glFramebufferRenderbufferEXT", (PROC)_stub_glFramebufferRenderbuffer },
+    { "glFramebufferTexture1DEXT",  (PROC)_stub_glFramebufferTexture1D },
+    { "glFramebufferTexture2DEXT",  (PROC)_stub_glFramebufferTexture2D },
+    { "glFramebufferTexture3DEXT",  (PROC)_stub_glFramebufferTexture3D },
+    { "glGenFramebuffersEXT",       (PROC)_stub_glGenFramebuffers },
+    { "glGenRenderbuffersEXT",      (PROC)_stub_glGenRenderbuffers },
+    { "glGenerateMipmapEXT",        (PROC)_stub_glGenerateMipmap },
+    { "glGetFramebufferAttachmentParameterivEXT", (PROC)_stub_glGetFramebufferAttachmentParameteriv },
+    { "glGetRenderbufferParameterivEXT", (PROC)_stub_glGetRenderbufferParameteriv },
+    { "glIsFramebufferEXT",         (PROC)_stub_glIsFramebuffer },
+    { "glIsRenderbufferEXT",        (PROC)_stub_glIsRenderbuffer },
+    { "glRenderbufferStorageEXT",   (PROC)_stub_glRenderbufferStorage },
+    { "glRenderbufferStorageMultisampleEXT", (PROC)_stub_glRenderbufferStorageMultisample },
     /* Sentinel */
     { NULL, NULL }
 };

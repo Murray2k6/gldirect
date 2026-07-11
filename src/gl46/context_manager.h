@@ -104,6 +104,9 @@ BOOL gldDeleteContext46(GLD_ctx *ctx);
  */
 IDirect3DDevice9* gldGetD3DDevice46(void);
 
+/* Return the latest non-zero D3D9 texture-memory estimate in KiB. */
+UINT gldGetAvailableVideoMemoryKB46(void);
+
 /*
  * Ensure the D3D9 device exists. Creates it lazily on the calling thread.
  * Returns TRUE on success, FALSE on failure.

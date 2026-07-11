@@ -253,6 +253,8 @@ typedef struct {
     GLuint_t            boundTextureCube[GLS_MAX_TEX_UNITS];
     GLuint_t            boundArrayBuffer;
     GLuint_t            boundElementBuffer;
+    GLuint_t            boundPixelPackBuffer;
+    GLuint_t            boundPixelUnpackBuffer;
     GLuint_t            boundVAO;
     GLuint_t            boundFBO;
     GLuint_t            boundRBO;

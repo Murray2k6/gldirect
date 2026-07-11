@@ -431,9 +431,28 @@ static HGLRC WINAPI _wglCreateContextAttribsARB(HDC hDC, HGLRC hShareContext, co
 	// Sync the wrapper's internal current-PF.
 	gldSetPixelFormat(ipf);
 
-	// Eager real-window context creation. D3D9 device is bound to the real
-	// HWND derived from hDC inside gldCreateContextBuffers.
-	hglrc = gldCreateContext(hDC, &glb.lpPF[ipf - 1]);
+	/*
+	 * Wolfenstein: The New Order creates its attribute context while the
+	 * bootstrap window can still have a zero-sized client area.  Creating a
+	 * DXVK-Remix D3D9 swap chain for that window makes DXVK fall back to the
+	 * desktop dimensions and can stall inside CreateDevice.  Keep the WGL
+	 * context usable for capability/function queries, but defer D3D9 device
+	 * creation until wglMakeCurrent or SwapBuffers sees a real drawable.
+	 */
+	{
+		HWND hWnd = WindowFromDC(hDC);
+		RECT rc;
+		BOOL drawable = hWnd && IsWindow(hWnd) && GetClientRect(hWnd, &rc) &&
+			(rc.right > rc.left) && (rc.bottom > rc.top);
+
+		if (drawable) {
+			hglrc = gldCreateContext(hDC, &glb.lpPF[ipf - 1]);
+		} else {
+			gldLogMessage(GLDLOG_SYSTEM,
+				"GL46: deferring D3D9 device creation for zero-sized/bootstrap context\n");
+			hglrc = gldCreateContextLazy(hDC, &glb.lpPF[ipf - 1]);
+		}
+	}
 
 	if (hglrc == NULL) {
 		gldLogMessage(GLDLOG_ERROR,
@@ -630,7 +649,7 @@ static int _glsGuessArgCount(const char *name)
 	if (strstr(name, "glSampler") == name) return 3;
 	if (strstr(name, "glTexParameter") == name) return 3;
 	if (strstr(name, "glTexStorage1D") == name) return 4;
-	if (strstr(name, "glShaderBinary") == 0) return 5;
+	if (strstr(name, "glShaderBinary") == name) return 5;
 	if (strstr(name, "glProgramBinary") == name) return 4;
 	if (strstr(name, "glProgramParameteri") == name) return 3;
 

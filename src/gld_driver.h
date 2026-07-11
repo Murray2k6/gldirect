@@ -92,6 +92,8 @@ extern GLD_driver _gldDriver;
 
 BOOL gldInitDriverPointers(DWORD dwDriver);
 const GLubyte* _gldGetStringGeneric(GLD_ctx *ctx, GLenum name);
+const GLubyte* _gldGetStringiGeneric(GLenum name, GLuint index);
+int _gldGetExtensionCount(void);
 BOOL gldValidate();
 
 #ifdef  __cplusplus

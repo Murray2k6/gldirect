@@ -398,6 +398,43 @@ D3DFORMAT _glsMapGLFormatToD3D(unsigned int internalformat)
     case GL_LUMINANCE_ALPHA:
     case 2:
         return D3DFMT_A8L8;
+
+    /* Sized single- and dual-component formats.  id Tech 4 asks for these by
+     * name; without them they fell through to A8R8G8B8, quadrupling the
+     * memory for what should be an 8-bit surface. */
+    case 0x803B: case 0x803C:                     /* GL_ALPHA4/8      */
+    case 0x803D: case 0x803E:                     /* GL_ALPHA12/16    */
+        return D3DFMT_A8;
+    case 0x803F: case 0x8040:                     /* GL_LUMINANCE4/8  */
+    case 0x8041: case 0x8042:                     /* GL_LUMINANCE12/16*/
+    case 0x804B: case 0x804C:                     /* GL_INTENSITY8/12 */
+        return D3DFMT_L8;
+    case 0x8043: case 0x8044: case 0x8045:        /* GL_LUMINANCE*_ALPHA* */
+    case 0x8046: case 0x8047:
+        return D3DFMT_A8L8;
+
+    /* Sized colour formats. */
+    case 0x8050:                                  /* GL_RGB5   */
+        return D3DFMT_R5G6B5;
+    case 0x8056:                                  /* GL_RGBA4  */
+        return D3DFMT_A4R4G4B4;
+    case 0x8057:                                  /* GL_RGB5_A1*/
+        return D3DFMT_A1R5G5B5;
+    case 0x8052: case 0x8053: case 0x8054:        /* GL_RGB10/12/16 */
+        return D3DFMT_X8R8G8B8;
+
+    /* Compressed internal formats requested through the *uncompressed*
+     * glTexImage2D entry point: the application hands over raw pixels and
+     * asks the driver to compress.  There is no compressor here, so the
+     * data is kept uncompressed — but the surface must still carry alpha
+     * only when the requested format does. */
+    case GL_COMPRESSED_RGB_S3TC_DXT1_EXT:         /* 0x83F0 */
+        return D3DFMT_X8R8G8B8;
+    case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:        /* 0x83F1 */
+    case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT:        /* 0x83F2 */
+    case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT:        /* 0x83F3 */
+        return D3DFMT_A8R8G8B8;
+
     default:
         return D3DFMT_A8R8G8B8;
     }
@@ -418,59 +455,140 @@ D3DFORMAT _glsMapCompressedFormatToD3D(unsigned int internalformat)
     }
 }
 
+/* Components in a GL pixel format, or 0 if unknown. */
+static int _glsFormatComponents(unsigned int glFormat)
+{
+    switch (glFormat) {
+    case GL_RGBA: case GL_BGRA: case GL_RGBA8: case 4:      return 4;
+    case GL_RGB:  case GL_BGR:  case GL_RGB8:  case 3:      return 3;
+    case GL_LUMINANCE_ALPHA: case 2:                        return 2;
+    case GL_LUMINANCE: case GL_ALPHA: case GL_RED:
+    case GL_GREEN: case GL_BLUE: case GL_INTENSITY:
+    case GL_DEPTH_COMPONENT: case 1:                        return 1;
+    default:                                                return 0;
+    }
+}
+
+/*
+ * Bytes occupied by one source pixel, or 0 when the combination is not
+ * understood.
+ *
+ * Returning 0 matters: the caller must then skip the copy entirely rather
+ * than guess a size.  Guessing 4 bytes per pixel — as this code used to —
+ * reads three bytes past the end of every pixel of a single-component
+ * image, which on a 1024-wide alpha texture runs ~3 MB off the end of the
+ * application's buffer and crashes.
+ */
+static int _glsSourceBytesPerPixel(unsigned int glFormat, unsigned int glType)
+{
+    int comps;
+
+    switch (glType) {
+    /* Packed types encode a whole pixel, so the component count is implied. */
+    case 0x8363: /* GL_UNSIGNED_SHORT_5_6_5      */
+    case 0x8364: /* GL_UNSIGNED_SHORT_5_6_5_REV  */
+    case 0x8033: /* GL_UNSIGNED_SHORT_4_4_4_4    */
+    case 0x8365: /* GL_UNSIGNED_SHORT_4_4_4_4_REV*/
+    case 0x8034: /* GL_UNSIGNED_SHORT_5_5_5_1    */
+    case 0x8366: /* GL_UNSIGNED_SHORT_1_5_5_5_REV*/
+        return 2;
+    case 0x8035: /* GL_UNSIGNED_INT_8_8_8_8      */
+    case 0x8367: /* GL_UNSIGNED_INT_8_8_8_8_REV  */
+    case 0x8036: /* GL_UNSIGNED_INT_10_10_10_2   */
+    case 0x8368: /* GL_UNSIGNED_INT_2_10_10_10_REV*/
+        return 4;
+    default:
+        break;
+    }
+
+    comps = _glsFormatComponents(glFormat);
+    if (comps == 0) return 0;
+
+    switch (glType) {
+    case GL_BYTE: case GL_UNSIGNED_BYTE:   return comps * 1;
+    case GL_SHORT: case GL_UNSIGNED_SHORT: return comps * 2;
+    case GL_INT: case GL_UNSIGNED_INT:
+    case GL_FLOAT:                         return comps * 4;
+    default:                               return 0;
+    }
+}
+
+/*
+ * Copy application pixel data into a locked D3D9 surface.
+ *
+ * Honours GL_UNPACK_ALIGNMENT and GL_UNPACK_ROW_LENGTH: GL pads each source
+ * row up to the alignment (4 by default), so a 2-pixel-wide alpha texture
+ * has 4-byte rows, not 2.  Ignoring that walked the source out of step with
+ * the image and produced garbage on every narrow texture.
+ */
 void _glsCopyPixelsToD3D(void *dst, const void *src, int width, int height,
                           unsigned int glFormat, unsigned int glType, int dstPitch)
 {
+    GLS_State *s = glsGetState();
+    int srcBpp, rowPixels, rowBytes, srcStride, alignment;
     int y;
-    if (!dst || !src) return;
+
+    if (!dst || !src || width <= 0 || height <= 0) return;
+
+    srcBpp = _glsSourceBytesPerPixel(glFormat, glType);
+    if (srcBpp == 0) {
+        /* Unknown source layout — leave the level as allocated rather than
+         * read from memory whose size we cannot determine. */
+        gldDiagLog("GL: CopyPixels unsupported format=0x%X type=0x%X — level skipped",
+                   glFormat, glType);
+        return;
+    }
+
+    rowPixels = (s && s->unpackRowLength > 0) ? s->unpackRowLength : width;
+    alignment = (s && s->unpackAlignment > 0) ? s->unpackAlignment : 4;
+    rowBytes  = rowPixels * srcBpp;
+    srcStride = ((rowBytes + alignment - 1) / alignment) * alignment;
 
     for (y = 0; y < height; y++) {
-        unsigned char *dstRow = (unsigned char *)dst + y * dstPitch;
+        const unsigned char *srcRow = (const unsigned char *)src + (ptrdiff_t)y * srcStride;
+        unsigned char *dstRow = (unsigned char *)dst + (ptrdiff_t)y * dstPitch;
         int x;
 
-        if ((glFormat == GL_RGBA || glFormat == GL_RGBA8 || glFormat == 4) && glType == GL_UNSIGNED_BYTE) {
-            /* RGBA -> BGRA (D3D A8R8G8B8 is actually BGRA in memory) */
-            const unsigned char *srcRow = (const unsigned char *)src + y * width * 4;
-            for (x = 0; x < width; x++) {
-                dstRow[x * 4 + 0] = srcRow[x * 4 + 2]; /* B <- R */
-                dstRow[x * 4 + 1] = srcRow[x * 4 + 1]; /* G <- G */
-                dstRow[x * 4 + 2] = srcRow[x * 4 + 0]; /* R <- B */
-                dstRow[x * 4 + 3] = srcRow[x * 4 + 3]; /* A <- A */
-            }
-        } else if ((glFormat == GL_RGB || glFormat == GL_RGB8 || glFormat == 3) && glType == GL_UNSIGNED_BYTE) {
-            /* RGB -> BGRX (D3D X8R8G8B8) */
-            const unsigned char *srcRow = (const unsigned char *)src + y * width * 3;
-            for (x = 0; x < width; x++) {
-                dstRow[x * 4 + 0] = srcRow[x * 3 + 2]; /* B */
-                dstRow[x * 4 + 1] = srcRow[x * 3 + 1]; /* G */
-                dstRow[x * 4 + 2] = srcRow[x * 3 + 0]; /* R */
-                dstRow[x * 4 + 3] = 0xFF;               /* X */
-            }
-        } else if (glFormat == GL_BGRA && glType == GL_UNSIGNED_BYTE) {
-            /* BGRA -> BGRA (no swizzle needed) */
-            const unsigned char *srcRow = (const unsigned char *)src + y * width * 4;
-            memcpy(dstRow, srcRow, width * 4);
-        } else if ((glFormat == GL_LUMINANCE || glFormat == 1) && glType == GL_UNSIGNED_BYTE) {
-            /* L8 -> L8 */
-            const unsigned char *srcRow = (const unsigned char *)src + y * width;
-            memcpy(dstRow, srcRow, width);
-        } else if (glFormat == GL_ALPHA && glType == GL_UNSIGNED_BYTE) {
-            /* A8 -> A8 */
-            const unsigned char *srcRow = (const unsigned char *)src + y * width;
-            memcpy(dstRow, srcRow, width);
-        } else if ((glFormat == GL_LUMINANCE_ALPHA || glFormat == 2) && glType == GL_UNSIGNED_BYTE) {
-            /* LA -> A8L8 */
-            const unsigned char *srcRow = (const unsigned char *)src + y * width * 2;
-            memcpy(dstRow, srcRow, width * 2);
-        } else {
-            /* Fallback: assume RGBA byte order, do BGRA swizzle */
-            const unsigned char *srcRow = (const unsigned char *)src + y * width * 4;
+        if (glType == GL_UNSIGNED_BYTE &&
+            (glFormat == GL_RGBA || glFormat == GL_RGBA8 || glFormat == 4)) {
+            /* RGBA -> BGRA (D3D A8R8G8B8 is BGRA in memory) */
             for (x = 0; x < width; x++) {
                 dstRow[x * 4 + 0] = srcRow[x * 4 + 2];
                 dstRow[x * 4 + 1] = srcRow[x * 4 + 1];
                 dstRow[x * 4 + 2] = srcRow[x * 4 + 0];
                 dstRow[x * 4 + 3] = srcRow[x * 4 + 3];
             }
+        } else if (glType == GL_UNSIGNED_BYTE && glFormat == GL_BGRA) {
+            memcpy(dstRow, srcRow, (size_t)width * 4);
+        } else if (glType == GL_UNSIGNED_BYTE &&
+                   (glFormat == GL_RGB || glFormat == GL_RGB8 || glFormat == 3)) {
+            /* RGB -> BGRX */
+            for (x = 0; x < width; x++) {
+                dstRow[x * 4 + 0] = srcRow[x * 3 + 2];
+                dstRow[x * 4 + 1] = srcRow[x * 3 + 1];
+                dstRow[x * 4 + 2] = srcRow[x * 3 + 0];
+                dstRow[x * 4 + 3] = 0xFF;
+            }
+        } else if (glType == GL_UNSIGNED_BYTE && glFormat == GL_BGR) {
+            for (x = 0; x < width; x++) {
+                dstRow[x * 4 + 0] = srcRow[x * 3 + 0];
+                dstRow[x * 4 + 1] = srcRow[x * 3 + 1];
+                dstRow[x * 4 + 2] = srcRow[x * 3 + 2];
+                dstRow[x * 4 + 3] = 0xFF;
+            }
+        } else if (glType == GL_UNSIGNED_BYTE &&
+                   (glFormat == GL_LUMINANCE_ALPHA || glFormat == 2)) {
+            memcpy(dstRow, srcRow, (size_t)width * 2);
+        } else if (glType == GL_UNSIGNED_BYTE && srcBpp == 1) {
+            /* Single component (luminance, alpha, intensity) -> L8/A8 */
+            memcpy(dstRow, srcRow, (size_t)width);
+        } else {
+            /* Understood size but no conversion for this combination; copying
+             * the raw row is bounded and correct whenever the D3D format was
+             * chosen to match. */
+            int copyBytes = width * srcBpp;
+            if (dstPitch > 0 && copyBytes > dstPitch) copyBytes = dstPitch;
+            memcpy(dstRow, srcRow, (size_t)copyBytes);
         }
     }
 }
@@ -1523,6 +1641,12 @@ void _glsTexImage2D(unsigned int target, int level, int internalformat,
 
     (void)border;
 
+    /* Logged on entry, not just on success: everything else here records
+     * only after the work is done, so a call that faults leaves no trace of
+     * itself and the crash appears to happen "after" the previous call. */
+    gldDiagLog("GL: -> TexImage2D target=0x%X level=%d %dx%d int=0x%X fmt=0x%X type=0x%X px=%p",
+               target, level, width, height, internalformat, format, type, pixels);
+
     tex = _glsBoundTextureForTarget(target, &unit);
     if (!tex || level < 0) return;
     if (!pDev || width <= 0 || height <= 0) return;
@@ -1705,6 +1829,9 @@ void _glsCompressedTexImage2D(unsigned int target, int level, unsigned int inter
     HRESULT hr;
 
     (void)border;
+
+    gldDiagLog("GL: -> CompressedTexImage2D target=0x%X level=%d %dx%d int=0x%X size=%d data=%p",
+               target, level, width, height, internalformat, imageSize, data);
 
     tex = _glsBoundTextureForTarget(target, &unit);
     if (!tex || level < 0) return;
@@ -3356,6 +3483,7 @@ void _glsGenProgramsARB(int n, unsigned int *programs)
 
 void _glsBindProgramARB(unsigned int target, unsigned int program)
 {
+    gldDiagLog("GL: -> BindProgramARB target=0x%X program=%u", target, program);
     GLS_State *s = glsGetState();
     (void)target;
     /* Auto-allocate if needed */
@@ -3371,6 +3499,7 @@ void _glsBindProgramARB(unsigned int target, unsigned int program)
 
 void _glsProgramStringARB(unsigned int target, unsigned int format, int len, const void *string)
 {
+    gldDiagLog("GL: -> ProgramStringARB target=0x%X format=0x%X len=%d", target, format, len);
     /* Store the program string in the currently bound program's source */
     GLS_State *s = glsGetState();
     GLS_Shader *sh;

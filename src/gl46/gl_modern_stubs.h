@@ -308,6 +308,53 @@ static void    APIENTRY _stub_glBindProgramARB(GLenum target, GLuint program) { 
 static void    APIENTRY _stub_glProgramStringARB(GLenum target, GLenum format, GLsizei len, const void *string) { _glsProgramStringARB(target, format, len, string); }
 static void    APIENTRY _stub_glProgramEnvParameter4fvARB(GLenum target, GLuint index, const GLfloat *params) { _glsProgramEnvParameter4fvARB(target, index, params); }
 static void    APIENTRY _stub_glProgramLocalParameter4fvARB(GLenum target, GLuint index, const GLfloat *params) { _glsProgramLocalParameter4fvARB(target, index, params); }
+/*
+ * Entry points that MUST be listed in the proc table below.
+ *
+ * Anything not in the table and not exported falls back to a typed no-op
+ * whose argument count _glsGuessArgCount only guesses.  These are all cases
+ * where the guess is wrong, and on x86 __stdcall the callee pops the
+ * arguments, so a wrong count corrupts the caller's stack and crashes.
+ * glUnlockArraysEXT was the worst: 0 arguments guessed as 4, popping 16
+ * bytes that were never pushed.  id Tech 4 games (Quake 4, Wolfenstein)
+ * call it every frame because GL_EXT_compiled_vertex_array is advertised.
+ */
+
+/* GL_EXT_compiled_vertex_array — a caching hint with no D3D9 equivalent;
+ * correct to ignore, but it must be ignored with the right stack cleanup. */
+static void    APIENTRY _stub_glLockArraysEXT(GLint first, GLsizei count) { (void)first; (void)count; }
+static void    APIENTRY _stub_glUnlockArraysEXT(void) { }
+
+/* Scalar forms of the ARB program parameter entry points (6 and 10 slots). */
+static void    APIENTRY _stub_glProgramEnvParameter4fARB(GLenum target, GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w)
+    { GLfloat v[4]; v[0]=x; v[1]=y; v[2]=z; v[3]=w; _glsProgramEnvParameter4fvARB(target, index, v); }
+static void    APIENTRY _stub_glProgramLocalParameter4fARB(GLenum target, GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w)
+    { GLfloat v[4]; v[0]=x; v[1]=y; v[2]=z; v[3]=w; _glsProgramLocalParameter4fvARB(target, index, v); }
+static void    APIENTRY _stub_glProgramEnvParameter4dARB(GLenum target, GLuint index, GLdouble x, GLdouble y, GLdouble z, GLdouble w)
+    { GLfloat v[4]; v[0]=(GLfloat)x; v[1]=(GLfloat)y; v[2]=(GLfloat)z; v[3]=(GLfloat)w; _glsProgramEnvParameter4fvARB(target, index, v); }
+static void    APIENTRY _stub_glProgramLocalParameter4dARB(GLenum target, GLuint index, GLdouble x, GLdouble y, GLdouble z, GLdouble w)
+    { GLfloat v[4]; v[0]=(GLfloat)x; v[1]=(GLfloat)y; v[2]=(GLfloat)z; v[3]=(GLfloat)w; _glsProgramLocalParameter4fvARB(target, index, v); }
+
+/* Occlusion query ARB aliases. */
+static void    APIENTRY _stub_glBeginQueryARB(GLenum target, GLuint id) { _glsBeginQuery(target, id); }
+static void    APIENTRY _stub_glEndQueryARB(GLenum target) { _glsEndQuery(target); }
+
+/* GL_EXT_multi_draw_arrays — replay as individual draws. */
+static void    APIENTRY _stub_glMultiDrawElementsEXT(GLenum mode, const GLsizei *count, GLenum type, const void *const*indices, GLsizei primcount)
+{
+    GLsizei i;
+    if (!count || !indices) return;
+    for (i = 0; i < primcount; i++)
+        if (count[i] > 0) _glsDrawElements(mode, count[i], type, indices[i]);
+}
+
+/* GL_EXT_fog_coord / GL_EXT_secondary_color / GL_ARB_point_parameters. */
+static void    APIENTRY _stub_glFogCoordfEXT(GLfloat coord) { _glsFogCoordf(coord); }
+static void    APIENTRY _stub_glFogCoordPointerEXT(GLenum type, GLsizei stride, const void *pointer) { (void)type; (void)stride; (void)pointer; }
+static void    APIENTRY _stub_glSecondaryColor3fvEXT(const GLfloat *v) { _glsSecondaryColor3fv(v); }
+static void    APIENTRY _stub_glPointParameterfEXT(GLenum pname, GLfloat param) { _glsPointParameterf(pname, param); }
+static void    APIENTRY _stub_glPointParameterfvEXT(GLenum pname, const GLfloat *params) { _glsPointParameterfv(pname, params); }
+
 static void    APIENTRY _stub_glDeleteObjectARB(GLuint obj) { _glsDeleteObjectARB(obj); }
 static void    APIENTRY _stub_glGetObjectParameterivARB(GLuint obj, GLenum pname, GLint *params) { _glsGetObjectParameterivARB(obj, pname, params); }
 static void    APIENTRY _stub_glGetInfoLogARB(GLuint obj, GLsizei maxLength, GLsizei *length, GLchar *infoLog) { _glsGetInfoLogARB(obj, maxLength, length, infoLog); }
@@ -582,6 +629,24 @@ static const GLD_modernProcEntry g_modernGL[] = {
     { "glDrawRangeElementsEXT",     (PROC)_stub_glDrawRangeElements },
     { "glBlendEquationEXT",         (PROC)_stub_glBlendEquation },
     { "glActiveStencilFaceEXT",     (PROC)_stub_glActiveStencilFaceEXT },
+
+    /* Entry points whose arity _glsGuessArgCount gets wrong — see the note
+     * above the stubs.  Without these the typed-no-op fallback corrupts the
+     * x86 __stdcall stack and crashes id Tech 4 titles. */
+    { "glLockArraysEXT",            (PROC)_stub_glLockArraysEXT },
+    { "glUnlockArraysEXT",          (PROC)_stub_glUnlockArraysEXT },
+    { "glProgramEnvParameter4fARB", (PROC)_stub_glProgramEnvParameter4fARB },
+    { "glProgramLocalParameter4fARB",(PROC)_stub_glProgramLocalParameter4fARB },
+    { "glProgramEnvParameter4dARB", (PROC)_stub_glProgramEnvParameter4dARB },
+    { "glProgramLocalParameter4dARB",(PROC)_stub_glProgramLocalParameter4dARB },
+    { "glBeginQueryARB",            (PROC)_stub_glBeginQueryARB },
+    { "glEndQueryARB",              (PROC)_stub_glEndQueryARB },
+    { "glMultiDrawElementsEXT",     (PROC)_stub_glMultiDrawElementsEXT },
+    { "glFogCoordfEXT",             (PROC)_stub_glFogCoordfEXT },
+    { "glFogCoordPointerEXT",       (PROC)_stub_glFogCoordPointerEXT },
+    { "glSecondaryColor3fvEXT",     (PROC)_stub_glSecondaryColor3fvEXT },
+    { "glPointParameterfEXT",       (PROC)_stub_glPointParameterfEXT },
+    { "glPointParameterfvEXT",      (PROC)_stub_glPointParameterfvEXT },
     /* EXT_framebuffer_object / EXT_framebuffer_blit aliases */
     { "glBindFramebufferEXT",       (PROC)_stub_glBindFramebuffer },
     { "glBindRenderbufferEXT",      (PROC)_stub_glBindRenderbuffer },

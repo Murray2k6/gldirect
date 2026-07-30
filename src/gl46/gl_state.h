@@ -146,6 +146,22 @@ typedef struct {
     BOOL                set;
 } GLS_AttribBinding;
 
+/* ===== Resolved uniform =====
+ *
+ * One GL uniform name and the D3D9 constant registers it landed on.  The
+ * vertex and pixel shaders are compiled separately and the HLSL compiler
+ * allocates registers independently, so the same name usually sits at a
+ * different register in each — hence both are tracked, with -1 meaning the
+ * uniform is not present in that shader.
+ */
+typedef struct {
+    char                name[64];
+    int                 vsRegister;
+    int                 psRegister;
+    int                 registerCount;
+    int                 registerSet;    /* GLSL_RS_* */
+} GLS_ResolvedUniform;
+
 /* ===== Program ===== */
 typedef struct {
     GLuint_t            id;
@@ -158,6 +174,13 @@ typedef struct {
     int                 uniformCount;
     GLS_AttribBinding   attribBindings[GLS_MAX_ATTRIB_BINDINGS];
     int                 attribBindingCount;
+
+    /* Compiled D3D9 shader objects and their uniform register mapping */
+    IDirect3DVertexShader9 *pVS;
+    IDirect3DPixelShader9  *pPS;
+    GLS_ResolvedUniform resolved[GLS_MAX_UNIFORMS];
+    int                 resolvedCount;
+    char                infoLog[512];
 } GLS_Program;
 
 /* ===== Sampler ===== */
@@ -224,6 +247,21 @@ typedef struct {
     float               texcoord[GLS_MAX_TEX_UNITS][4];
 } GLS_ImmVertex;
 
+/* ===== Legacy client-side vertex array (GL 1.1) =====
+ *
+ * glVertexPointer and friends.  Distinct from the generic attribs on a VAO:
+ * these have no VAO, and `pointer` is either a raw CPU address or, if
+ * bufferBinding is non-zero, an offset into that buffer object.
+ */
+typedef struct {
+    GLint_t             size;           /* components: 1-4 */
+    GLenum_t            type;           /* GL_FLOAT, GL_UNSIGNED_BYTE, ... */
+    GLsizei_t           stride;         /* 0 means tightly packed */
+    const void          *pointer;
+    GLuint_t            bufferBinding;  /* VBO bound when this was set, 0 = client memory */
+    BOOL                enabled;        /* glEnableClientState */
+} GLS_ClientArray;
+
 /* ===== Main GL state ===== */
 typedef struct {
     /* Object pools */
@@ -260,6 +298,17 @@ typedef struct {
     GLuint_t            boundRBO;
     GLuint_t            boundProgram;
     GLenum_t            activeTexUnit;  /* GL_TEXTURE0 + n */
+
+    /* Which GL texture unit each D3D9 sampler stage should read.
+     * Set by glUniform1i on a sampler uniform; identity until then. */
+    int                 samplerStageUnit[GLS_MAX_TEX_UNITS];
+
+    /* Legacy client-side vertex arrays (GL 1.1) */
+    GLS_ClientArray     clientVertexArray;
+    GLS_ClientArray     clientNormalArray;
+    GLS_ClientArray     clientColorArray;
+    GLS_ClientArray     clientTexCoordArray[GLS_MAX_TEX_UNITS];
+    GLenum_t            clientActiveTexUnit; /* GL_TEXTURE0 + n, for glTexCoordPointer */
 
     /* Render state */
     float               clearColor[4];

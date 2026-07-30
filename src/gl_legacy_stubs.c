@@ -337,11 +337,11 @@ void APIENTRY glInterleavedArrays(GLenum format, GLsizei stride, const GLvoid *p
 void APIENTRY glPolygonOffsetEXT(GLfloat factor, GLfloat bias) { _glsPolygonOffset(factor, bias); }
 void APIENTRY glBlendEquationEXT(GLenum mode) { _glsBlendEquation(mode); }
 void APIENTRY glBlendColorEXT(GLfloat r, GLfloat g, GLfloat b, GLfloat a) { _glsBlendColor(r, g, b, a); }
-void APIENTRY glVertexPointerEXT(GLint size, GLenum type, GLsizei stride, GLsizei count, const GLvoid *ptr) { (void)size; (void)type; (void)stride; (void)count; (void)ptr; }
-void APIENTRY glNormalPointerEXT(GLenum type, GLsizei stride, GLsizei count, const GLvoid *ptr) { (void)type; (void)stride; (void)count; (void)ptr; }
-void APIENTRY glColorPointerEXT(GLint size, GLenum type, GLsizei stride, GLsizei count, const GLvoid *ptr) { (void)size; (void)type; (void)stride; (void)count; (void)ptr; }
+void APIENTRY glVertexPointerEXT(GLint size, GLenum type, GLsizei stride, GLsizei count, const GLvoid *ptr) { (void)count; _glsVertexPointer(size, type, stride, ptr); }
+void APIENTRY glNormalPointerEXT(GLenum type, GLsizei stride, GLsizei count, const GLvoid *ptr) { (void)count; _glsNormalPointer(type, stride, ptr); }
+void APIENTRY glColorPointerEXT(GLint size, GLenum type, GLsizei stride, GLsizei count, const GLvoid *ptr) { (void)count; _glsColorPointer(size, type, stride, ptr); }
 void APIENTRY glIndexPointerEXT(GLenum type, GLsizei stride, GLsizei count, const GLvoid *ptr) { (void)type; (void)stride; (void)count; (void)ptr; }
-void APIENTRY glTexCoordPointerEXT(GLint size, GLenum type, GLsizei stride, GLsizei count, const GLvoid *ptr) { (void)size; (void)type; (void)stride; (void)count; (void)ptr; }
+void APIENTRY glTexCoordPointerEXT(GLint size, GLenum type, GLsizei stride, GLsizei count, const GLvoid *ptr) { (void)count; _glsTexCoordPointer(size, type, stride, ptr); }
 void APIENTRY glEdgeFlagPointerEXT(GLsizei stride, GLsizei count, const GLboolean *ptr) { (void)stride; (void)count; (void)ptr; }
 void APIENTRY glGetPointervEXT(GLenum pname, GLvoid **params) { (void)pname; if(params) *params = NULL; }
 void APIENTRY glArrayElementEXT(GLint i) { (void)i; }
@@ -467,7 +467,7 @@ void APIENTRY glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) { _glsCle
 void APIENTRY glClearDepth(GLdouble depth) { _glsClearDepth(depth); }
 void APIENTRY glClearStencil(GLint s) { _glsClearStencil(s); }
 void APIENTRY glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) { _glsColorMask(r, g, b, a); }
-void APIENTRY glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer) { (void)size; (void)type; (void)stride; (void)pointer; }
+void APIENTRY glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer) { _glsColorPointer(size, type, stride, pointer); }
 void APIENTRY glCopyTexImage1D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLint border) { (void)target; (void)level; (void)internalformat; (void)x; (void)y; (void)width; (void)border; }
 void APIENTRY glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border) { (void)target; (void)level; (void)internalformat; (void)x; (void)y; (void)width; (void)height; (void)border; }
 void APIENTRY glCopyTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width) { (void)target; (void)level; (void)xoffset; (void)x; (void)y; (void)width; }
@@ -478,13 +478,13 @@ void APIENTRY glDepthFunc(GLenum func) { _glsDepthFunc(func); }
 void APIENTRY glDepthMask(GLboolean flag) { _glsDepthMask(flag); }
 void APIENTRY glDepthRange(GLdouble nearVal, GLdouble farVal) { _glsDepthRange(nearVal, farVal); }
 void APIENTRY glDisable(GLenum cap) { _glsDisable(cap); }
-void APIENTRY glDisableClientState(GLenum array) { (void)array; }
+void APIENTRY glDisableClientState(GLenum array) { _glsDisableClientState(array); }
 void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) { _glsDrawArrays(mode, first, count); }
 void APIENTRY glDrawBuffer(GLenum mode) { _glsDrawBuffer(mode); }
 void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices) { _glsDrawElements(mode, count, type, indices); }
 void APIENTRY glEdgeFlagPointer(GLsizei stride, const GLvoid *pointer) { (void)stride; (void)pointer; }
 void APIENTRY glEnable(GLenum cap) { _glsEnable(cap); }
-void APIENTRY glEnableClientState(GLenum array) { (void)array; }
+void APIENTRY glEnableClientState(GLenum array) { _glsEnableClientState(array); }
 void APIENTRY glFinish(void) { }
 void APIENTRY glFlush(void) { }
 void APIENTRY glFrontFace(GLenum mode) { _glsFrontFace(mode); }
@@ -521,7 +521,7 @@ GLboolean APIENTRY glIsEnabled(GLenum cap) { return _glsIsEnabled(cap); }
 GLboolean APIENTRY glIsTexture(GLuint texture) { return GL_FALSE; }
 void APIENTRY glLineWidth(GLfloat width) { _glsLineWidth(width); }
 void APIENTRY glLogicOp(GLenum opcode) { _glsLogicOp(opcode); }
-void APIENTRY glNormalPointer(GLenum type, GLsizei stride, const GLvoid *pointer) { (void)type; (void)stride; (void)pointer; }
+void APIENTRY glNormalPointer(GLenum type, GLsizei stride, const GLvoid *pointer) { _glsNormalPointer(type, stride, pointer); }
 void APIENTRY glPixelStoref(GLenum pname, GLfloat param) { _glsPixelStorei(pname, (int)param); }
 void APIENTRY glPixelStorei(GLenum pname, GLint param) { _glsPixelStorei(pname, param); }
 void APIENTRY glPointSize(GLfloat size) { _glsPointSize(size); }
@@ -534,7 +534,7 @@ void APIENTRY glScissor(GLint x, GLint y, GLsizei width, GLsizei height) { _glsS
 void APIENTRY glStencilFunc(GLenum func, GLint ref, GLuint mask) { _glsStencilFunc(func, ref, mask); }
 void APIENTRY glStencilMask(GLuint mask) { _glsStencilMaskSeparate(0x0408, mask); }
 void APIENTRY glStencilOp(GLenum fail, GLenum zfail, GLenum zpass) { _glsStencilOp(fail, zfail, zpass); }
-void APIENTRY glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer) { (void)size; (void)type; (void)stride; (void)pointer; }
+void APIENTRY glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer) { _glsTexCoordPointer(size, type, stride, pointer); }
 void APIENTRY glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border, GLenum format, GLenum type, const GLvoid *pixels) { (void)target; (void)level; (void)internalformat; (void)width; (void)border; (void)format; (void)type; (void)pixels; }
 void APIENTRY glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels) { _glsTexImage2D(target, level, internalformat, width, height, border, format, type, pixels); }
 void APIENTRY glTexParameterf(GLenum target, GLenum pname, GLfloat param) { _glsTexParameterf(target, pname, param); }
@@ -543,5 +543,5 @@ void APIENTRY glTexParameterfv(GLenum target, GLenum pname, const GLfloat *param
 void APIENTRY glTexParameteriv(GLenum target, GLenum pname, const GLint *params) { if(params) _glsTexParameteri(target, pname, params[0]); }
 void APIENTRY glTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const GLvoid *pixels) { (void)target; (void)level; (void)xoffset; (void)width; (void)format; (void)type; (void)pixels; }
 void APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels) { _glsTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels); }
-void APIENTRY glVertexPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer) { (void)size; (void)type; (void)stride; (void)pointer; }
+void APIENTRY glVertexPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer) { _glsVertexPointer(size, type, stride, pointer); }
 void APIENTRY glViewport(GLint x, GLint y, GLsizei width, GLsizei height) { _glsViewport(x, y, width, height); }

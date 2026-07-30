@@ -19,6 +19,7 @@
 
 #include "gl_impl.h"
 #include "gl_state.h"
+#include "glsl_to_hlsl.h"
 #include "context_manager.h"
 #include "gld_diag.h"
 #include "gld_context.h"
@@ -211,6 +212,32 @@
 #endif
 #ifndef GL_FLOAT
 #define GL_FLOAT                0x1406
+#endif
+#ifndef GL_BYTE
+#define GL_BYTE                 0x1400
+#endif
+#ifndef GL_SHORT
+#define GL_SHORT                0x1402
+#endif
+#ifndef GL_INT
+#define GL_INT                  0x1404
+#endif
+#ifndef GL_DOUBLE
+#define GL_DOUBLE               0x140A
+#endif
+
+/* Legacy client-array capability selectors (glEnableClientState) */
+#ifndef GL_VERTEX_ARRAY
+#define GL_VERTEX_ARRAY         0x8074
+#endif
+#ifndef GL_NORMAL_ARRAY
+#define GL_NORMAL_ARRAY         0x8075
+#endif
+#ifndef GL_COLOR_ARRAY
+#define GL_COLOR_ARRAY          0x8076
+#endif
+#ifndef GL_TEXTURE_COORD_ARRAY
+#define GL_TEXTURE_COORD_ARRAY  0x8078
 #endif
 
 /* GL filter/wrap constants */
@@ -555,13 +582,480 @@ static D3DTEXTUREADDRESS _glsMapWrapMode(unsigned int glWrap)
     }
 }
 
-static void _glsTransposeMatrix(D3DMATRIX *dst, const float *src)
+/*
+ * Convert a GL matrix to a D3D9 matrix.
+ *
+ * This is a straight copy, not an element-wise transpose.  The two APIs
+ * differ in *both* storage order and vector convention, and the two
+ * differences cancel: GL stores column-major and multiplies M*v with column
+ * vectors, D3D9 stores row-major and multiplies v*M with row vectors, so the
+ * same transform has an identical byte layout in both.
+ *
+ * Transposing element-wise here — as this function previously did — moves
+ * the translation out of the last row into the last column, which silently
+ * discards all translation: glTranslatef(10,20,30) applied to the origin
+ * came out as (0,0,0), so nothing could be positioned correctly.
+ */
+static void _glsGLMatrixToD3D(D3DMATRIX *dst, const float *src)
 {
-    /* GL is column-major, D3D9 is row-major — transpose */
-    dst->_11 = src[0];  dst->_12 = src[4];  dst->_13 = src[8];  dst->_14 = src[12];
-    dst->_21 = src[1];  dst->_22 = src[5];  dst->_23 = src[9];  dst->_24 = src[13];
-    dst->_31 = src[2];  dst->_32 = src[6];  dst->_33 = src[10]; dst->_34 = src[14];
-    dst->_41 = src[3];  dst->_42 = src[7];  dst->_43 = src[11]; dst->_44 = src[15];
+    memcpy(dst, src, 16 * sizeof(float));
+}
+
+/*
+ * Build the D3D9 projection matrix from GL's projection matrix.
+ *
+ * Two conventions differ between the APIs and both must be corrected here,
+ * or geometry is silently destroyed before it ever reaches the rasteriser:
+ *
+ * 1. Clip-space depth.  GL projects z into NDC [-1,+1]; D3D9 clips against
+ *    0 <= z <= w.  Handing a GL matrix straight to D3D9 therefore throws
+ *    away the entire near half of every frustum.  D3D9 uses row vectors
+ *    (clip = v * M), so the z output is column 3 and w is column 4, and the
+ *    remap z' = (z + w) / 2 is applied by folding column 4 into column 3.
+ *
+ * 2. Pixel centre.  GL samples pixel centres at (i+0.5, j+0.5); D3D9's
+ *    rasteriser effectively samples at integer coordinates, which shows up
+ *    as a half-pixel smear on all texturing and a visible offset on 2D/UI.
+ *    Correcting by a half pixel means shifting NDC x by -1/width and y by
+ *    +1/height.  That shift has to scale with w to survive the perspective
+ *    divide, so it is applied as column_x -= column_w/width rather than as
+ *    a constant added to the translation row (which would only be correct
+ *    for orthographic projections).
+ */
+static void _glsBuildD3DProjection(D3DMATRIX *dst, const float *glProj,
+                                   int vpWidth, int vpHeight)
+{
+    _glsGLMatrixToD3D(dst, glProj);
+
+    /* 1. GL [-1,1] -> D3D [0,1] depth range */
+    dst->_13 = 0.5f * (dst->_13 + dst->_14);
+    dst->_23 = 0.5f * (dst->_23 + dst->_24);
+    dst->_33 = 0.5f * (dst->_33 + dst->_34);
+    dst->_43 = 0.5f * (dst->_43 + dst->_44);
+
+    /* 2. Half-pixel raster offset */
+    if (vpWidth > 0 && vpHeight > 0) {
+        float dx = 1.0f / (float)vpWidth;
+        float dy = 1.0f / (float)vpHeight;
+
+        dst->_11 -= dst->_14 * dx;
+        dst->_21 -= dst->_24 * dx;
+        dst->_31 -= dst->_34 * dx;
+        dst->_41 -= dst->_44 * dx;
+
+        dst->_12 += dst->_14 * dy;
+        dst->_22 += dst->_24 * dy;
+        dst->_32 += dst->_34 * dy;
+        dst->_42 += dst->_44 * dy;
+    }
+}
+
+/*
+ * Push the current GL modelview/projection onto the D3D9 device.
+ *
+ * GL keeps a single combined modelview matrix, so it goes to D3DTS_WORLD and
+ * D3DTS_VIEW is held at identity.  Shared by the immediate-mode, DrawArrays
+ * and DrawElements paths so the clip-space correction cannot be applied in
+ * one and forgotten in another.
+ *
+ * Returns FALSE if the transforms could not be set and the draw should be
+ * abandoned.
+ */
+static BOOL _glsApplyTransforms(IDirect3DDevice9 *pDev, GLS_State *s)
+{
+    D3DMATRIX d3dWorld, d3dView, d3dProj;
+
+    _glsGLMatrixToD3D(&d3dWorld, s->modelviewStack.stack[s->modelviewStack.top].m);
+    _glsBuildD3DProjection(&d3dProj, s->projectionStack.stack[s->projectionStack.top].m,
+                           s->viewportW, s->viewportH);
+
+    memset(&d3dView, 0, sizeof(d3dView));
+    d3dView._11 = d3dView._22 = d3dView._33 = d3dView._44 = 1.0f;
+
+    __try {
+        IDirect3DDevice9_SetTransform(pDev, D3DTS_WORLD, &d3dWorld);
+        IDirect3DDevice9_SetTransform(pDev, D3DTS_VIEW, &d3dView);
+        IDirect3DDevice9_SetTransform(pDev, D3DTS_PROJECTION, &d3dProj);
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_LIGHTING,
+                                        s->enableLighting ? TRUE : FALSE);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+/* ===================================================================
+ *  SECTION 0b: Vertex array assembly
+ *
+ *  Shared by the DrawArrays and DrawElements paths.  Reads whatever the
+ *  application supplied — generic vertex attributes on a VAO (GL 2.0+) or
+ *  legacy client-side arrays (GL 1.1) — and assembles the single fat
+ *  GLS_D3DVertex format the fixed-function submission path uses.
+ * =================================================================== */
+
+/*
+ * Resolve an array's base address.
+ *
+ * GL overloads `pointer`: if a buffer object was bound when the pointer was
+ * set it is a byte offset into that buffer, otherwise it is a raw client
+ * memory address.  Returns NULL when the source is unusable.
+ */
+static const unsigned char *_glsResolveArrayBase(GLuint_t bufferBinding, const void *pointer)
+{
+    if (bufferBinding) {
+        GLS_Buffer *buf = glsFindBuffer(bufferBinding);
+        if (!buf || !buf->data) return NULL;
+        return (const unsigned char *)buf->data + (ptrdiff_t)pointer;
+    }
+    return (const unsigned char *)pointer;
+}
+
+/* Bytes occupied by one component of a GL array type. */
+static int _glsTypeSize(unsigned int type)
+{
+    switch (type) {
+    case GL_BYTE:  case GL_UNSIGNED_BYTE:  return 1;
+    case GL_SHORT: case GL_UNSIGNED_SHORT: return 2;
+    case GL_INT:   case GL_UNSIGNED_INT:
+    case GL_FLOAT:                         return 4;
+    case GL_DOUBLE:                        return 8;
+    default:                               return 4;
+    }
+}
+
+/*
+ * Read one element of a typed GL vertex array into out[4].
+ *
+ * `normalized` follows GL's rule: integer components are scaled to [0,1]
+ * when unsigned and [-1,1] when signed; floats are always passed through.
+ * Components the array does not supply keep the caller's defaults, which is
+ * what makes a 2-component glTexCoordPointer or 3-component colour work.
+ */
+static void _glsReadArrayElement(const unsigned char *base, int stride, int index,
+                                 int size, unsigned int type, BOOL normalized,
+                                 float *out)
+{
+    const unsigned char *p;
+    int i;
+
+    if (!base || size <= 0) return;
+    if (stride <= 0) stride = size * _glsTypeSize(type);
+    if (size > 4) size = 4;
+    p = base + (ptrdiff_t)index * stride;
+
+    for (i = 0; i < size; i++) {
+        switch (type) {
+        case GL_FLOAT:
+            out[i] = ((const float *)p)[i];
+            break;
+        case GL_DOUBLE:
+            out[i] = (float)((const double *)p)[i];
+            break;
+        case GL_BYTE: {
+            signed char v = ((const signed char *)p)[i];
+            out[i] = normalized ? (float)v / 127.0f : (float)v;
+            break;
+        }
+        case GL_UNSIGNED_BYTE: {
+            unsigned char v = p[i];
+            out[i] = normalized ? (float)v / 255.0f : (float)v;
+            break;
+        }
+        case GL_SHORT: {
+            short v = ((const short *)p)[i];
+            out[i] = normalized ? (float)v / 32767.0f : (float)v;
+            break;
+        }
+        case GL_UNSIGNED_SHORT: {
+            unsigned short v = ((const unsigned short *)p)[i];
+            out[i] = normalized ? (float)v / 65535.0f : (float)v;
+            break;
+        }
+        case GL_INT: {
+            int v = ((const int *)p)[i];
+            out[i] = normalized ? (float)v / 2147483647.0f : (float)v;
+            break;
+        }
+        case GL_UNSIGNED_INT: {
+            unsigned int v = ((const unsigned int *)p)[i];
+            out[i] = normalized ? (float)v / 4294967295.0f : (float)v;
+            break;
+        }
+        default:
+            break;
+        }
+    }
+}
+
+/* Pack a float colour into D3DCOLOR, clamping first.  GL allows colours
+ * outside [0,1]; D3DCOLOR_COLORVALUE truncates to DWORD without clamping,
+ * so an out-of-range channel would wrap and invert the colour. */
+static DWORD _glsPackColor(const float *c)
+{
+    float r = c[0] < 0.0f ? 0.0f : (c[0] > 1.0f ? 1.0f : c[0]);
+    float g = c[1] < 0.0f ? 0.0f : (c[1] > 1.0f ? 1.0f : c[1]);
+    float b = c[2] < 0.0f ? 0.0f : (c[2] > 1.0f ? 1.0f : c[2]);
+    float a = c[3] < 0.0f ? 0.0f : (c[3] > 1.0f ? 1.0f : c[3]);
+
+    return D3DCOLOR_ARGB((DWORD)(a * 255.0f + 0.5f),
+                         (DWORD)(r * 255.0f + 0.5f),
+                         (DWORD)(g * 255.0f + 0.5f),
+                         (DWORD)(b * 255.0f + 0.5f));
+}
+
+/* Where one vertex semantic is read from, reduced from either a generic
+ * vertex attrib or a legacy client array. */
+typedef struct {
+    const unsigned char *base;
+    int          stride;
+    int          size;
+    unsigned int type;
+    BOOL         normalized;
+    BOOL         present;
+} GLS_AttribSource;
+
+typedef struct {
+    GLS_AttribSource pos, normal, color, tex0, tex1;
+} GLS_VertexSources;
+
+static void _glsSourceFromAttrib(GLS_AttribSource *src, const GLS_VertexAttrib *a)
+{
+    src->present = FALSE;
+    if (!a || !a->enabled) return;
+    src->base = _glsResolveArrayBase(a->bufferBinding, a->pointer);
+    if (!src->base) return;
+    src->stride     = a->stride;
+    src->size       = a->size;
+    src->type       = a->type;
+    src->normalized = a->normalized ? TRUE : FALSE;
+    src->present    = TRUE;
+}
+
+static void _glsSourceFromClientArray(GLS_AttribSource *src, const GLS_ClientArray *c,
+                                      BOOL normalized)
+{
+    src->present = FALSE;
+    if (!c || !c->enabled) return;
+    src->base = _glsResolveArrayBase(c->bufferBinding, c->pointer);
+    if (!src->base) return;
+    src->stride     = c->stride;
+    src->size       = c->size;
+    src->type       = c->type;
+    src->normalized = normalized;
+    src->present    = TRUE;
+}
+
+/*
+ * Work out where each vertex semantic comes from for this draw.
+ *
+ * Generic attributes on the bound VAO win, using the classic fixed-function
+ * aliasing (0 = position, 2 = normal, 3 = colour, 8/9 = texcoord 0/1).
+ * Anything the VAO does not supply falls back to the GL 1.1 client arrays,
+ * so both eras draw through one path.
+ */
+static void _glsResolveVertexSources(GLS_State *s, GLS_VertexSources *out)
+{
+    GLS_VAO *vao = glsFindVAO(s->boundVAO);
+
+    memset(out, 0, sizeof(*out));
+
+    if (vao) {
+        _glsSourceFromAttrib(&out->pos,    &vao->attribs[0]);
+        _glsSourceFromAttrib(&out->normal, &vao->attribs[2]);
+        _glsSourceFromAttrib(&out->color,  &vao->attribs[3]);
+        _glsSourceFromAttrib(&out->tex0,   &vao->attribs[8]);
+        _glsSourceFromAttrib(&out->tex1,   &vao->attribs[9]);
+    }
+
+    /* Integer colours and normals are normalised by definition in the legacy
+     * entry points: glColorPointer(GL_UNSIGNED_BYTE) means 0..255 -> 0..1. */
+    if (!out->pos.present)
+        _glsSourceFromClientArray(&out->pos,    &s->clientVertexArray,      FALSE);
+    if (!out->normal.present)
+        _glsSourceFromClientArray(&out->normal, &s->clientNormalArray,      TRUE);
+    if (!out->color.present)
+        _glsSourceFromClientArray(&out->color,  &s->clientColorArray,       TRUE);
+    if (!out->tex0.present)
+        _glsSourceFromClientArray(&out->tex0,   &s->clientTexCoordArray[0], FALSE);
+    if (!out->tex1.present)
+        _glsSourceFromClientArray(&out->tex1,   &s->clientTexCoordArray[1], FALSE);
+}
+
+/* Assemble one output vertex from the resolved sources. */
+static void _glsBuildVertex(GLS_State *s, const GLS_VertexSources *src,
+                            int index, GLS_D3DVertex *out)
+{
+    float pos[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    float nrm[4] = { 0.0f, 0.0f, 1.0f, 0.0f };
+    float t0[4]  = { 0.0f, 0.0f, 0.0f, 1.0f };
+    float t1[4]  = { 0.0f, 0.0f, 0.0f, 1.0f };
+    float col[4];
+
+    /* Absent colour array means the vertex takes glColor's current value. */
+    col[0] = s->currentColor[0];
+    col[1] = s->currentColor[1];
+    col[2] = s->currentColor[2];
+    col[3] = s->currentColor[3];
+
+    if (src->pos.present)
+        _glsReadArrayElement(src->pos.base, src->pos.stride, index,
+                             src->pos.size, src->pos.type, src->pos.normalized, pos);
+    if (src->normal.present)
+        _glsReadArrayElement(src->normal.base, src->normal.stride, index,
+                             src->normal.size, src->normal.type, src->normal.normalized, nrm);
+    if (src->color.present)
+        _glsReadArrayElement(src->color.base, src->color.stride, index,
+                             src->color.size, src->color.type, src->color.normalized, col);
+    if (src->tex0.present)
+        _glsReadArrayElement(src->tex0.base, src->tex0.stride, index,
+                             src->tex0.size, src->tex0.type, src->tex0.normalized, t0);
+    if (src->tex1.present)
+        _glsReadArrayElement(src->tex1.base, src->tex1.stride, index,
+                             src->tex1.size, src->tex1.type, src->tex1.normalized, t1);
+
+    out->x  = pos[0]; out->y  = pos[1]; out->z  = pos[2];
+    out->nx = nrm[0]; out->ny = nrm[1]; out->nz = nrm[2];
+    out->color = _glsPackColor(col);
+    out->u0 = t0[0]; out->v0 = t0[1];
+    out->u1 = t1[0]; out->v1 = t1[1];
+}
+
+/*
+ * Number of indices needed to express `count` vertices of `mode` as a D3D9
+ * primitive.  Returns 0 for modes that cannot be drawn.
+ */
+static int _glsExpandedIndexCount(unsigned int mode, int count)
+{
+    switch (mode) {
+    case 0x0000: return count;                  /* GL_POINTS */
+    case 0x0001: return (count / 2) * 2;        /* GL_LINES */
+    case 0x0002: return count >= 2 ? count + 1 : 0; /* GL_LINE_LOOP -> closed strip */
+    case 0x0003: return count >= 2 ? count : 0; /* GL_LINE_STRIP */
+    case 0x0004: return (count / 3) * 3;        /* GL_TRIANGLES */
+    case 0x0005:                                /* GL_TRIANGLE_STRIP */
+    case 0x0006: return count >= 3 ? count : 0; /* GL_TRIANGLE_FAN */
+    case 0x0007: return (count / 4) * 6;        /* GL_QUADS -> 2 tris each */
+    case 0x0008: return count >= 4 ? (count / 2) * 2 : 0; /* GL_QUAD_STRIP */
+    case 0x0009: return count >= 3 ? count : 0; /* GL_POLYGON -> fan */
+    default:     return 0;
+    }
+}
+
+/*
+ * Expand a GL primitive mode into a D3D9 primitive type plus an index list
+ * over the assembled vertices.
+ *
+ * D3D9 has no GL_QUADS, GL_POLYGON or GL_LINE_LOOP, so those are tessellated
+ * here.  GL_QUAD_STRIP needs no work: its vertex order already matches a
+ * D3D triangle strip.  Modes that map one-to-one still generate an identity
+ * index list so every draw can use a single indexed submission path.
+ *
+ * `out` must hold _glsExpandedIndexCount(mode, count) entries.  Returns the
+ * primitive count, or 0 if the mode cannot be drawn.
+ */
+static int _glsExpandPrimitive(unsigned int mode, int count,
+                               D3DPRIMITIVETYPE *outType, unsigned int *out)
+{
+    int i, n = 0;
+
+    switch (mode) {
+    case 0x0000: /* GL_POINTS */
+        *outType = D3DPT_POINTLIST;
+        for (i = 0; i < count; i++) out[n++] = i;
+        return count;
+
+    case 0x0001: /* GL_LINES */
+        *outType = D3DPT_LINELIST;
+        for (i = 0; i + 1 < count; i += 2) { out[n++] = i; out[n++] = i + 1; }
+        return count / 2;
+
+    case 0x0002: /* GL_LINE_LOOP — D3D has no loop, close the strip manually */
+        if (count < 2) return 0;
+        *outType = D3DPT_LINESTRIP;
+        for (i = 0; i < count; i++) out[n++] = i;
+        out[n++] = 0;
+        return count;
+
+    case 0x0003: /* GL_LINE_STRIP */
+        if (count < 2) return 0;
+        *outType = D3DPT_LINESTRIP;
+        for (i = 0; i < count; i++) out[n++] = i;
+        return count - 1;
+
+    case 0x0004: /* GL_TRIANGLES */
+        *outType = D3DPT_TRIANGLELIST;
+        for (i = 0; i + 2 < count; i += 3) { out[n++] = i; out[n++] = i + 1; out[n++] = i + 2; }
+        return count / 3;
+
+    case 0x0005: /* GL_TRIANGLE_STRIP */
+        if (count < 3) return 0;
+        *outType = D3DPT_TRIANGLESTRIP;
+        for (i = 0; i < count; i++) out[n++] = i;
+        return count - 2;
+
+    case 0x0006: /* GL_TRIANGLE_FAN */
+        if (count < 3) return 0;
+        *outType = D3DPT_TRIANGLEFAN;
+        for (i = 0; i < count; i++) out[n++] = i;
+        return count - 2;
+
+    case 0x0007: /* GL_QUADS — split each quad into triangles 0-1-2 and 0-2-3 */
+        *outType = D3DPT_TRIANGLELIST;
+        for (i = 0; i + 3 < count; i += 4) {
+            out[n++] = i;     out[n++] = i + 1; out[n++] = i + 2;
+            out[n++] = i;     out[n++] = i + 2; out[n++] = i + 3;
+        }
+        return (count / 4) * 2;
+
+    case 0x0008: /* GL_QUAD_STRIP — same winding as a D3D triangle strip */
+        if (count < 4) return 0;
+        *outType = D3DPT_TRIANGLESTRIP;
+        count = (count / 2) * 2;  /* trailing odd vertex cannot form a quad */
+        for (i = 0; i < count; i++) out[n++] = i;
+        return count - 2;
+
+    case 0x0009: /* GL_POLYGON — convex by GL's definition, so a fan is exact */
+        if (count < 3) return 0;
+        *outType = D3DPT_TRIANGLEFAN;
+        for (i = 0; i < count; i++) out[n++] = i;
+        return count - 2;
+
+    default:
+        return 0;
+    }
+}
+
+/*
+ * Submit assembled vertices as one indexed D3D9 draw.
+ *
+ * 16-bit indices are used when the vertex count allows, since D3DFMT_INDEX32
+ * is an optional capability that some drivers refuse.
+ */
+static void _glsSubmitIndexed(IDirect3DDevice9 *pDev, D3DPRIMITIVETYPE primType,
+                              int primCount, const GLS_D3DVertex *verts, int vertCount,
+                              const unsigned int *indices, int indexCount)
+{
+    if (primCount <= 0 || vertCount <= 0 || indexCount <= 0) return;
+
+    __try {
+        IDirect3DDevice9_SetFVF(pDev, GLS_D3DFVF);
+
+        if (vertCount <= 65536) {
+            unsigned short *idx16 = (unsigned short *)malloc(indexCount * sizeof(unsigned short));
+            int i;
+            if (!idx16) return;
+            for (i = 0; i < indexCount; i++) idx16[i] = (unsigned short)indices[i];
+            IDirect3DDevice9_DrawIndexedPrimitiveUP(pDev, primType, 0, vertCount,
+                                                    primCount, idx16, D3DFMT_INDEX16,
+                                                    verts, sizeof(GLS_D3DVertex));
+            free(idx16);
+        } else {
+            IDirect3DDevice9_DrawIndexedPrimitiveUP(pDev, primType, 0, vertCount,
+                                                    primCount, indices, D3DFMT_INDEX32,
+                                                    verts, sizeof(GLS_D3DVertex));
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) { }
 }
 
 /* ===================================================================
@@ -910,78 +1404,230 @@ void _glsDeleteSamplers(int count, const unsigned int *samplers)
  *  SECTION 2: Texture Functions
  * =================================================================== */
 
-void _glsTexImage2D(unsigned int target, int level, int internalformat,
-                     int width, int height, int border,
-                     unsigned int format, unsigned int type, const void *pixels)
+/* Cube map face targets are consecutive from GL_TEXTURE_CUBE_MAP_POSITIVE_X
+ * and appear in the same order as D3DCUBEMAP_FACES, so the face index is a
+ * plain subtraction.  Returns -1 for non-cube targets. */
+#ifndef GL_TEXTURE_CUBE_MAP_POSITIVE_X
+#define GL_TEXTURE_CUBE_MAP_POSITIVE_X  0x8515
+#endif
+#ifndef GL_TEXTURE_CUBE_MAP_NEGATIVE_Z
+#define GL_TEXTURE_CUBE_MAP_NEGATIVE_Z  0x851A
+#endif
+
+static int _glsCubeFaceFromTarget(unsigned int target)
+{
+    if (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X &&
+        target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)
+        return (int)(target - GL_TEXTURE_CUBE_MAP_POSITIVE_X);
+    return -1;
+}
+
+/* Number of mip levels in a full chain down to 1x1. */
+static int _glsMipLevelCount(int width, int height)
+{
+    int levels = 1;
+    while (width > 1 || height > 1) {
+        if (width  > 1) width  >>= 1;
+        if (height > 1) height >>= 1;
+        levels++;
+    }
+    return levels;
+}
+
+/* Look up the texture object bound to the active unit for `target`. */
+static GLS_Texture *_glsBoundTextureForTarget(unsigned int target, int *outUnit)
 {
     GLS_State *s = glsGetState();
-    IDirect3DDevice9 *pDev = gldGetD3DDevice46();
-    int unit = (s->activeTexUnit >= GL_TEXTURE0) ? (s->activeTexUnit - GL_TEXTURE0) : 0;
+    int unit = (s->activeTexUnit >= GL_TEXTURE0) ? (int)(s->activeTexUnit - GL_TEXTURE0) : 0;
     unsigned int texId;
-    GLS_Texture *tex;
-    D3DFORMAT d3dFmt;
-    HRESULT hr;
 
     if (unit < 0 || unit >= GLS_MAX_TEX_UNITS) unit = 0;
-    texId = s->boundTexture2D[unit];
-    tex = glsFindTexture(texId);
+    if (outUnit) *outUnit = unit;
 
-    (void)border; (void)target;
+    if (_glsCubeFaceFromTarget(target) >= 0 || target == GL_TEXTURE_CUBE_MAP)
+        texId = s->boundTextureCube[unit];
+    else
+        texId = s->boundTexture2D[unit];
 
-    if (!tex || level != 0) return;
+    return glsFindTexture(texId);
+}
 
-    tex->width = width;
-    tex->height = height;
-    tex->internalFormat = internalformat;
-
-    /* Release old texture if any */
-    if (tex->pTex) {
-        IDirect3DTexture9_Release(tex->pTex);
-        tex->pTex = NULL;
-    }
+/* Drop whatever D3D9 resources a texture object currently holds. */
+static void _glsReleaseTextureResources(GLS_Texture *tex)
+{
+    if (tex->pTex)     { IDirect3DTexture9_Release(tex->pTex);         tex->pTex = NULL; }
+    if (tex->pCubeTex) { IDirect3DCubeTexture9_Release(tex->pCubeTex); tex->pCubeTex = NULL; }
     if (tex->pixelData) { free(tex->pixelData); tex->pixelData = NULL; tex->pixelDataSize = 0; }
+}
 
-    if (!pDev || width <= 0 || height <= 0) return;
-
-    d3dFmt = _glsMapGLFormatToD3D(internalformat);
+/*
+ * Lock one mip level of a 2D or cube texture.
+ *
+ * `pRect` may be NULL to lock the whole level.  Returns FALSE if the level
+ * does not exist, which is the normal outcome when an application uploads
+ * more mip levels than the allocated chain holds.
+ */
+static BOOL _glsLockTexLevel(GLS_Texture *tex, unsigned int target, int level,
+                             const RECT *pRect, D3DLOCKED_RECT *out)
+{
+    int face = _glsCubeFaceFromTarget(target);
+    HRESULT hr = E_FAIL;
 
     __try {
-        hr = IDirect3DDevice9_CreateTexture(pDev, width, height, 1, 0, d3dFmt,
-                                             D3DPOOL_MANAGED, &tex->pTex, NULL);
+        if (face >= 0 && tex->pCubeTex)
+            hr = IDirect3DCubeTexture9_LockRect(tex->pCubeTex, (D3DCUBEMAP_FACES)face,
+                                                level, out, pRect, 0);
+        else if (tex->pTex)
+            hr = IDirect3DTexture9_LockRect(tex->pTex, level, out, pRect, 0);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         hr = E_FAIL;
     }
 
-    if (FAILED(hr) || !tex->pTex) {
-        gldDiagLog("GL: TexImage2D CreateTexture FAILED hr=0x%08X %dx%d fmt=%d", hr, width, height, d3dFmt);
-        tex->pTex = NULL;
+    return SUCCEEDED(hr);
+}
+
+static void _glsUnlockTexLevel(GLS_Texture *tex, unsigned int target, int level)
+{
+    int face = _glsCubeFaceFromTarget(target);
+
+    __try {
+        if (face >= 0 && tex->pCubeTex)
+            IDirect3DCubeTexture9_UnlockRect(tex->pCubeTex, (D3DCUBEMAP_FACES)face, level);
+        else if (tex->pTex)
+            IDirect3DTexture9_UnlockRect(tex->pTex, level);
+    } __except(EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+/*
+ * glTexImage2D — define one mip level of a 2D or cube map texture.
+ *
+ * GL defines levels one call at a time and gives no advance notice of how
+ * many are coming, so the storage is allocated on the level 0 call as a full
+ * mip chain.  Levels the application never supplies simply stay empty, and
+ * are only sampled if it also asks for a mipmapping min filter.
+ *
+ * A level > 0 arriving for an already-allocated texture writes into the
+ * existing chain rather than being discarded, which is what makes
+ * pre-generated mipmaps work.
+ */
+void _glsTexImage2D(unsigned int target, int level, int internalformat,
+                     int width, int height, int border,
+                     unsigned int format, unsigned int type, const void *pixels)
+{
+    IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+    GLS_Texture *tex;
+    D3DFORMAT d3dFmt;
+    D3DLOCKED_RECT lr;
+    int face, unit;
+    HRESULT hr;
+
+    (void)border;
+
+    tex = _glsBoundTextureForTarget(target, &unit);
+    if (!tex || level < 0) return;
+    if (!pDev || width <= 0 || height <= 0) return;
+
+    face   = _glsCubeFaceFromTarget(target);
+    d3dFmt = _glsMapGLFormatToD3D(internalformat);
+
+    if (level == 0) {
+        int levels;
+
+        /* A cube map is defined face by face; only allocate on the first
+         * face, otherwise each face would destroy the previous one. */
+        if (face > 0 && tex->pCubeTex) {
+            /* storage already exists — fall through to the upload below */
+        } else {
+            _glsReleaseTextureResources(tex);
+
+            tex->width          = width;
+            tex->height         = height;
+            tex->internalFormat = internalformat;
+            tex->target         = target;
+
+            levels = _glsMipLevelCount(width, height);
+
+            __try {
+                if (face >= 0)
+                    hr = IDirect3DDevice9_CreateCubeTexture(pDev, width, levels, 0,
+                                                            d3dFmt, D3DPOOL_MANAGED,
+                                                            &tex->pCubeTex, NULL);
+                else
+                    hr = IDirect3DDevice9_CreateTexture(pDev, width, height, levels, 0,
+                                                        d3dFmt, D3DPOOL_MANAGED,
+                                                        &tex->pTex, NULL);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                hr = E_FAIL;
+            }
+
+            if (FAILED(hr)) {
+                gldDiagLog("GL: TexImage2D Create%sTexture FAILED hr=0x%08X %dx%d fmt=%d",
+                           face >= 0 ? "Cube" : "", hr, width, height, d3dFmt);
+                tex->pTex = NULL;
+                tex->pCubeTex = NULL;
+                return;
+            }
+        }
+    }
+
+    if (!tex->pTex && !tex->pCubeTex) {
+        /* Level > 0 arrived before level 0 — nothing to write into. */
+        gldDiagLog("GL: TexImage2D level %d with no storage allocated", level);
         return;
     }
 
-    /* Copy pixel data if provided */
     if (pixels) {
-        D3DLOCKED_RECT lr;
-        __try {
-            hr = IDirect3DTexture9_LockRect(tex->pTex, 0, &lr, NULL, 0);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            hr = E_FAIL;
-        }
-        if (SUCCEEDED(hr)) {
+        if (_glsLockTexLevel(tex, target, level, NULL, &lr)) {
             _glsCopyPixelsToD3D(lr.pBits, pixels, width, height, format, type, lr.Pitch);
-            IDirect3DTexture9_UnlockRect(tex->pTex, 0);
+            _glsUnlockTexLevel(tex, target, level);
+        } else {
+            gldDiagLog("GL: TexImage2D lock failed level=%d", level);
         }
     }
 
-    gldDiagLog("GL: TexImage2D tex=%u %dx%d fmt=0x%X d3d=%d pTex=%p", texId, width, height, internalformat, d3dFmt, tex->pTex);
+    gldDiagLog("GL: TexImage2D tex=%u target=0x%X level=%d %dx%d fmt=0x%X d3d=%d",
+               tex->id, target, level, width, height, internalformat, d3dFmt);
 }
 
+/*
+ * glTexSubImage2D — replace a rectangle of an existing mip level.
+ *
+ * Locking only the destination rectangle lets the source rows be copied
+ * straight in: within a locked sub-rect, pBits points at the sub-rect's
+ * first texel, so the existing row conversion works unchanged.
+ */
 void _glsTexSubImage2D(unsigned int target, int level, int xoffset, int yoffset,
                         int width, int height, unsigned int format, unsigned int type,
                         const void *pixels)
 {
-    /* Just accept the data without crashing */
-    (void)target; (void)level; (void)xoffset; (void)yoffset;
-    (void)width; (void)height; (void)format; (void)type; (void)pixels;
+    GLS_Texture *tex;
+    D3DLOCKED_RECT lr;
+    RECT rect;
+    int unit;
+
+    tex = _glsBoundTextureForTarget(target, &unit);
+    if (!tex || !pixels || level < 0) return;
+    if (width <= 0 || height <= 0) return;
+    if (!tex->pTex && !tex->pCubeTex) {
+        gldDiagLog("GL: TexSubImage2D with no storage (tex=%u)", tex->id);
+        return;
+    }
+
+    rect.left   = xoffset;
+    rect.top    = yoffset;
+    rect.right  = xoffset + width;
+    rect.bottom = yoffset + height;
+
+    if (!_glsLockTexLevel(tex, target, level, &rect, &lr)) {
+        gldDiagLog("GL: TexSubImage2D lock failed tex=%u level=%d", tex->id, level);
+        return;
+    }
+
+    _glsCopyPixelsToD3D(lr.pBits, pixels, width, height, format, type, lr.Pitch);
+    _glsUnlockTexLevel(tex, target, level);
+
+    gldDiagLog("GL: TexSubImage2D tex=%u level=%d (%d,%d) %dx%d",
+               tex->id, level, xoffset, yoffset, width, height);
 }
 
 void _glsTexParameteri(unsigned int target, unsigned int pname, int param)
@@ -1039,90 +1685,103 @@ void _glsTexParameterf(unsigned int target, unsigned int pname, float param)
     _glsTexParameteri(target, pname, (int)param);
 }
 
+/*
+ * glCompressedTexImage2D — upload pre-compressed S3TC/DXT data.
+ *
+ * The block layout is identical between GL and D3D9, so the data is copied
+ * verbatim; only the row pitch has to be honoured, and a "row" here is a row
+ * of 4x4 blocks rather than of texels.  Levels beyond 0 write into the chain
+ * allocated by the level 0 call, which is how compressed mipmaps in DDS-style
+ * assets get through.
+ */
 void _glsCompressedTexImage2D(unsigned int target, int level, unsigned int internalformat,
                                int width, int height, int border, int imageSize, const void *data)
 {
-    GLS_State *s = glsGetState();
     IDirect3DDevice9 *pDev = gldGetD3DDevice46();
-    int unit = (s->activeTexUnit >= GL_TEXTURE0) ? (s->activeTexUnit - GL_TEXTURE0) : 0;
-    unsigned int texId;
     GLS_Texture *tex;
     D3DFORMAT d3dFmt;
+    D3DLOCKED_RECT lr;
+    int face, unit;
     HRESULT hr;
 
-    if (unit < 0 || unit >= GLS_MAX_TEX_UNITS) unit = 0;
-    texId = s->boundTexture2D[unit];
-    tex = glsFindTexture(texId);
+    (void)border;
 
-    (void)border; (void)target;
-
-    if (!tex || level != 0) return;
-
-    tex->width = width;
-    tex->height = height;
-    tex->internalFormat = internalformat;
-
-    /* Release old texture if any */
-    if (tex->pTex) {
-        IDirect3DTexture9_Release(tex->pTex);
-        tex->pTex = NULL;
-    }
-    if (tex->pixelData) { free(tex->pixelData); tex->pixelData = NULL; tex->pixelDataSize = 0; }
-
+    tex = _glsBoundTextureForTarget(target, &unit);
+    if (!tex || level < 0) return;
     if (!pDev || width <= 0 || height <= 0) return;
 
+    face   = _glsCubeFaceFromTarget(target);
     d3dFmt = _glsMapCompressedFormatToD3D(internalformat);
     if (d3dFmt == D3DFMT_UNKNOWN) {
         gldDiagLog("GL: CompressedTexImage2D unknown format 0x%X", internalformat);
         return;
     }
 
-    __try {
-        hr = IDirect3DDevice9_CreateTexture(pDev, width, height, 1, 0, d3dFmt,
-                                             D3DPOOL_MANAGED, &tex->pTex, NULL);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        hr = E_FAIL;
-    }
+    if (level == 0 && !(face > 0 && tex->pCubeTex)) {
+        int levels = _glsMipLevelCount(width, height);
 
-    if (FAILED(hr) || !tex->pTex) {
-        gldDiagLog("GL: CompressedTexImage2D CreateTexture FAILED hr=0x%08X", hr);
-        tex->pTex = NULL;
-        return;
-    }
+        _glsReleaseTextureResources(tex);
 
-    /* Copy compressed data directly — no conversion needed for S3TC/DXT */
-    if (data && imageSize > 0) {
-        D3DLOCKED_RECT lr;
+        tex->width          = width;
+        tex->height         = height;
+        tex->internalFormat = internalformat;
+        tex->target         = target;
+
         __try {
-            hr = IDirect3DTexture9_LockRect(tex->pTex, 0, &lr, NULL, 0);
+            if (face >= 0)
+                hr = IDirect3DDevice9_CreateCubeTexture(pDev, width, levels, 0,
+                                                        d3dFmt, D3DPOOL_MANAGED,
+                                                        &tex->pCubeTex, NULL);
+            else
+                hr = IDirect3DDevice9_CreateTexture(pDev, width, height, levels, 0,
+                                                    d3dFmt, D3DPOOL_MANAGED,
+                                                    &tex->pTex, NULL);
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             hr = E_FAIL;
         }
-        if (SUCCEEDED(hr)) {
-            /* For compressed textures, copy row by row respecting pitch,
-               or if pitch matches, copy the whole block */
+
+        if (FAILED(hr)) {
+            gldDiagLog("GL: CompressedTexImage2D Create FAILED hr=0x%08X %dx%d fmt=%d",
+                       hr, width, height, d3dFmt);
+            tex->pTex = NULL;
+            tex->pCubeTex = NULL;
+            return;
+        }
+    }
+
+    if (!tex->pTex && !tex->pCubeTex) {
+        gldDiagLog("GL: CompressedTexImage2D level %d with no storage", level);
+        return;
+    }
+
+    if (data && imageSize > 0) {
+        if (_glsLockTexLevel(tex, target, level, NULL, &lr)) {
+            int blockWidth  = (width  + 3) / 4;
             int blockHeight = (height + 3) / 4;
-            int blockWidth = (width + 3) / 4;
-            int blockSize = (d3dFmt == D3DFMT_DXT1) ? 8 : 16;
+            int blockSize   = (d3dFmt == D3DFMT_DXT1) ? 8 : 16;
             int srcRowBytes = blockWidth * blockSize;
             int row;
 
             if (lr.Pitch == srcRowBytes) {
-                memcpy(lr.pBits, data, imageSize);
+                memcpy(lr.pBits, data, (size_t)imageSize);
             } else {
                 for (row = 0; row < blockHeight; row++) {
                     int copySize = srcRowBytes;
                     if (copySize > lr.Pitch) copySize = lr.Pitch;
-                    memcpy((unsigned char *)lr.pBits + row * lr.Pitch,
-                           (const unsigned char *)data + row * srcRowBytes,
-                           copySize);
+                    memcpy((unsigned char *)lr.pBits + (ptrdiff_t)row * lr.Pitch,
+                           (const unsigned char *)data + (ptrdiff_t)row * srcRowBytes,
+                           (size_t)copySize);
                 }
             }
-            IDirect3DTexture9_UnlockRect(tex->pTex, 0);
+
+            _glsUnlockTexLevel(tex, target, level);
+        } else {
+            gldDiagLog("GL: CompressedTexImage2D lock failed level=%d", level);
         }
     }
 
-    gldDiagLog("GL: CompressedTexImage2D tex=%u %dx%d fmt=0x%X d3d=%d pTex=%p", texId, width, height, internalformat, d3dFmt, tex->pTex);
+    gldDiagLog("GL: CompressedTexImage2D tex=%u target=0x%X level=%d %dx%d fmt=0x%X size=%d",
+               tex->id, target, level, width, height, internalformat, imageSize);
 }
 
 void _glsActiveTexture(unsigned int texture)
@@ -1266,12 +1925,18 @@ void _glsEnable(unsigned int cap)
                 break;
             case GL_STENCIL_TEST:
                 IDirect3DDevice9_SetRenderState(pDev, D3DRS_STENCILENABLE, TRUE);
+                /* Enabling the test alone is not enough — the func/op state
+                 * accumulated while it was off has never been pushed. */
+                _glsApplyStencilState();
                 break;
             case GL_ALPHA_TEST:
                 IDirect3DDevice9_SetRenderState(pDev, D3DRS_ALPHATESTENABLE, TRUE);
                 break;
             case GL_LIGHTING:
                 IDirect3DDevice9_SetRenderState(pDev, D3DRS_LIGHTING, TRUE);
+                break;
+            case GL_FOG:
+                _glsApplyFogState();
                 break;
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) { }
@@ -1310,6 +1975,9 @@ void _glsDisable(unsigned int cap)
                 break;
             case GL_LIGHTING:
                 IDirect3DDevice9_SetRenderState(pDev, D3DRS_LIGHTING, FALSE);
+                break;
+            case GL_FOG:
+                IDirect3DDevice9_SetRenderState(pDev, D3DRS_FOGENABLE, FALSE);
                 break;
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) { }
@@ -1374,10 +2042,24 @@ void _glsFrontFace(unsigned int mode)
 void _glsColorMask(unsigned char r, unsigned char g, unsigned char b, unsigned char a)
 {
     GLS_State *s = glsGetState();
+    IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+    DWORD mask = 0;
+
     s->colorMask[0] = r;
     s->colorMask[1] = g;
     s->colorMask[2] = b;
     s->colorMask[3] = a;
+
+    if (r) mask |= D3DCOLORWRITEENABLE_RED;
+    if (g) mask |= D3DCOLORWRITEENABLE_GREEN;
+    if (b) mask |= D3DCOLORWRITEENABLE_BLUE;
+    if (a) mask |= D3DCOLORWRITEENABLE_ALPHA;
+
+    if (pDev) {
+        __try {
+            IDirect3DDevice9_SetRenderState(pDev, D3DRS_COLORWRITEENABLE, mask);
+        } __except(EXCEPTION_EXECUTE_HANDLER) { }
+    }
 }
 
 void _glsAlphaFunc(unsigned int func, float ref)
@@ -1395,29 +2077,127 @@ void _glsAlphaFunc(unsigned int func, float ref)
     }
 }
 
+/* GL stencil operation -> D3DSTENCILOP.
+ *
+ * GL_INCR/GL_DECR saturate at the maximum/minimum representable value, so
+ * they map to the *SAT variants; the WRAP forms are the ones that map to
+ * D3D's plain INCR/DECR. */
+static D3DSTENCILOP _glsMapStencilOp(unsigned int op)
+{
+    switch (op) {
+    case 0x1E00: return D3DSTENCILOP_KEEP;      /* GL_KEEP */
+    case 0x0000: return D3DSTENCILOP_ZERO;      /* GL_ZERO */
+    case 0x1E01: return D3DSTENCILOP_REPLACE;   /* GL_REPLACE */
+    case 0x1E02: return D3DSTENCILOP_INCRSAT;   /* GL_INCR */
+    case 0x1E03: return D3DSTENCILOP_DECRSAT;   /* GL_DECR */
+    case 0x150A: return D3DSTENCILOP_INVERT;    /* GL_INVERT */
+    case 0x8507: return D3DSTENCILOP_INCR;      /* GL_INCR_WRAP */
+    case 0x8508: return D3DSTENCILOP_DECR;      /* GL_DECR_WRAP */
+    default:     return D3DSTENCILOP_KEEP;
+    }
+}
+
+/*
+ * Push the whole stencil state to D3D9.
+ *
+ * Called from every stencil setter rather than each one writing its own
+ * render states, because two-sided stencil has to be enabled or disabled
+ * based on whether the front and back state actually differ — a decision
+ * that needs all of it visible at once.
+ */
+void _glsApplyStencilState(void)
+{
+    GLS_State *s = glsGetState();
+    IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+    BOOL twoSided;
+
+    if (!pDev) return;
+
+    twoSided = (s->stencilBackFunc  != s->stencilFunc)  ||
+               (s->stencilBackRef   != s->stencilRef)   ||
+               (s->stencilBackMask  != s->stencilMask)  ||
+               (s->stencilBackFail  != s->stencilFail)  ||
+               (s->stencilBackZFail != s->stencilZFail) ||
+               (s->stencilBackZPass != s->stencilZPass);
+
+    __try {
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_STENCILFUNC, _glsMapCompareFunc(s->stencilFunc));
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_STENCILREF,  (DWORD)s->stencilRef);
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_STENCILMASK, (DWORD)s->stencilMask);
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_STENCILWRITEMASK, (DWORD)s->stencilWriteMask);
+
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_STENCILFAIL,  _glsMapStencilOp(s->stencilFail));
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_STENCILZFAIL, _glsMapStencilOp(s->stencilZFail));
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_STENCILPASS,  _glsMapStencilOp(s->stencilZPass));
+
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_TWOSIDEDSTENCILMODE, twoSided ? TRUE : FALSE);
+        if (twoSided) {
+            IDirect3DDevice9_SetRenderState(pDev, D3DRS_CCW_STENCILFUNC,
+                                            _glsMapCompareFunc(s->stencilBackFunc));
+            IDirect3DDevice9_SetRenderState(pDev, D3DRS_CCW_STENCILFAIL,
+                                            _glsMapStencilOp(s->stencilBackFail));
+            IDirect3DDevice9_SetRenderState(pDev, D3DRS_CCW_STENCILZFAIL,
+                                            _glsMapStencilOp(s->stencilBackZFail));
+            IDirect3DDevice9_SetRenderState(pDev, D3DRS_CCW_STENCILPASS,
+                                            _glsMapStencilOp(s->stencilBackZPass));
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) { }
+}
+
 void _glsStencilFunc(unsigned int func, int ref, unsigned int mask)
 {
     GLS_State *s = glsGetState();
+
     s->stencilFunc = func;
     s->stencilRef = ref;
     s->stencilMask = mask;
+    /* Non-separate glStencilFunc sets both faces. */
+    s->stencilBackFunc = func;
+    s->stencilBackRef = ref;
+    s->stencilBackMask = mask;
+
+    _glsApplyStencilState();
 }
 
 void _glsStencilOp(unsigned int fail, unsigned int zfail, unsigned int zpass)
 {
     GLS_State *s = glsGetState();
+
     s->stencilFail = fail;
     s->stencilZFail = zfail;
     s->stencilZPass = zpass;
+    s->stencilBackFail = fail;
+    s->stencilBackZFail = zfail;
+    s->stencilBackZPass = zpass;
+
+    _glsApplyStencilState();
 }
 
 void _glsPolygonMode(unsigned int face, unsigned int mode)
 {
     GLS_State *s = glsGetState();
+    IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+    DWORD fill;
+
     if (face == 0x0404 || face == 0x0408) /* GL_FRONT or GL_FRONT_AND_BACK */
         s->polygonModeFront = mode;
     if (face == 0x0405 || face == 0x0408) /* GL_BACK or GL_FRONT_AND_BACK */
         s->polygonModeBack = mode;
+
+    /* D3D9 has a single fill mode, with no front/back distinction; the front
+     * setting wins because that is what an application changing only one face
+     * almost always means to affect. */
+    switch (s->polygonModeFront) {
+    case 0x1B00: fill = D3DFILL_POINT;     break;  /* GL_POINT */
+    case 0x1B01: fill = D3DFILL_WIREFRAME; break;  /* GL_LINE */
+    default:     fill = D3DFILL_SOLID;     break;  /* GL_FILL */
+    }
+
+    if (pDev) {
+        __try {
+            IDirect3DDevice9_SetRenderState(pDev, D3DRS_FILLMODE, fill);
+        } __except(EXCEPTION_EXECUTE_HANDLER) { }
+    }
 }
 
 void _glsPolygonOffset(float factor, float units)
@@ -1797,102 +2577,64 @@ void _glsBegin(unsigned int mode)
     s->immVertexCount = 0;
 }
 
+/*
+ * glEnd — flush the vertices accumulated since glBegin.
+ *
+ * Shares the primitive expansion used by the vertex-array paths, so
+ * GL_LINE_LOOP, GL_QUAD_STRIP and GL_POLYGON work here too rather than
+ * being silently dropped.
+ */
 void _glsEnd(void)
 {
     GLS_State *s = glsGetState();
     IDirect3DDevice9 *pDev = gldGetD3DDevice46();
     D3DPRIMITIVETYPE d3dPrimType;
-    int primCount;
-    int i;
+    GLS_D3DVertex *verts;
+    unsigned int *idx;
+    int indexCount, primCount, count, i;
 
     s->inBeginEnd = FALSE;
 
-    if (!pDev || s->immVertexCount == 0)
+    count = s->immVertexCount;
+    if (!pDev || count <= 0)
         return;
 
-    /* Map GL primitive mode to D3D9 */
-    switch (s->beginMode) {
-    case 0x0000: /* GL_POINTS */        d3dPrimType = D3DPT_POINTLIST; primCount = s->immVertexCount; break;
-    case 0x0001: /* GL_LINES */         d3dPrimType = D3DPT_LINELIST; primCount = s->immVertexCount / 2; break;
-    case 0x0003: /* GL_LINE_STRIP */    d3dPrimType = D3DPT_LINESTRIP; primCount = s->immVertexCount - 1; break;
-    case 0x0004: /* GL_TRIANGLES */     d3dPrimType = D3DPT_TRIANGLELIST; primCount = s->immVertexCount / 3; break;
-    case 0x0005: /* GL_TRIANGLE_STRIP */d3dPrimType = D3DPT_TRIANGLESTRIP; primCount = s->immVertexCount - 2; break;
-    case 0x0006: /* GL_TRIANGLE_FAN */  d3dPrimType = D3DPT_TRIANGLEFAN; primCount = s->immVertexCount - 2; break;
-    case 0x0007: /* GL_QUADS */         d3dPrimType = D3DPT_TRIANGLELIST; primCount = (s->immVertexCount / 4) * 2; break;
-    default: return;
+    indexCount = _glsExpandedIndexCount(s->beginMode, count);
+    if (indexCount <= 0) {
+        gldDiagLog("GL: glEnd unsupported mode 0x%X", s->beginMode);
+        return;
     }
 
-    if (primCount <= 0) return;
+    if (!_glsApplyTransforms(pDev, s))
+        return;
 
-    /* Set modelview and projection matrices on D3D9 device (transposed: GL col-major -> D3D row-major) */
-    {
-        D3DMATRIX d3dWorld, d3dProj;
-        _glsTransposeMatrix(&d3dWorld, s->modelviewStack.stack[s->modelviewStack.top].m);
-        _glsTransposeMatrix(&d3dProj, s->projectionStack.stack[s->projectionStack.top].m);
+    verts = (GLS_D3DVertex *)malloc((size_t)count * sizeof(GLS_D3DVertex));
+    if (!verts) return;
 
-        __try {
-            IDirect3DDevice9_SetTransform(pDev, D3DTS_WORLD, &d3dWorld);
-            IDirect3DDevice9_SetTransform(pDev, D3DTS_PROJECTION, &d3dProj);
-            /* Disable lighting for immediate mode unless explicitly enabled */
-            if (!s->enableLighting) {
-                IDirect3DDevice9_SetRenderState(pDev, D3DRS_LIGHTING, FALSE);
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            return;
-        }
+    idx = (unsigned int *)malloc((size_t)indexCount * sizeof(unsigned int));
+    if (!idx) { free(verts); return; }
+
+    for (i = 0; i < count; i++) {
+        GLS_ImmVertex *sv = &s->immVertices[i];
+        verts[i].x  = sv->pos[0];
+        verts[i].y  = sv->pos[1];
+        verts[i].z  = sv->pos[2];
+        verts[i].nx = sv->normal[0];
+        verts[i].ny = sv->normal[1];
+        verts[i].nz = sv->normal[2];
+        verts[i].color = _glsPackColor(sv->color);
+        verts[i].u0 = sv->texcoord[0][0];
+        verts[i].v0 = sv->texcoord[0][1];
+        verts[i].u1 = sv->texcoord[1][0];
+        verts[i].v1 = sv->texcoord[1][1];
     }
 
-    /* Use untransformed vertex format: XYZ + DIFFUSE + TEX1 */
-    {
-        int vertCount;
-        GLS_D3DVertex *verts;
+    primCount = _glsExpandPrimitive(s->beginMode, count, &d3dPrimType, idx);
+    if (primCount > 0)
+        _glsSubmitIndexed(pDev, d3dPrimType, primCount, verts, count, idx, indexCount);
 
-        if (s->beginMode == 0x0007) { /* GL_QUADS */
-            int quadCount = s->immVertexCount / 4;
-            vertCount = quadCount * 6;
-            verts = (GLS_D3DVertex *)malloc(vertCount * sizeof(GLS_D3DVertex));
-            if (!verts) return;
-
-            for (i = 0; i < quadCount; i++) {
-                GLS_ImmVertex *q = &s->immVertices[i * 4];
-                GLS_D3DVertex *t = &verts[i * 6];
-                int j;
-                /* Quad -> 2 triangles: 0-1-2, 0-2-3 */
-                int indices[6] = {0, 1, 2, 0, 2, 3};
-                for (j = 0; j < 6; j++) {
-                    GLS_ImmVertex *sv = &q[indices[j]];
-                    t[j].x = sv->pos[0];
-                    t[j].y = sv->pos[1];
-                    t[j].z = sv->pos[2];
-                    t[j].color = D3DCOLOR_COLORVALUE(sv->color[0], sv->color[1], sv->color[2], sv->color[3]);
-                    t[j].u = sv->texcoord[0][0];
-                    t[j].v = sv->texcoord[0][1];
-                }
-            }
-        } else {
-            vertCount = s->immVertexCount;
-            verts = (GLS_D3DVertex *)malloc(vertCount * sizeof(GLS_D3DVertex));
-            if (!verts) return;
-
-            for (i = 0; i < vertCount; i++) {
-                GLS_ImmVertex *sv = &s->immVertices[i];
-                verts[i].x = sv->pos[0];
-                verts[i].y = sv->pos[1];
-                verts[i].z = sv->pos[2];
-                verts[i].color = D3DCOLOR_COLORVALUE(sv->color[0], sv->color[1], sv->color[2], sv->color[3]);
-                verts[i].u = sv->texcoord[0][0];
-                verts[i].v = sv->texcoord[0][1];
-            }
-        }
-
-        /* Submit to D3D9 */
-        __try {
-            IDirect3DDevice9_SetFVF(pDev, GLS_D3DFVF);
-            IDirect3DDevice9_DrawPrimitiveUP(pDev, d3dPrimType, primCount, verts, sizeof(GLS_D3DVertex));
-        } __except(EXCEPTION_EXECUTE_HANDLER) { }
-
-        free(verts);
-    }
+    free(idx);
+    free(verts);
 }
 
 static void _emitVertex(float x, float y, float z, float w)
@@ -2118,17 +2860,172 @@ void _glsAttachShader(unsigned int program, unsigned int shader)
         prog->fragShader = shader;
 }
 
+/*
+ * Merge one shader's reflected constant table into the program's resolved
+ * uniform list, matching entries by name across the two shader stages.
+ */
+static void _glsMergeUniformMap(GLS_Program *prog, const glslUniformMap *map,
+                                int count, BOOL isVertex)
+{
+    int i, j;
+
+    for (i = 0; i < count; i++) {
+        GLS_ResolvedUniform *slot = NULL;
+
+        for (j = 0; j < prog->resolvedCount; j++) {
+            if (strcmp(prog->resolved[j].name, map[i].name) == 0) {
+                slot = &prog->resolved[j];
+                break;
+            }
+        }
+
+        if (!slot) {
+            if (prog->resolvedCount >= GLS_MAX_UNIFORMS)
+                continue;
+            slot = &prog->resolved[prog->resolvedCount++];
+            strncpy(slot->name, map[i].name, sizeof(slot->name) - 1);
+            slot->name[sizeof(slot->name) - 1] = '\0';
+            slot->vsRegister = -1;
+            slot->psRegister = -1;
+        }
+
+        slot->registerCount = map[i].registerCount;
+        slot->registerSet   = map[i].registerSet;
+        if (isVertex) slot->vsRegister = map[i].registerIndex;
+        else          slot->psRegister = map[i].registerIndex;
+    }
+}
+
+/* Release any D3D9 shader objects a program is holding. */
+static void _glsReleaseProgramShaders(GLS_Program *prog)
+{
+    if (prog->pVS) { IDirect3DVertexShader9_Release(prog->pVS); prog->pVS = NULL; }
+    if (prog->pPS) { IDirect3DPixelShader9_Release(prog->pPS);  prog->pPS = NULL; }
+}
+
+/*
+ * glLinkProgram — transpile the attached GLSL to HLSL, compile it to Shader
+ * Model 3 bytecode and create the D3D9 shader objects.
+ *
+ * This is where a GL 2.0+ program actually becomes something D3D9 can run.
+ * Failure leaves linked = FALSE with a message in the info log, which is what
+ * an application's glGetProgramiv(GL_LINK_STATUS) check expects to see.
+ */
 void _glsLinkProgram(unsigned int program)
 {
     GLS_Program *prog = glsFindProgram(program);
-    if (prog) prog->linked = TRUE;
-    gldDiagLog("GL: glLinkProgram(%u) -> linked=%d", program, prog ? prog->linked : -1);
+    GLS_Shader *vs, *fs;
+    IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+    void *vsCode = NULL, *psCode = NULL;
+    DWORD vsSize = 0, psSize = 0;
+    glslUniformMap map[GLSL_MAX_UNIFORM_MAP];
+    int mapCount;
+
+    if (!prog) {
+        gldDiagLog("GL: glLinkProgram(%u) -> program not found", program);
+        return;
+    }
+
+    prog->linked        = FALSE;
+    prog->resolvedCount = 0;
+    prog->infoLog[0]    = '\0';
+    _glsReleaseProgramShaders(prog);
+
+    if (!pDev) {
+        strcpy(prog->infoLog, "no D3D9 device");
+        gldDiagLog("GL: glLinkProgram(%u) -> no D3D9 device", program);
+        return;
+    }
+
+    if (!glslTranspilerInit()) {
+        strcpy(prog->infoLog, "GLSL transpiler unavailable (d3dcompiler_47.dll missing)");
+        gldDiagLog("GL: glLinkProgram(%u) -> transpiler unavailable", program);
+        return;
+    }
+
+    vs = glsFindShader(prog->vertShader);
+    fs = glsFindShader(prog->fragShader);
+
+    /* Vertex stage */
+    if (vs && vs->source) {
+        if (!glslTranspileAndCompile(0, vs->source, &vsCode, &vsSize)) {
+            strcpy(prog->infoLog, "vertex shader compilation failed");
+            gldDiagLog("GL: glLinkProgram(%u) -> VS compile failed", program);
+            return;
+        }
+        if (!glslCreateVertexShader(pDev, vsCode, vsSize, &prog->pVS)) {
+            strcpy(prog->infoLog, "CreateVertexShader failed");
+            glslFreeBytecode(vsCode);
+            gldDiagLog("GL: glLinkProgram(%u) -> CreateVertexShader failed", program);
+            return;
+        }
+        mapCount = glslReflectConstants(vsCode, vsSize, map, GLSL_MAX_UNIFORM_MAP);
+        _glsMergeUniformMap(prog, map, mapCount, TRUE);
+        glslFreeBytecode(vsCode);
+    }
+
+    /* Fragment stage */
+    if (fs && fs->source) {
+        if (!glslTranspileAndCompile(1, fs->source, &psCode, &psSize)) {
+            strcpy(prog->infoLog, "fragment shader compilation failed");
+            _glsReleaseProgramShaders(prog);
+            gldDiagLog("GL: glLinkProgram(%u) -> PS compile failed", program);
+            return;
+        }
+        if (!glslCreatePixelShader(pDev, psCode, psSize, &prog->pPS)) {
+            strcpy(prog->infoLog, "CreatePixelShader failed");
+            glslFreeBytecode(psCode);
+            _glsReleaseProgramShaders(prog);
+            gldDiagLog("GL: glLinkProgram(%u) -> CreatePixelShader failed", program);
+            return;
+        }
+        mapCount = glslReflectConstants(psCode, psSize, map, GLSL_MAX_UNIFORM_MAP);
+        _glsMergeUniformMap(prog, map, mapCount, FALSE);
+        glslFreeBytecode(psCode);
+    }
+
+    prog->linked = TRUE;
+    gldDiagLog("GL: glLinkProgram(%u) -> linked (VS=%p PS=%p, %d uniforms)",
+               program, prog->pVS, prog->pPS, prog->resolvedCount);
 }
 
+/*
+ * glUseProgram — bind the program's compiled shaders on the device.
+ *
+ * Program 0 unbinds both stages, which returns D3D9 to the fixed-function
+ * pipeline that the immediate-mode and legacy array paths rely on.
+ */
 void _glsUseProgram(unsigned int program)
 {
     GLS_State *s = glsGetState();
+    IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+    GLS_Program *prog;
+
     s->boundProgram = program;
+
+    if (!pDev) return;
+
+    if (program == 0) {
+        __try {
+            IDirect3DDevice9_SetVertexShader(pDev, NULL);
+            IDirect3DDevice9_SetPixelShader(pDev, NULL);
+        } __except(EXCEPTION_EXECUTE_HANDLER) { }
+        gldDiagLog("GL: glUseProgram(0) -> fixed function");
+        return;
+    }
+
+    prog = glsFindProgram(program);
+    if (!prog || !prog->linked) {
+        gldDiagLog("GL: glUseProgram(%u) -> not linked, staying on fixed function", program);
+        return;
+    }
+
+    __try {
+        IDirect3DDevice9_SetVertexShader(pDev, prog->pVS);
+        IDirect3DDevice9_SetPixelShader(pDev, prog->pPS);
+    } __except(EXCEPTION_EXECUTE_HANDLER) { }
+
+    gldDiagLog("GL: glUseProgram(%u) -> VS=%p PS=%p", program, prog->pVS, prog->pPS);
 }
 
 void _glsGetProgramiv(unsigned int program, unsigned int pname, int *params)
@@ -2159,9 +3056,21 @@ void _glsGetProgramiv(unsigned int program, unsigned int pname, int *params)
 
 void _glsGetProgramInfoLog(unsigned int program, int bufSize, int *length, char *infoLog)
 {
-    (void)program;
-    if (length) *length = 0;
+    GLS_Program *prog = glsFindProgram(program);
+    int n;
+
     if (infoLog && bufSize > 0) infoLog[0] = '\0';
+    if (length) *length = 0;
+
+    if (!prog || !infoLog || bufSize <= 0) return;
+
+    /* Report why linking failed — applications print this on link failure,
+     * and a silent empty log makes a shader problem impossible to diagnose. */
+    strncpy(infoLog, prog->infoLog, (size_t)bufSize - 1);
+    infoLog[bufSize - 1] = '\0';
+
+    n = (int)strlen(infoLog);
+    if (length) *length = n;
 }
 
 
@@ -2674,134 +3583,310 @@ static GLS_Program* _getBoundProgram(void)
     return glsFindProgram(s->boundProgram);
 }
 
+/*
+ * glGetUniformLocation — resolve a uniform name to a location.
+ *
+ * The location is an index into the program's resolved uniform table built
+ * at link time from the shader constant tables, not a D3D9 register: the
+ * same name usually occupies different registers in the vertex and pixel
+ * shaders, so the indirection is what lets one glUniform call update both.
+ */
+int _glsGetUniformLocation(unsigned int program, const char *name)
+{
+    GLS_Program *prog = glsFindProgram(program);
+    int i;
+
+    if (!prog || !name) return -1;
+
+    for (i = 0; i < prog->resolvedCount; i++) {
+        if (strcmp(prog->resolved[i].name, name) == 0) {
+            gldDiagLog("GL: glGetUniformLocation(%u, \"%s\") -> %d (vs=%d ps=%d)",
+                       program, name, i,
+                       prog->resolved[i].vsRegister, prog->resolved[i].psRegister);
+            return i;
+        }
+    }
+
+    gldDiagLog("GL: glGetUniformLocation(%u, \"%s\") -> -1 (not found)", program, name);
+    return -1;
+}
+
+/*
+ * glGetAttribLocation — resolve a vertex attribute name to its index.
+ *
+ * Honours any glBindAttribLocation the application made; otherwise falls back
+ * to the fixed-function aliasing the vertex assembly path reads from.
+ */
+int _glsGetAttribLocation(unsigned int program, const char *name)
+{
+    GLS_Program *prog = glsFindProgram(program);
+    int i;
+
+    if (!prog || !name) return -1;
+
+    for (i = 0; i < prog->attribBindingCount; i++) {
+        if (prog->attribBindings[i].set &&
+            strcmp(prog->attribBindings[i].name, name) == 0)
+            return (int)prog->attribBindings[i].index;
+    }
+
+    if (strstr(name, "ertex") || strstr(name, "osition")) return 0;
+    if (strstr(name, "ormal"))                            return 2;
+    if (strstr(name, "olor") || strstr(name, "olour"))    return 3;
+    if (strstr(name, "exCoord") || strstr(name, "excoord")) return 8;
+
+    return -1;
+}
+
+/*
+ * Push a uniform's value into the D3D9 constant registers of whichever
+ * stages declare it.
+ *
+ * Sampler uniforms are handled separately: D3D9 pins a sampler to its
+ * register, so glUniform1i on a sampler is recorded as a stage->GL-unit
+ * mapping rather than uploaded as a constant.
+ */
+static void _glsUploadUniform(int loc, const float *data, int vec4Count)
+{
+    GLS_State *s = glsGetState();
+    GLS_Program *prog = _getBoundProgram();
+    IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+    GLS_ResolvedUniform *u;
+
+    if (!prog || !pDev || loc < 0 || loc >= prog->resolvedCount) return;
+    if (!data || vec4Count <= 0) return;
+
+    u = &prog->resolved[loc];
+
+    if (u->registerSet == GLSL_RS_SAMPLER) {
+        int unit = (int)data[0];
+        if (u->psRegister >= 0 && u->psRegister < GLS_MAX_TEX_UNITS &&
+            unit >= 0 && unit < GLS_MAX_TEX_UNITS)
+            s->samplerStageUnit[u->psRegister] = unit;
+        gldDiagLog("GL: uniform sampler loc=%d stage=%d <- GL unit %d",
+                   loc, u->psRegister, unit);
+        return;
+    }
+
+    __try {
+        if (u->vsRegister >= 0)
+            IDirect3DDevice9_SetVertexShaderConstantF(pDev, u->vsRegister, data, vec4Count);
+        if (u->psRegister >= 0)
+            IDirect3DDevice9_SetPixelShaderConstantF(pDev, u->psRegister, data, vec4Count);
+    } __except(EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+/* Upload `count` scalars/vectors of `components` each, padding to float4
+ * because D3D9 constant registers are always four floats wide. */
+static void _glsUploadScalars(int loc, const float *v, int count, int components)
+{
+    float packed[4 * 64];
+    int i, c, n;
+
+    if (!v || count <= 0) return;
+    if (count > 64) count = 64;
+
+    n = count * 4;
+    memset(packed, 0, (size_t)n * sizeof(float));
+
+    for (i = 0; i < count; i++)
+        for (c = 0; c < components; c++)
+            packed[i * 4 + c] = v[i * components + c];
+
+    _glsUploadUniform(loc, packed, count);
+}
+
+/* ===== glUniform* =====
+ *
+ * Each entry records the value for glGetUniform queries and uploads it to
+ * the bound program's D3D9 constant registers.  Integer uniforms are
+ * converted to float because D3D9's integer constant file is tiny and
+ * rarely supported; the only integers that matter in practice are sampler
+ * bindings, which _glsUploadUniform intercepts.
+ */
+
 void _glsUniform1i(int loc, int v0)
 {
+    float f[1];
     GLS_Uniform *u = _findOrCreateUniform(_getBoundProgram(), loc);
     if (u) { u->type = 0; u->data[0] = (float)v0; u->set = TRUE; }
+    f[0] = (float)v0;
+    _glsUploadScalars(loc, f, 1, 1);
 }
 
 void _glsUniform2i(int loc, int v0, int v1)
 {
+    float f[2];
     GLS_Uniform *u = _findOrCreateUniform(_getBoundProgram(), loc);
     if (u) { u->type = 0; u->data[0] = (float)v0; u->data[1] = (float)v1; u->set = TRUE; }
+    f[0] = (float)v0; f[1] = (float)v1;
+    _glsUploadScalars(loc, f, 1, 2);
 }
 
 void _glsUniform3i(int loc, int v0, int v1, int v2)
 {
+    float f[3];
     GLS_Uniform *u = _findOrCreateUniform(_getBoundProgram(), loc);
     if (u) { u->type = 0; u->data[0] = (float)v0; u->data[1] = (float)v1; u->data[2] = (float)v2; u->set = TRUE; }
+    f[0] = (float)v0; f[1] = (float)v1; f[2] = (float)v2;
+    _glsUploadScalars(loc, f, 1, 3);
 }
 
 void _glsUniform4i(int loc, int v0, int v1, int v2, int v3)
 {
+    float f[4];
     GLS_Uniform *u = _findOrCreateUniform(_getBoundProgram(), loc);
     if (u) { u->type = 0; u->data[0] = (float)v0; u->data[1] = (float)v1; u->data[2] = (float)v2; u->data[3] = (float)v3; u->set = TRUE; }
+    f[0] = (float)v0; f[1] = (float)v1; f[2] = (float)v2; f[3] = (float)v3;
+    _glsUploadScalars(loc, f, 1, 4);
 }
 
 void _glsUniform1f(int loc, float v0)
 {
+    float f[1];
     GLS_Uniform *u = _findOrCreateUniform(_getBoundProgram(), loc);
     if (u) { u->type = 1; u->data[0] = v0; u->set = TRUE; }
+    f[0] = v0;
+    _glsUploadScalars(loc, f, 1, 1);
 }
 
 void _glsUniform2f(int loc, float v0, float v1)
 {
+    float f[2];
     GLS_Uniform *u = _findOrCreateUniform(_getBoundProgram(), loc);
     if (u) { u->type = 2; u->data[0] = v0; u->data[1] = v1; u->set = TRUE; }
+    f[0] = v0; f[1] = v1;
+    _glsUploadScalars(loc, f, 1, 2);
 }
 
 void _glsUniform3f(int loc, float v0, float v1, float v2)
 {
+    float f[3];
     GLS_Uniform *u = _findOrCreateUniform(_getBoundProgram(), loc);
     if (u) { u->type = 3; u->data[0] = v0; u->data[1] = v1; u->data[2] = v2; u->set = TRUE; }
+    f[0] = v0; f[1] = v1; f[2] = v2;
+    _glsUploadScalars(loc, f, 1, 3);
 }
 
 void _glsUniform4f(int loc, float v0, float v1, float v2, float v3)
 {
+    float f[4];
     GLS_Uniform *u = _findOrCreateUniform(_getBoundProgram(), loc);
     if (u) { u->type = 4; u->data[0] = v0; u->data[1] = v1; u->data[2] = v2; u->data[3] = v3; u->set = TRUE; }
+    f[0] = v0; f[1] = v1; f[2] = v2; f[3] = v3;
+    _glsUploadScalars(loc, f, 1, 4);
 }
 
 void _glsUniform1iv(int loc, int count, const int *v)
 {
-    GLS_Uniform *u;
+    float f[64];
+    int i, n;
     if (!v || count <= 0) return;
-    u = _findOrCreateUniform(_getBoundProgram(), loc);
-    if (u) { u->type = 0; u->data[0] = (float)v[0]; u->set = TRUE; }
+    n = count > 64 ? 64 : count;
+    for (i = 0; i < n; i++) f[i] = (float)v[i];
+    _glsUploadScalars(loc, f, n, 1);
 }
 
 void _glsUniform2iv(int loc, int count, const int *v)
 {
-    GLS_Uniform *u;
+    float f[128];
+    int i, n;
     if (!v || count <= 0) return;
-    u = _findOrCreateUniform(_getBoundProgram(), loc);
-    if (u) { u->type = 0; u->data[0] = (float)v[0]; u->data[1] = (float)v[1]; u->set = TRUE; }
+    n = count > 64 ? 64 : count;
+    for (i = 0; i < n * 2; i++) f[i] = (float)v[i];
+    _glsUploadScalars(loc, f, n, 2);
 }
 
 void _glsUniform3iv(int loc, int count, const int *v)
 {
-    GLS_Uniform *u;
+    float f[192];
+    int i, n;
     if (!v || count <= 0) return;
-    u = _findOrCreateUniform(_getBoundProgram(), loc);
-    if (u) { u->type = 0; u->data[0] = (float)v[0]; u->data[1] = (float)v[1]; u->data[2] = (float)v[2]; u->set = TRUE; }
+    n = count > 64 ? 64 : count;
+    for (i = 0; i < n * 3; i++) f[i] = (float)v[i];
+    _glsUploadScalars(loc, f, n, 3);
 }
 
 void _glsUniform4iv(int loc, int count, const int *v)
 {
-    GLS_Uniform *u;
+    float f[256];
+    int i, n;
     if (!v || count <= 0) return;
-    u = _findOrCreateUniform(_getBoundProgram(), loc);
-    if (u) { u->type = 0; u->data[0] = (float)v[0]; u->data[1] = (float)v[1]; u->data[2] = (float)v[2]; u->data[3] = (float)v[3]; u->set = TRUE; }
+    n = count > 64 ? 64 : count;
+    for (i = 0; i < n * 4; i++) f[i] = (float)v[i];
+    _glsUploadScalars(loc, f, n, 4);
 }
 
 void _glsUniform1fv(int loc, int count, const float *v)
 {
-    GLS_Uniform *u;
     if (!v || count <= 0) return;
-    u = _findOrCreateUniform(_getBoundProgram(), loc);
-    if (u) { u->type = 1; u->data[0] = v[0]; u->set = TRUE; }
+    _glsUploadScalars(loc, v, count, 1);
 }
 
 void _glsUniform2fv(int loc, int count, const float *v)
 {
-    GLS_Uniform *u;
     if (!v || count <= 0) return;
-    u = _findOrCreateUniform(_getBoundProgram(), loc);
-    if (u) { u->type = 2; u->data[0] = v[0]; u->data[1] = v[1]; u->set = TRUE; }
+    _glsUploadScalars(loc, v, count, 2);
 }
 
 void _glsUniform3fv(int loc, int count, const float *v)
 {
-    GLS_Uniform *u;
     if (!v || count <= 0) return;
-    u = _findOrCreateUniform(_getBoundProgram(), loc);
-    if (u) { u->type = 3; u->data[0] = v[0]; u->data[1] = v[1]; u->data[2] = v[2]; u->set = TRUE; }
+    _glsUploadScalars(loc, v, count, 3);
 }
 
 void _glsUniform4fv(int loc, int count, const float *v)
 {
-    GLS_Uniform *u;
+    /* Already float4-aligned — upload straight through. */
     if (!v || count <= 0) return;
-    u = _findOrCreateUniform(_getBoundProgram(), loc);
-    if (u) { u->type = 4; u->data[0] = v[0]; u->data[1] = v[1]; u->data[2] = v[2]; u->data[3] = v[3]; u->set = TRUE; }
+    _glsUploadUniform(loc, v, count);
+}
+
+/*
+ * Matrix uniforms.
+ *
+ * GL hands over column-major data when transpose is FALSE, which is exactly
+ * what HLSL's default column-major packing expects, so that case is a
+ * straight copy.  transpose = TRUE means the application supplied row-major
+ * data and asked the driver to flip it.
+ *
+ * Each matrix occupies one constant register per column, and a mat3 still
+ * costs three float4 registers because registers cannot be split.
+ */
+static void _glsUploadMatrices(int loc, int count, unsigned char transpose,
+                               const float *v, int dim)
+{
+    float packed[4 * 16];
+    int m, r, c, reg = 0;
+
+    if (!v || count <= 0) return;
+    if (count > 16 / dim) count = 16 / dim;
+
+    memset(packed, 0, sizeof(packed));
+
+    for (m = 0; m < count; m++) {
+        const float *src = v + m * dim * dim;
+        for (c = 0; c < dim; c++) {
+            for (r = 0; r < dim; r++) {
+                /* src is column-major unless the caller asked for a flip */
+                packed[reg * 4 + r] = transpose ? src[r * dim + c]
+                                                : src[c * dim + r];
+            }
+            reg++;
+        }
+    }
+
+    _glsUploadUniform(loc, packed, reg);
 }
 
 void _glsUniformMatrix2fv(int loc, int count, unsigned char transpose, const float *v)
 {
-    GLS_Uniform *u;
-    if (!v || count <= 0) return;
-    u = _findOrCreateUniform(_getBoundProgram(), loc);
-    if (u) { u->type = 5; memcpy(u->data, v, 4 * sizeof(float)); u->set = TRUE; }
-    (void)transpose;
+    _glsUploadMatrices(loc, count, transpose, v, 2);
 }
 
 void _glsUniformMatrix3fv(int loc, int count, unsigned char transpose, const float *v)
 {
-    GLS_Uniform *u;
-    if (!v || count <= 0) return;
-    u = _findOrCreateUniform(_getBoundProgram(), loc);
-    if (u) { u->type = 6; memcpy(u->data, v, 9 * sizeof(float)); u->set = TRUE; }
-    (void)transpose;
+    _glsUploadMatrices(loc, count, transpose, v, 3);
 }
 
 void _glsUniformMatrix4fv(int loc, int count, unsigned char transpose, const float *v)
@@ -2810,7 +3895,7 @@ void _glsUniformMatrix4fv(int loc, int count, unsigned char transpose, const flo
     if (!v || count <= 0) return;
     u = _findOrCreateUniform(_getBoundProgram(), loc);
     if (u) { u->type = 7; memcpy(u->data, v, 16 * sizeof(float)); u->set = TRUE; }
-    (void)transpose;
+    _glsUploadMatrices(loc, count, transpose, v, 4);
 }
 
 
@@ -2884,6 +3969,90 @@ void _glsVertexAttribPointer(unsigned int index, int size, unsigned int type, un
     }
 }
 
+/* ===== Legacy client-side vertex arrays (GL 1.1) =====
+ *
+ * These record where the application's arrays live; _glsResolveVertexSources
+ * picks them up at draw time when the bound VAO does not supply the same
+ * semantic.  A buffer object bound to GL_ARRAY_BUFFER at the time of the call
+ * makes `pointer` an offset into it, matching the VBO rules for generic
+ * attributes.
+ */
+
+static void _glsSetClientArray(GLS_ClientArray *arr, int size, unsigned int type,
+                               int stride, const void *pointer)
+{
+    GLS_State *s = glsGetState();
+    arr->size          = size;
+    arr->type          = type;
+    arr->stride        = stride;
+    arr->pointer       = pointer;
+    arr->bufferBinding = s->boundArrayBuffer;
+}
+
+void _glsVertexPointer(int size, unsigned int type, int stride, const void *pointer)
+{
+    _glsSetClientArray(&glsGetState()->clientVertexArray, size, type, stride, pointer);
+    gldDiagLog("GL: glVertexPointer(%d, 0x%X, %d, %p)", size, type, stride, pointer);
+}
+
+void _glsNormalPointer(unsigned int type, int stride, const void *pointer)
+{
+    /* glNormalPointer has no size argument — normals are always 3 components. */
+    _glsSetClientArray(&glsGetState()->clientNormalArray, 3, type, stride, pointer);
+    gldDiagLog("GL: glNormalPointer(0x%X, %d, %p)", type, stride, pointer);
+}
+
+void _glsColorPointer(int size, unsigned int type, int stride, const void *pointer)
+{
+    _glsSetClientArray(&glsGetState()->clientColorArray, size, type, stride, pointer);
+    gldDiagLog("GL: glColorPointer(%d, 0x%X, %d, %p)", size, type, stride, pointer);
+}
+
+void _glsTexCoordPointer(int size, unsigned int type, int stride, const void *pointer)
+{
+    GLS_State *s = glsGetState();
+    int unit = (int)s->clientActiveTexUnit - GL_TEXTURE0;
+    if (unit < 0 || unit >= GLS_MAX_TEX_UNITS) unit = 0;
+    _glsSetClientArray(&s->clientTexCoordArray[unit], size, type, stride, pointer);
+    gldDiagLog("GL: glTexCoordPointer(%d, 0x%X, %d, %p) unit=%d", size, type, stride, pointer, unit);
+}
+
+void _glsClientActiveTexture(unsigned int texture)
+{
+    GLS_State *s = glsGetState();
+    s->clientActiveTexUnit = texture;
+}
+
+static void _glsSetClientState(unsigned int array, BOOL enable)
+{
+    GLS_State *s = glsGetState();
+    int unit;
+
+    switch (array) {
+    case GL_VERTEX_ARRAY:
+        s->clientVertexArray.enabled = enable;
+        break;
+    case GL_NORMAL_ARRAY:
+        s->clientNormalArray.enabled = enable;
+        break;
+    case GL_COLOR_ARRAY:
+        s->clientColorArray.enabled = enable;
+        break;
+    case GL_TEXTURE_COORD_ARRAY:
+        unit = (int)s->clientActiveTexUnit - GL_TEXTURE0;
+        if (unit < 0 || unit >= GLS_MAX_TEX_UNITS) unit = 0;
+        s->clientTexCoordArray[unit].enabled = enable;
+        break;
+    default:
+        gldDiagLog("GL: %sClientState unhandled array 0x%X",
+                   enable ? "glEnable" : "glDisable", array);
+        break;
+    }
+}
+
+void _glsEnableClientState(unsigned int array)  { _glsSetClientState(array, TRUE); }
+void _glsDisableClientState(unsigned int array) { _glsSetClientState(array, FALSE); }
+
 void _glsEnableVertexAttribArray(unsigned int index)
 {
     GLS_VAO *vao = _getBoundVAO();
@@ -2929,11 +4098,39 @@ void _glsVertexAttribDivisor(unsigned int index, unsigned int divisor)
  *  SECTION 17: Blend/Stencil Separate
  * =================================================================== */
 
+/* GL blend equation -> D3DBLENDOP. */
+static D3DBLENDOP _glsMapBlendEquation(unsigned int mode)
+{
+    switch (mode) {
+    case 0x8006: return D3DBLENDOP_ADD;          /* GL_FUNC_ADD */
+    case 0x800A: return D3DBLENDOP_SUBTRACT;     /* GL_FUNC_SUBTRACT */
+    case 0x800B: return D3DBLENDOP_REVSUBTRACT;  /* GL_FUNC_REVERSE_SUBTRACT */
+    case 0x8007: return D3DBLENDOP_MIN;          /* GL_MIN */
+    case 0x8008: return D3DBLENDOP_MAX;          /* GL_MAX */
+    default:     return D3DBLENDOP_ADD;
+    }
+}
+
 void _glsBlendEquationSeparate(unsigned int modeRGB, unsigned int modeAlpha)
 {
     GLS_State *s = glsGetState();
+    IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+
     s->blendEquationRGB = modeRGB;
     s->blendEquationAlpha = modeAlpha;
+
+    if (!pDev) return;
+
+    __try {
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_BLENDOP, _glsMapBlendEquation(modeRGB));
+        if (modeAlpha != modeRGB) {
+            IDirect3DDevice9_SetRenderState(pDev, D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+            IDirect3DDevice9_SetRenderState(pDev, D3DRS_BLENDOPALPHA,
+                                            _glsMapBlendEquation(modeAlpha));
+        } else {
+            IDirect3DDevice9_SetRenderState(pDev, D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) { }
 }
 
 void _glsBlendEquation(unsigned int mode)
@@ -2983,6 +4180,7 @@ void _glsStencilFuncSeparate(unsigned int face, unsigned int func, int ref, unsi
         s->stencilBackRef = ref;
         s->stencilBackMask = mask;
     }
+    _glsApplyStencilState();
 }
 
 void _glsStencilOpSeparate(unsigned int face, unsigned int sfail, unsigned int dpfail, unsigned int dppass)
@@ -2998,6 +4196,7 @@ void _glsStencilOpSeparate(unsigned int face, unsigned int sfail, unsigned int d
         s->stencilBackZFail = dpfail;
         s->stencilBackZPass = dppass;
     }
+    _glsApplyStencilState();
 }
 
 void _glsStencilMaskSeparate(unsigned int face, unsigned int mask)
@@ -3009,6 +4208,7 @@ void _glsStencilMaskSeparate(unsigned int face, unsigned int mask)
     if (face == GL_BACK || face == GL_FRONT_AND_BACK) {
         s->stencilBackWriteMask = mask;
     }
+    _glsApplyStencilState();
 }
 
 void _glsDrawBuffers(int n, const unsigned int *bufs)
@@ -3724,12 +4924,6 @@ void _glsSampleCoverage(float value, unsigned char invert)
     (void)value; (void)invert;
 }
 
-void _glsClientActiveTexture(unsigned int texture)
-{
-    /* Track client active texture unit for legacy vertex arrays */
-    (void)texture;
-}
-
 void _glsLoadTransposeMatrixf(const float *m)
 {
     float t[16];
@@ -3889,6 +5083,54 @@ void _glsGetBufferSubData(unsigned int target, ptrdiff_t offset, ptrdiff_t size,
 #define GL_FOG_COORD_SRC        0x8450
 #endif
 
+/*
+ * Push the fog state to D3D9.
+ *
+ * Table (per-pixel) fog is used rather than vertex fog because GL's fog is
+ * defined per fragment.  With table fog D3D9 interprets FOGSTART/FOGEND in
+ * eye-space w on any device advertising W-fog, which is the same space GL
+ * uses, so the distances pass through unchanged.
+ *
+ * D3D9 takes these float render states as raw bit patterns, hence the
+ * type-punning through a DWORD.
+ */
+static DWORD _glsFloatAsDword(float f)
+{
+    DWORD d;
+    memcpy(&d, &f, sizeof(d));
+    return d;
+}
+
+void _glsApplyFogState(void)
+{
+    GLS_State *s = glsGetState();
+    IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+    DWORD d3dMode;
+
+    if (!pDev || !s) return;
+
+    switch (s->fogMode) {
+    case 0x0800: d3dMode = D3DFOG_EXP;    break;  /* GL_EXP */
+    case 0x0801: d3dMode = D3DFOG_EXP2;   break;  /* GL_EXP2 */
+    case 0x2601: d3dMode = D3DFOG_LINEAR; break;  /* GL_LINEAR */
+    default:     d3dMode = D3DFOG_LINEAR; break;
+    }
+
+    __try {
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_FOGENABLE, s->enableFog ? TRUE : FALSE);
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_FOGCOLOR, _glsPackColor(s->fogColor));
+
+        /* Per-pixel fog; vertex fog stays off so the two cannot compound. */
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_FOGTABLEMODE, d3dMode);
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_FOGVERTEXMODE, D3DFOG_NONE);
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_RANGEFOGENABLE, FALSE);
+
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_FOGSTART,   _glsFloatAsDword(s->fogStart));
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_FOGEND,     _glsFloatAsDword(s->fogEnd));
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_FOGDENSITY, _glsFloatAsDword(s->fogDensity));
+    } __except(EXCEPTION_EXECUTE_HANDLER) { }
+}
+
 static void _setFogParam(GLS_State *s, unsigned int pname, float value)
 {
     switch (pname) {
@@ -3898,6 +5140,7 @@ static void _setFogParam(GLS_State *s, unsigned int pname, float value)
     case GL_FOG_END:     s->fogEnd = value; break;
     default: break;
     }
+    _glsApplyFogState();
 }
 
 void _glsFogf(unsigned int pname, float param)
@@ -3920,6 +5163,7 @@ void _glsFogfv(unsigned int pname, const float *params)
         s->fogColor[1] = params[1];
         s->fogColor[2] = params[2];
         s->fogColor[3] = params[3];
+        _glsApplyFogState();
     } else {
         _setFogParam(s, pname, params[0]);
     }
@@ -3933,6 +5177,7 @@ void _glsFogiv(unsigned int pname, const int *params)
         s->fogColor[1] = params[1] / 2147483647.0f;
         s->fogColor[2] = params[2] / 2147483647.0f;
         s->fogColor[3] = params[3] / 2147483647.0f;
+        _glsApplyFogState();
     } else {
         _setFogParam(s, pname, (float)params[0]);
     }
@@ -4302,7 +5547,17 @@ void _glsColorMaterial(unsigned int face, unsigned int mode)
 
 void _glsShadeModel(unsigned int mode)
 {
+    IDirect3DDevice9 *pDev = gldGetD3DDevice46();
+
     _glsShadeModelMode = mode;
+
+    if (!pDev) return;
+
+    __try {
+        /* GL_FLAT (0x1D00) / GL_SMOOTH (0x1D01) */
+        IDirect3DDevice9_SetRenderState(pDev, D3DRS_SHADEMODE,
+            (mode == 0x1D00) ? D3DSHADE_FLAT : D3DSHADE_GOURAUD);
+    } __except(EXCEPTION_EXECUTE_HANDLER) { }
 }
 
 void _glsHint(unsigned int target, unsigned int mode)
@@ -4354,279 +5609,136 @@ void _glsPopClientAttrib(void)
  *  SECTION 33: Draw Calls
  * =================================================================== */
 
+/*
+ * glDrawArrays — assemble `count` sequential vertices starting at `first`
+ * and submit them as one indexed D3D9 draw.
+ */
 void _glsDrawArrays(unsigned int mode, int first, int count)
 {
     GLS_State *s = glsGetState();
     IDirect3DDevice9 *pDev = gldGetD3DDevice46();
     D3DPRIMITIVETYPE d3dPrimType;
-    int primCount;
-    GLS_VAO *vao;
+    GLS_VertexSources src;
     GLS_D3DVertex *verts;
-    int i;
+    unsigned int *idx;
+    int indexCount, primCount, i;
 
     if (!pDev || count <= 0) return;
 
-    switch (mode) {
-    case 0x0000: d3dPrimType = D3DPT_POINTLIST; primCount = count; break;
-    case 0x0001: d3dPrimType = D3DPT_LINELIST; primCount = count / 2; break;
-    case 0x0003: d3dPrimType = D3DPT_LINESTRIP; primCount = count - 1; break;
-    case 0x0004: d3dPrimType = D3DPT_TRIANGLELIST; primCount = count / 3; break;
-    case 0x0005: d3dPrimType = D3DPT_TRIANGLESTRIP; primCount = count - 2; break;
-    case 0x0006: d3dPrimType = D3DPT_TRIANGLEFAN; primCount = count - 2; break;
-    default: return;
+    indexCount = _glsExpandedIndexCount(mode, count);
+    if (indexCount <= 0) {
+        gldDiagLog("GL: glDrawArrays unsupported mode 0x%X", mode);
+        return;
     }
 
-    if (primCount <= 0) return;
+    if (!_glsApplyTransforms(pDev, s))
+        return;
 
-    /* Set transforms */
-    {
-        D3DMATRIX d3dWorld, d3dProj;
-        _glsTransposeMatrix(&d3dWorld, s->modelviewStack.stack[s->modelviewStack.top].m);
-        _glsTransposeMatrix(&d3dProj, s->projectionStack.stack[s->projectionStack.top].m);
-        __try {
-            IDirect3DDevice9_SetTransform(pDev, D3DTS_WORLD, &d3dWorld);
-            IDirect3DDevice9_SetTransform(pDev, D3DTS_PROJECTION, &d3dProj);
-            if (!s->enableLighting)
-                IDirect3DDevice9_SetRenderState(pDev, D3DRS_LIGHTING, FALSE);
-        } __except(EXCEPTION_EXECUTE_HANDLER) { return; }
+    _glsResolveVertexSources(s, &src);
+    if (!src.pos.present) {
+        /* No position data bound — nothing meaningful to draw. */
+        gldDiagLog("GL: glDrawArrays(0x%X, %d, %d) with no position array", mode, first, count);
+        return;
     }
 
-    /* Build temporary vertex buffer from VAO attrib pointers */
-    vao = glsFindVAO(s->boundVAO);
-    verts = (GLS_D3DVertex *)malloc(count * sizeof(GLS_D3DVertex));
+    verts = (GLS_D3DVertex *)malloc((size_t)count * sizeof(GLS_D3DVertex));
     if (!verts) return;
 
-    for (i = 0; i < count; i++) {
-        int vertIdx = first + i;
-        float pos[3] = {0.0f, 0.0f, 0.0f};
-        float col[4];
-        float tc[2] = {0.0f, 0.0f};
+    idx = (unsigned int *)malloc((size_t)indexCount * sizeof(unsigned int));
+    if (!idx) { free(verts); return; }
 
-        col[0] = s->currentColor[0];
-        col[1] = s->currentColor[1];
-        col[2] = s->currentColor[2];
-        col[3] = s->currentColor[3];
+    for (i = 0; i < count; i++)
+        _glsBuildVertex(s, &src, first + i, &verts[i]);
 
-        /* Read position from attrib 0 */
-        if (vao && vao->attribs[0].enabled) {
-            GLS_VertexAttrib *a = &vao->attribs[0];
-            GLS_Buffer *buf = glsFindBuffer(a->bufferBinding);
-            if (buf && buf->data) {
-                int stride = a->stride ? a->stride : (a->size * (int)sizeof(float));
-                const float *p = (const float *)((const char *)buf->data + (ptrdiff_t)a->pointer + vertIdx * stride);
-                if (a->size >= 1) pos[0] = p[0];
-                if (a->size >= 2) pos[1] = p[1];
-                if (a->size >= 3) pos[2] = p[2];
-            }
-        }
+    primCount = _glsExpandPrimitive(mode, count, &d3dPrimType, idx);
+    if (primCount > 0)
+        _glsSubmitIndexed(pDev, d3dPrimType, primCount, verts, count, idx, indexCount);
 
-        /* Read color from attrib 3 */
-        if (vao && vao->attribs[3].enabled) {
-            GLS_VertexAttrib *a = &vao->attribs[3];
-            GLS_Buffer *buf = glsFindBuffer(a->bufferBinding);
-            if (buf && buf->data) {
-                int stride = a->stride ? a->stride : (a->size * (int)sizeof(float));
-                if (a->type == GL_FLOAT) {
-                    const float *p = (const float *)((const char *)buf->data + (ptrdiff_t)a->pointer + vertIdx * stride);
-                    if (a->size >= 1) col[0] = p[0];
-                    if (a->size >= 2) col[1] = p[1];
-                    if (a->size >= 3) col[2] = p[2];
-                    if (a->size >= 4) col[3] = p[3];
-                } else if (a->type == GL_UNSIGNED_BYTE && a->normalized) {
-                    const unsigned char *p = (const unsigned char *)((const char *)buf->data + (ptrdiff_t)a->pointer + vertIdx * (a->stride ? a->stride : a->size));
-                    if (a->size >= 1) col[0] = p[0] / 255.0f;
-                    if (a->size >= 2) col[1] = p[1] / 255.0f;
-                    if (a->size >= 3) col[2] = p[2] / 255.0f;
-                    if (a->size >= 4) col[3] = p[3] / 255.0f;
-                }
-            }
-        }
-
-        /* Read texcoord from attrib 8 */
-        if (vao && vao->attribs[8].enabled) {
-            GLS_VertexAttrib *a = &vao->attribs[8];
-            GLS_Buffer *buf = glsFindBuffer(a->bufferBinding);
-            if (buf && buf->data) {
-                int stride = a->stride ? a->stride : (a->size * (int)sizeof(float));
-                const float *p = (const float *)((const char *)buf->data + (ptrdiff_t)a->pointer + vertIdx * stride);
-                if (a->size >= 1) tc[0] = p[0];
-                if (a->size >= 2) tc[1] = p[1];
-            }
-        }
-
-        verts[i].x = pos[0];
-        verts[i].y = pos[1];
-        verts[i].z = pos[2];
-        verts[i].color = D3DCOLOR_COLORVALUE(col[0], col[1], col[2], col[3]);
-        verts[i].u = tc[0];
-        verts[i].v = tc[1];
-    }
-
-    __try {
-        IDirect3DDevice9_SetFVF(pDev, GLS_D3DFVF);
-        IDirect3DDevice9_DrawPrimitiveUP(pDev, d3dPrimType, primCount, verts, sizeof(GLS_D3DVertex));
-    } __except(EXCEPTION_EXECUTE_HANDLER) { }
-
+    free(idx);
     free(verts);
 }
 
+/*
+ * glDrawElements — assemble the vertices referenced by the index array and
+ * submit them as one indexed D3D9 draw.
+ *
+ * The GL indices are remapped onto a compacted vertex array rather than
+ * passed through: the primitive expansion produces indices into the vertices
+ * we assemble, so quads and line loops work here exactly as in DrawArrays.
+ */
 void _glsDrawElements(unsigned int mode, int count, unsigned int type, const void *indices)
 {
     GLS_State *s = glsGetState();
     IDirect3DDevice9 *pDev = gldGetD3DDevice46();
     D3DPRIMITIVETYPE d3dPrimType;
-    int primCount;
-    GLS_VAO *vao;
+    GLS_VertexSources src;
     GLS_Buffer *ibo;
     const void *indexData;
-    int i;
-    int maxVertIdx = 0;
     GLS_D3DVertex *verts;
-    unsigned short *idx16 = NULL;
+    unsigned int *glIndices, *expanded, *final;
+    int indexCount, primCount, i;
 
     if (!pDev || count <= 0) return;
 
-    switch (mode) {
-    case 0x0000: d3dPrimType = D3DPT_POINTLIST; primCount = count; break;
-    case 0x0001: d3dPrimType = D3DPT_LINELIST; primCount = count / 2; break;
-    case 0x0003: d3dPrimType = D3DPT_LINESTRIP; primCount = count - 1; break;
-    case 0x0004: d3dPrimType = D3DPT_TRIANGLELIST; primCount = count / 3; break;
-    case 0x0005: d3dPrimType = D3DPT_TRIANGLESTRIP; primCount = count - 2; break;
-    case 0x0006: d3dPrimType = D3DPT_TRIANGLEFAN; primCount = count - 2; break;
-    default: return;
+    indexCount = _glsExpandedIndexCount(mode, count);
+    if (indexCount <= 0) {
+        gldDiagLog("GL: glDrawElements unsupported mode 0x%X", mode);
+        return;
     }
 
-    if (primCount <= 0) return;
-
-    /* Set transforms */
-    {
-        D3DMATRIX d3dWorld, d3dProj;
-        _glsTransposeMatrix(&d3dWorld, s->modelviewStack.stack[s->modelviewStack.top].m);
-        _glsTransposeMatrix(&d3dProj, s->projectionStack.stack[s->projectionStack.top].m);
-        __try {
-            IDirect3DDevice9_SetTransform(pDev, D3DTS_WORLD, &d3dWorld);
-            IDirect3DDevice9_SetTransform(pDev, D3DTS_PROJECTION, &d3dProj);
-            if (!s->enableLighting)
-                IDirect3DDevice9_SetRenderState(pDev, D3DRS_LIGHTING, FALSE);
-        } __except(EXCEPTION_EXECUTE_HANDLER) { return; }
-    }
-
-    /* Resolve index data */
+    /* Resolve index data: an element buffer binding makes `indices` an
+     * offset into that buffer, otherwise it is a client pointer. */
     ibo = glsFindBuffer(s->boundElementBuffer);
-    indexData = indices;
-    if (ibo && ibo->data) {
-        indexData = (const char *)ibo->data + (ptrdiff_t)indices;
-    }
+    indexData = (ibo && ibo->data)
+              ? (const void *)((const char *)ibo->data + (ptrdiff_t)indices)
+              : indices;
     if (!indexData) return;
 
-    /* Find max vertex index to know how many vertices to build */
+    if (!_glsApplyTransforms(pDev, s))
+        return;
+
+    _glsResolveVertexSources(s, &src);
+    if (!src.pos.present) {
+        gldDiagLog("GL: glDrawElements(0x%X, %d) with no position array", mode, count);
+        return;
+    }
+
+    /* Widen the application's indices to 32-bit so one code path covers all
+     * three GL index types. */
+    glIndices = (unsigned int *)malloc((size_t)count * sizeof(unsigned int));
+    if (!glIndices) return;
+
     for (i = 0; i < count; i++) {
-        int idx;
         switch (type) {
-        case 0x1401: /* GL_UNSIGNED_BYTE */  idx = ((const unsigned char *)indexData)[i]; break;
-        case 0x1403: /* GL_UNSIGNED_SHORT */ idx = ((const unsigned short *)indexData)[i]; break;
-        case 0x1405: /* GL_UNSIGNED_INT */   idx = (int)((const unsigned int *)indexData)[i]; break;
-        default: return;
+        case GL_UNSIGNED_BYTE:  glIndices[i] = ((const unsigned char  *)indexData)[i]; break;
+        case GL_UNSIGNED_SHORT: glIndices[i] = ((const unsigned short *)indexData)[i]; break;
+        case GL_UNSIGNED_INT:   glIndices[i] = ((const unsigned int   *)indexData)[i]; break;
+        default:
+            gldDiagLog("GL: glDrawElements bad index type 0x%X", type);
+            free(glIndices);
+            return;
         }
-        if (idx > maxVertIdx) maxVertIdx = idx;
-    }
-    maxVertIdx++;
-
-    /* Build vertex buffer */
-    vao = glsFindVAO(s->boundVAO);
-    verts = (GLS_D3DVertex *)malloc(maxVertIdx * sizeof(GLS_D3DVertex));
-    if (!verts) return;
-
-    for (i = 0; i < maxVertIdx; i++) {
-        float pos[3] = {0.0f, 0.0f, 0.0f};
-        float col[4];
-        float tc[2] = {0.0f, 0.0f};
-
-        col[0] = s->currentColor[0];
-        col[1] = s->currentColor[1];
-        col[2] = s->currentColor[2];
-        col[3] = s->currentColor[3];
-
-        if (vao && vao->attribs[0].enabled) {
-            GLS_VertexAttrib *a = &vao->attribs[0];
-            GLS_Buffer *buf = glsFindBuffer(a->bufferBinding);
-            if (buf && buf->data) {
-                int stride = a->stride ? a->stride : (a->size * (int)sizeof(float));
-                const float *p = (const float *)((const char *)buf->data + (ptrdiff_t)a->pointer + i * stride);
-                if (a->size >= 1) pos[0] = p[0];
-                if (a->size >= 2) pos[1] = p[1];
-                if (a->size >= 3) pos[2] = p[2];
-            }
-        }
-
-        if (vao && vao->attribs[3].enabled) {
-            GLS_VertexAttrib *a = &vao->attribs[3];
-            GLS_Buffer *buf = glsFindBuffer(a->bufferBinding);
-            if (buf && buf->data) {
-                int stride = a->stride ? a->stride : (a->size * (int)sizeof(float));
-                if (a->type == GL_FLOAT) {
-                    const float *p = (const float *)((const char *)buf->data + (ptrdiff_t)a->pointer + i * stride);
-                    if (a->size >= 1) col[0] = p[0];
-                    if (a->size >= 2) col[1] = p[1];
-                    if (a->size >= 3) col[2] = p[2];
-                    if (a->size >= 4) col[3] = p[3];
-                } else if (a->type == GL_UNSIGNED_BYTE && a->normalized) {
-                    const unsigned char *p = (const unsigned char *)((const char *)buf->data + (ptrdiff_t)a->pointer + i * (a->stride ? a->stride : a->size));
-                    if (a->size >= 1) col[0] = p[0] / 255.0f;
-                    if (a->size >= 2) col[1] = p[1] / 255.0f;
-                    if (a->size >= 3) col[2] = p[2] / 255.0f;
-                    if (a->size >= 4) col[3] = p[3] / 255.0f;
-                }
-            }
-        }
-
-        if (vao && vao->attribs[8].enabled) {
-            GLS_VertexAttrib *a = &vao->attribs[8];
-            GLS_Buffer *buf = glsFindBuffer(a->bufferBinding);
-            if (buf && buf->data) {
-                int stride = a->stride ? a->stride : (a->size * (int)sizeof(float));
-                const float *p = (const float *)((const char *)buf->data + (ptrdiff_t)a->pointer + i * stride);
-                if (a->size >= 1) tc[0] = p[0];
-                if (a->size >= 2) tc[1] = p[1];
-            }
-        }
-
-        verts[i].x = pos[0];
-        verts[i].y = pos[1];
-        verts[i].z = pos[2];
-        verts[i].color = D3DCOLOR_COLORVALUE(col[0], col[1], col[2], col[3]);
-        verts[i].u = tc[0];
-        verts[i].v = tc[1];
     }
 
-    /* Convert indices to 16-bit if needed (D3D9 DrawIndexedPrimitiveUP needs INDEX16 or INDEX32) */
-    {
-        D3DFORMAT indexFormat;
-        const void *d3dIndices = indexData;
+    /* One assembled vertex per element reference.  This duplicates shared
+     * vertices, but keeps the expansion indices valid for every mode and
+     * avoids walking the index array to find its maximum. */
+    verts = (GLS_D3DVertex *)malloc((size_t)count * sizeof(GLS_D3DVertex));
+    if (!verts) { free(glIndices); return; }
 
-        if (type == 0x1401) { /* GL_UNSIGNED_BYTE -> convert to 16-bit */
-            idx16 = (unsigned short *)malloc(count * sizeof(unsigned short));
-            if (!idx16) { free(verts); return; }
-            for (i = 0; i < count; i++)
-                idx16[i] = ((const unsigned char *)indexData)[i];
-            d3dIndices = idx16;
-            indexFormat = D3DFMT_INDEX16;
-        } else if (type == 0x1403) { /* GL_UNSIGNED_SHORT */
-            indexFormat = D3DFMT_INDEX16;
-        } else { /* GL_UNSIGNED_INT */
-            indexFormat = D3DFMT_INDEX32;
-        }
+    for (i = 0; i < count; i++)
+        _glsBuildVertex(s, &src, (int)glIndices[i], &verts[i]);
 
-        __try {
-            IDirect3DDevice9_SetFVF(pDev, GLS_D3DFVF);
-            IDirect3DDevice9_DrawIndexedPrimitiveUP(pDev, d3dPrimType,
-                0, maxVertIdx, primCount,
-                d3dIndices, indexFormat,
-                verts, sizeof(GLS_D3DVertex));
-        } __except(EXCEPTION_EXECUTE_HANDLER) { }
+    expanded = (unsigned int *)malloc((size_t)indexCount * sizeof(unsigned int));
+    if (!expanded) { free(verts); free(glIndices); return; }
 
-        if (idx16) free(idx16);
+    primCount = _glsExpandPrimitive(mode, count, &d3dPrimType, expanded);
+    if (primCount > 0) {
+        final = expanded;  /* already indexes the compacted array */
+        _glsSubmitIndexed(pDev, d3dPrimType, primCount, verts, count, final, indexCount);
     }
 
+    free(expanded);
     free(verts);
+    free(glIndices);
 }

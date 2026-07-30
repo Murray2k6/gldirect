@@ -342,6 +342,106 @@ void glslFreeBytecode(void *pBytecode)
         free(pBytecode);
 }
 
+/**********************************************************************/
+/*****            Public API: Constant table reflection           *****/
+/**********************************************************************/
+
+/*
+ * Parse the CTAB constant table embedded in Shader Model 3 bytecode.
+ *
+ * SM3 bytecode is a stream of DWORD tokens.  Comment tokens have their low
+ * 16 bits set to 0xFFFE and encode their length (in DWORDs, excluding the
+ * token itself) in bits 16..30.  The compiler emits the constant table as
+ * one such comment whose payload begins with the 'CTAB' FourCC, followed by
+ * a header giving the offset and count of an array of constant records.
+ * All offsets inside are relative to the start of the header.
+ *
+ * D3DReflect does not handle SM3, and D3DXGetShaderConstantTable would
+ * require the D3DX9 redistributable, so the table is read directly here.
+ */
+int glslReflectConstants(const void *bytecode, DWORD size,
+                         glslUniformMap *out, int maxOut)
+{
+    const DWORD *tok    = (const DWORD *)bytecode;
+    const DWORD *end;
+    DWORD        dwords;
+    int          found  = 0;
+
+    if (!bytecode || !out || maxOut <= 0 || size < 8)
+        return 0;
+
+    dwords = size / 4;
+    end    = tok + dwords;
+    tok++;                      /* skip the version token */
+
+    while (tok < end) {
+        DWORD token = *tok;
+
+        /* Comment token? */
+        if ((token & 0x0000FFFF) == 0x0000FFFE) {
+            DWORD commentLen = (token >> 16) & 0x7FFF;
+            const unsigned char *base = (const unsigned char *)(tok + 1);
+
+            if (tok + 1 + commentLen > end)
+                break;
+
+            /* 'CTAB' little-endian */
+            if (commentLen >= 7 && *(const DWORD *)base == 0x42415443) {
+                const unsigned char *ctab = base + 4;   /* offsets are relative to here */
+                DWORD ctabBytes = (commentLen - 1) * 4;
+                DWORD constCount, constInfoOff;
+                DWORD i;
+
+                /* Header: Size, Creator, Version, Constants, ConstantInfo, Flags, Target */
+                constCount   = ((const DWORD *)ctab)[3];
+                constInfoOff = ((const DWORD *)ctab)[4];
+
+                if (constInfoOff >= ctabBytes)
+                    return 0;
+
+                for (i = 0; i < constCount && found < maxOut; i++) {
+                    /* D3DXSHADER_CONSTANTINFO is 20 bytes:
+                     *   DWORD Name; WORD RegisterSet; WORD RegisterIndex;
+                     *   WORD RegisterCount; WORD Reserved;
+                     *   DWORD TypeInfo; DWORD DefaultValue; */
+                    const unsigned char *rec = ctab + constInfoOff + i * 20;
+                    DWORD nameOff;
+                    const char *name;
+
+                    if ((DWORD)(constInfoOff + (i + 1) * 20) > ctabBytes)
+                        break;
+
+                    nameOff = *(const DWORD *)(rec + 0);
+                    if (nameOff >= ctabBytes)
+                        continue;
+
+                    name = (const char *)(ctab + nameOff);
+
+                    strncpy(out[found].name, name, GLSL_UNIFORM_NAME_LEN - 1);
+                    out[found].name[GLSL_UNIFORM_NAME_LEN - 1] = '\0';
+                    out[found].registerSet   = *(const WORD *)(rec + 4);
+                    out[found].registerIndex = *(const WORD *)(rec + 6);
+                    out[found].registerCount = *(const WORD *)(rec + 8);
+                    found++;
+                }
+
+                return found;
+            }
+
+            tok += 1 + commentLen;
+            continue;
+        }
+
+        /* 0x0000FFFF is the end token */
+        if (token == 0x0000FFFF)
+            break;
+
+        tok++;
+    }
+
+    return found;
+}
+
 
 /**********************************************************************/
 /*****            String Utility Helpers                          *****/

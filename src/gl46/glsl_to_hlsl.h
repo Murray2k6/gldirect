@@ -65,6 +65,36 @@ BOOL glslCreatePixelShader(IDirect3DDevice9 *pDev, const void *bytecode, DWORD s
 /* Free bytecode allocated by glslTranspileAndCompile */
 void glslFreeBytecode(void *pBytecode);
 
+/*---------------------- Constant table reflection ----------------------*/
+
+#define GLSL_MAX_UNIFORM_MAP    128
+#define GLSL_UNIFORM_NAME_LEN   64
+
+/* Register sets, matching D3DXRS_* */
+#define GLSL_RS_BOOL        0
+#define GLSL_RS_INT4        1
+#define GLSL_RS_FLOAT4      2
+#define GLSL_RS_SAMPLER     3
+
+typedef struct {
+    char name[GLSL_UNIFORM_NAME_LEN];
+    int  registerSet;       /* GLSL_RS_* */
+    int  registerIndex;     /* first constant register */
+    int  registerCount;     /* registers occupied (4 for a mat4) */
+} glslUniformMap;
+
+/* Extract the uniform name -> constant register mapping from compiled
+ * Shader Model 3 bytecode.
+ *
+ * The HLSL compiler assigns registers itself, so the mapping is only
+ * discoverable from the bytecode's embedded CTAB constant table.  Reading it
+ * directly avoids depending on D3DXGetShaderConstantTable, which would drag
+ * in the D3DX9 redistributable.
+ *
+ * Returns the number of entries written to `out`. */
+int glslReflectConstants(const void *bytecode, DWORD size,
+                         glslUniformMap *out, int maxOut);
+
 /* Shut down — unload d3dcompiler */
 void glslTranspilerShutdown(void);
 

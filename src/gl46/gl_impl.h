@@ -164,6 +164,27 @@ void _glsVertexAttrib2f(unsigned int index, float x, float y);
 void _glsVertexAttrib3f(unsigned int index, float x, float y, float z);
 void _glsVertexAttrib4f(unsigned int index, float x, float y, float z, float w);
 void _glsVertexAttribPointer(unsigned int index, int size, unsigned int type, unsigned char normalized, int stride, const void *pointer);
+
+/* ===== Deferred state application =====
+ * Push accumulated GL state to the D3D9 device.  Called from the relevant
+ * setters, and again when the corresponding capability is enabled, since
+ * state set while a capability was off has never reached the device. */
+void _glsApplyStencilState(void);
+void _glsApplyFogState(void);
+
+/* ===== Shader introspection ===== */
+int _glsGetUniformLocation(unsigned int program, const char *name);
+int _glsGetAttribLocation(unsigned int program, const char *name);
+
+/* ===== Legacy client-side vertex arrays (GL 1.1) ===== */
+void _glsVertexPointer(int size, unsigned int type, int stride, const void *pointer);
+void _glsNormalPointer(unsigned int type, int stride, const void *pointer);
+void _glsColorPointer(int size, unsigned int type, int stride, const void *pointer);
+void _glsTexCoordPointer(int size, unsigned int type, int stride, const void *pointer);
+void _glsClientActiveTexture(unsigned int texture);
+void _glsEnableClientState(unsigned int array);
+void _glsDisableClientState(unsigned int array);
+
 void _glsEnableVertexAttribArray(unsigned int index);
 void _glsDisableVertexAttribArray(unsigned int index);
 void _glsVertexAttribIPointer(unsigned int index, int size, unsigned int type, int stride, const void *pointer);
@@ -283,7 +304,6 @@ void _glsGetCompressedTexImage(unsigned int target, int level, void *img);
 void _glsCopyTexSubImage3D(unsigned int target, int level, int xoffset, int yoffset, int zoffset, int x, int y, int width, int height);
 void _glsDrawRangeElements(unsigned int mode, unsigned int start, unsigned int end, int count, unsigned int type, const void *indices);
 void _glsSampleCoverage(float value, unsigned char invert);
-void _glsClientActiveTexture(unsigned int texture);
 void _glsLoadTransposeMatrixf(const float *m);
 void _glsLoadTransposeMatrixd(const double *m);
 void _glsMultTransposeMatrixf(const float *m);
@@ -373,14 +393,26 @@ void _glsGetLightiv(unsigned int light, unsigned int pname, int *params);
 void _glsGetMaterialfv(unsigned int face, unsigned int pname, float *params);
 void _glsGetMaterialiv(unsigned int face, unsigned int pname, int *params);
 
-/* ===== D3D9 helper types ===== */
+/* ===== D3D9 helper types =====
+ *
+ * One fat vertex format is used for every draw.  Member order is not free:
+ * D3D9 requires FVF components to appear as position, normal, diffuse, then
+ * texture coordinates, and the struct must match that order exactly.
+ *
+ * Normals and the second texcoord set are always present even when the
+ * application supplies neither.  Selecting a narrower FVF per draw would save
+ * bandwidth but requires a matching struct layout per permutation; a single
+ * format keeps assembly correct, which matters more here than the 44 bytes.
+ */
 typedef struct {
     float x, y, z;
+    float nx, ny, nz;
     DWORD color;
-    float u, v;
+    float u0, v0;
+    float u1, v1;
 } GLS_D3DVertex;
 
-#define GLS_D3DFVF (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1)
+#define GLS_D3DFVF (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX2)
 
 /* ===== D3D9 helper functions ===== */
 D3DFORMAT _glsMapGLFormatToD3D(unsigned int internalformat);

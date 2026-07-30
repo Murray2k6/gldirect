@@ -39,8 +39,8 @@ static void    APIENTRY _stub_glGetProgramInfoLog(GLuint program, GLsizei bufSiz
 static void    APIENTRY _stub_glValidateProgram(GLuint program) { _glsValidateProgram(program); }
 static GLboolean APIENTRY _stub_glIsShader(GLuint shader) { return _glsIsShader(shader); }
 static GLboolean APIENTRY _stub_glIsProgram(GLuint program) { return _glsIsProgram(program); }
-static GLint   APIENTRY _stub_glGetUniformLocation(GLuint program, const GLchar *name) { return -1; }
-static GLint   APIENTRY _stub_glGetAttribLocation(GLuint program, const GLchar *name) { return -1; }
+static GLint   APIENTRY _stub_glGetUniformLocation(GLuint program, const GLchar *name) { return _glsGetUniformLocation(program, name); }
+static GLint   APIENTRY _stub_glGetAttribLocation(GLuint program, const GLchar *name) { return _glsGetAttribLocation(program, name); }
 static void    APIENTRY _stub_glBindAttribLocation(GLuint program, GLuint index, const GLchar *name) { _glsBindAttribLocation(program, index, name); }
 static void    APIENTRY _stub_glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) { if(length) *length=0; }
 static void    APIENTRY _stub_glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) { if(length) *length=0; }

@@ -67,9 +67,27 @@ void gldLogOpen(
 
 	if (gldLoggingMethod == GLDLOG_NORMAL) {
 		fpGLDLog = fopen(szGLDLogName, "wt");
-        if (fpGLDLog == NULL)
-            return;
-    }
+
+		// Fall back to the temp directory if the log cannot be written next
+		// to the DLL.  Games installed under Program Files run unelevated and
+		// cannot write to their own folder, so the log silently never appeared
+		// — which is indistinguishable from the DLL never having loaded, and
+		// makes diagnosing a non-starting game impossible.
+		if (fpGLDLog == NULL) {
+			char szTempLog[_MAX_PATH];
+			DWORD dwLen = GetTempPathA(sizeof(szTempLog), szTempLog);
+
+			if (dwLen > 0 && dwLen < sizeof(szTempLog) - sizeof(GLDLOG_FILENAME)) {
+				strcat(szTempLog, GLDLOG_FILENAME);
+				fpGLDLog = fopen(szTempLog, "wt");
+				if (fpGLDLog != NULL)
+					strcpy(szGLDLogName, szTempLog);
+			}
+		}
+
+		if (fpGLDLog == NULL)
+			return;
+	}
 
 	gldLogMessage(GLDLOG_SYSTEM, "-> Logging Started\n");
 }

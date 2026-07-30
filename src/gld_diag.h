@@ -9,6 +9,7 @@
 
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 
 static FILE *g_diagFile = NULL;
 
@@ -25,7 +26,20 @@ static void gldDiagLog(const char *fmt, ...)
     va_list args;
 
     if (!g_diagFile) {
+        /* The bare name resolves against the working directory, which a game
+         * may set anywhere and which is often not writable.  Fall back to the
+         * temp directory so the very first PROCESS_ATTACH lines are always
+         * recorded — without them there is no way to tell a DLL that failed
+         * to load from one that loaded but could not write its log. */
         g_diagFile = fopen("gldirect_diag.log", "a");
+        if (!g_diagFile) {
+            char szTempLog[MAX_PATH];
+            DWORD dwLen = GetTempPathA(sizeof(szTempLog), szTempLog);
+            if (dwLen > 0 && dwLen < sizeof(szTempLog) - 32) {
+                strcat(szTempLog, "gldirect_diag.log");
+                g_diagFile = fopen(szTempLog, "a");
+            }
+        }
         if (!g_diagFile) return;
     }
 

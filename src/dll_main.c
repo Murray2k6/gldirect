@@ -40,6 +40,9 @@
 #include "gld_driver.h"
 #include "gld_diag.h"
 #include "mesa_proxy.h"
+#include "gl46/context_manager.h"
+#include "gl46/gl_dx9_compat.h"
+#include "gl46/compute_emulator.h"
 
 #include "mmsystem.h"
 
@@ -622,10 +625,14 @@ BOOL gldInitDriver(void)
 
 	// Read registry or INI file settings
 	if (!dllReadRegistry(hInstanceDll)) {
-		// No valid INI found — default to D3D9 hardware backend for proper hardware acceleration.
-		gldLogMessage(GLDLOG_SYSTEM, "No INI file found, defaulting to D3D9 hardware backend (dwDriver=2)\n");
-		glb.dwDriver    = 2;  // GLDS_DRIVER_HAL
-		glb.dwRendering = 2;  // GLDS_DRIVER_HAL
+		// No valid INI found — default to the direct GL-to-D3D9 translator,
+		// the same default gldInitGlobals() uses. The legacy driver 2 path
+		// exposes no WGL extensions, so falling back to it would leave
+		// wglChoosePixelFormatARB / wglCreateContextAttribsARB unresolvable
+		// for any application that negotiates a modern context.
+		gldLogMessage(GLDLOG_SYSTEM, "No INI file found, defaulting to the direct GL-to-D3D9 backend (dwDriver=3)\n");
+		glb.dwDriver    = 3;  // GLDS_DRIVER_GL46_E
+		glb.dwRendering = 3;  // GLDS_DRIVER_GL46_E
 		glb.bPrimary    = 1;
 		glb.bHardware   = 1;  // Enable hardware acceleration
 		strcpy(glb.szDDName, "Primary");
@@ -709,14 +716,27 @@ void gldExitDriver(void)
     // DDraw objects may be invalid when DLL unloads.
 __try {
 
+	/* Release resources in dependency order: presentation surfaces and compat
+	 * objects retain references to the D3D9 device. */
+	gldShutdownMesaPresenter();
+	gldComputeEmulatorShutdown();
+	gldCompatShutdown();
+
 	// Shut down Mesa proxy
 	mesaProxyShutdown();
 
-	// Clean-up sequence (moved from DLL_PROCESS_DETACH)
-	gldReleasePixelFormatList();
-	gldDeleteContextState();
+	if (bInitialized) {
+		// Clean-up sequence (moved from DLL_PROCESS_DETACH)
+		gldReleasePixelFormatList();
+		gldDeleteContextState();
 
-	_gldDriver.DestroyPrivateGlobals();
+		if (_gldDriver.DestroyPrivateGlobals)
+			_gldDriver.DestroyPrivateGlobals();
+	} else {
+		/* Mesa mode can create the presentation-only D3D9 device without
+		 * initializing the legacy driver table. */
+		gldShutdownContext46();
+	}
 }
 __except(EXCEPTION_EXECUTE_HANDLER) {
 	    gldLogPrintf(GLDLOG_WARN, "Exception raised in gldExitDriver.");
@@ -742,6 +762,11 @@ int WINAPI DllMain(
         hInstanceDll = hInstance;
 
         gldDiagLog("DllMain: DLL_PROCESS_ATTACH");
+
+		// Record faults before the engine's own handler can swallow them.
+		// Cheap, passive, and the only way a crash inside an id Tech title
+		// leaves any evidence at all.
+		gldCrashHandlerInstall();
 
         // Flag that callback driver has yet to be initialized
         bInitialized = bExited = FALSE;
@@ -874,4 +899,3 @@ BOOL GLD_isLicensed(void)
 }
 
 // ***********************************************************************
-

@@ -222,18 +222,90 @@ int curPFD = 0;							// Current PFD (static)
 // then becomes a no-op on subsequent calls.
 static BOOL bMesaProxyReady = FALSE;
 static BOOL bMesaProxyAttempted = FALSE;
+static IDirect3DTexture9 *g_mesaPresenterTexture = NULL;
+static IDirect3DSurface9 *g_mesaPresenterStaging = NULL;
+static int g_mesaPresenterWidth = 0;
+static int g_mesaPresenterHeight = 0;
+
+void gldShutdownMesaPresenter(void)
+{
+	if (g_mesaPresenterStaging) {
+		IDirect3DSurface9_Release(g_mesaPresenterStaging);
+		g_mesaPresenterStaging = NULL;
+	}
+	if (g_mesaPresenterTexture) {
+		IDirect3DTexture9_Release(g_mesaPresenterTexture);
+		g_mesaPresenterTexture = NULL;
+	}
+	g_mesaPresenterWidth = 0;
+	g_mesaPresenterHeight = 0;
+}
+
+//
+// The Mesa proxy is a second, mutually exclusive renderer, not a helper for
+// the D3D9 one. When it is active Mesa's llvmpipe does all the GL work on the
+// CPU and SwapBuffers copies the finished image into a D3D9 texture, so what
+// reaches Direct3D is one fullscreen quad carrying a picture of the frame.
+//
+// That is the right trade for correctness - it is a real GL 4.5 compatibility
+// implementation, so every version and extension behaves exactly as specified -
+// and the wrong trade for anything that inspects the D3D9 stream. RTX Remix
+// rebuilds a scene from draw calls, transforms and texture stage state; handed
+// a single textured quad it has no geometry to trace and no camera to recover.
+// It is also software rasterization, so the cost is measured in seconds per
+// frame at modern resolutions, not frames per second.
+//
+// So it must be chosen deliberately, never entered just because the file
+// happens to be on disk. Enable it with dwUseMesa=1 in gldirect.ini beside the
+// executable, or GLDIRECT_USE_MESA=1 in the environment.
+//
+static BOOL _gldMesaRequested(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		char buf[16];
+		DWORD n = GetEnvironmentVariableA("GLDIRECT_USE_MESA", buf, sizeof(buf));
+
+		if (n > 0 && n < sizeof(buf)) {
+			cached = (buf[0] && buf[0] != '0') ? 1 : 0;
+		} else {
+			char szINI[MAX_PATH];
+			DWORD len = GetModuleFileNameA(NULL, szINI, MAX_PATH);
+			cached = 0;
+			if (len > 0 && len < MAX_PATH) {
+				char *slash = strrchr(szINI, '\\');
+				if (slash && (size_t)(slash - szINI) < MAX_PATH - 16) {
+					strcpy(slash + 1, "gldirect.ini");
+					cached = GetPrivateProfileIntA("Config", "dwUseMesa", 0, szINI)
+						? 1 : 0;
+				}
+			}
+		}
+	}
+	return cached ? TRUE : FALSE;
+}
 
 static void _gldInitMesaProxy(void)
 {
 	if (bMesaProxyReady || bMesaProxyAttempted)
 		return;
 	bMesaProxyAttempted = TRUE;
-	gldDiagLog("_gldInitMesaProxy: calling mesaProxyInit");
+
+	if (!_gldMesaRequested()) {
+		gldDiagLog("_gldInitMesaProxy: not requested (dwUseMesa=0) - "
+		           "translating GL to D3D9 directly");
+		return;
+	}
+
+	/* The public GL entry points are dual dispatchers. Once Mesa owns WGL, they
+	 * forward to Mesa; otherwise they call the private direct_gl* D3D9 path. */
 	if (mesaProxyInit()) {
 		bMesaProxyReady = TRUE;
-		gldDiagLog("_gldInitMesaProxy: SUCCESS");
+		gldDiagLog("_gldInitMesaProxy: Mesa compatibility backend active");
 	} else {
-		gldDiagLog("_gldInitMesaProxy: FAILED (mesa_gl.dll not found?)");
+		gldDiagLog("_gldInitMesaProxy: Mesa requested but unavailable; "
+		           "continuing with direct GL-to-D3D9 translation");
 	}
 }
 
@@ -623,8 +695,20 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(CreateContext)(
 {
 	int ipf;
 
-	/* Mesa init for function resolution */
 	_gldInitMesaProxy();
+
+	/* wglMakeCurrent and wglDeleteContext both hand their HGLRC straight to
+	 * Mesa when the proxy is live, so the handle they receive has to be one
+	 * Mesa issued. Creating a GLDirect context here and letting Mesa be asked
+	 * to bind it passes a small integer index where Mesa expects a pointer,
+	 * and leaves the GLDirect context that everything downstream draws
+	 * through never bound at all. Whichever renderer owns the frame has to
+	 * own the context too. */
+	if (g_mesaProxy.initialized && g_mesaProxy.wglCreateContext) {
+		HGLRC hMesaRC = g_mesaProxy.wglCreateContext(a);
+		gldDiagLog("wglCreateContext: Mesa context %p", (void *)hMesaRC);
+		return hMesaRC;
+	}
 
 	/* Create GLDirect context instead of Mesa context
 	 * GLDirect handles GL 1.0-4.6 with DX9 backend */
@@ -770,6 +854,11 @@ int APIENTRY _GLD_WGL_EXPORT(DescribePixelFormat)(
 
 HGLRC APIENTRY _GLD_WGL_EXPORT(GetCurrentContext)(void)
 {
+	_gldInitMesaProxy();
+
+	if (g_mesaProxy.initialized && g_mesaProxy.wglGetCurrentContext)
+		return g_mesaProxy.wglGetCurrentContext();
+
 	// Validate license
 	if (!gldValidate())
 		return 0;
@@ -781,6 +870,11 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(GetCurrentContext)(void)
 
 HDC APIENTRY _GLD_WGL_EXPORT(GetCurrentDC)(void)
 {
+	_gldInitMesaProxy();
+
+	if (g_mesaProxy.initialized && g_mesaProxy.wglGetCurrentDC)
+		return g_mesaProxy.wglGetCurrentDC();
+
 	// Validate license
 	if (!gldValidate())
 		return 0;
@@ -847,6 +941,16 @@ PROC APIENTRY _GLD_WGL_EXPORT(GetProcAddress)(
 
 	/* Full Mesa init on first WGL call */
 	_gldInitMesaProxy();
+
+	/* Mesa owns both the context and every procedure resolved for it. Returning
+	 * a GLDirect thunk here would cross state machines. Unknown names follow
+	 * the WGL contract and return NULL. */
+	if (g_mesaProxy.initialized) {
+		result = mesaProxyGetProcAddress(a);
+		gldDiagLog("wglGetProcAddress: \"%s\" -> %s (Mesa backend)",
+		           a, result ? "Mesa" : "NULL");
+		return result;
+	}
 
 	/* WGL functions should come from GL46 driver, not Mesa */
 	if (g_mesaProxy.initialized && (strncmp(a, "wgl", 3) == 0)) {
@@ -984,12 +1088,6 @@ PROC APIENTRY _GLD_WGL_EXPORT(GetProcAddress)(
 		return NULL;
 
 	result = _gldDriver.wglGetProcAddress(a);
-	if (!result) {
-		extern PROC gldGetProcAddress_GL46(LPCSTR a);
-		PROC fallback = gldGetProcAddress_GL46(a);
-		gldDiagLog("wglGetProcAddress: \"%s\" -> driver returned NULL, using typed no-op", a ? a : "(null)");
-		return fallback;
-	}
 	gldDiagLog("wglGetProcAddress: \"%s\" -> %s", a ? a : "(null)", result ? "found" : "NULL");
 	return result;
 }
@@ -1183,6 +1281,10 @@ BOOL APIENTRY _GLD_WGL_EXPORT(ShareLists)(
 	HGLRC a,
 	HGLRC b)
 {
+	_gldInitMesaProxy();
+	if (g_mesaProxy.initialized && g_mesaProxy.wglShareLists)
+		return g_mesaProxy.wglShareLists(a, b);
+
 	return FALSE;
 }
 #endif
@@ -1205,76 +1307,68 @@ BOOL APIENTRY _GLD_WGL_EXPORT(SwapBuffers)(
 			gldInitContext46();
 			_gldEnsureDevice(hWnd);
 			pDev = gldGetD3DDevice46();
-			/* Initialize the GL→D3D9 compatibility bridge */
-			if (pDev) {
-				gldCompatInit(pDev);
-			}
+		}
+		if (!pDev || !hWnd) {
+			gldDiagLog("SwapBuffers (Mesa): D3D9 presentation unavailable; "
+			           "keeping Mesa's native presentation");
 		}
 
 		/* Mesa renders and presents the frame via GDI */
 		result = g_mesaProxy.wglSwapBuffers(a);
 
-		/* Mirror the rendered frame to D3D9 for d3d9.dll wrapper compatibility.
-		 * When Remix is detected, draw a fullscreen textured quad so Remix
-		 * can see the rendered content as a D3D9 surface with stable hash.
-		 * For other wrappers, just signal the frame boundary. */
+		/* Present the rendered frame through D3D9. Mesa owns GL execution; the
+		 * D3D9 device owns the final window presentation in this backend. */
 		if (pDev && hWnd) {
 			RECT rc;
 			GetClientRect(hWnd, &rc);
 			int w = rc.right;
 			int h = rc.bottom;
 
-			if (w > 0 && h > 0 && gldIsRemixDetected()) {
-				/* Remix mode: read Mesa's framebuffer and draw as D3D9 textured quad.
-				 * This gives Remix a surface to hash and track. */
-				static IDirect3DTexture9 *s_pFBTex = NULL;
-				static int s_fbW = 0, s_fbH = 0;
+			if (w > 0 && h > 0) {
+				/* Read Mesa's framebuffer and draw it as a D3D9 textured quad. */
 				HRESULT hr;
 
 				/* Recreate texture if size changed */
-				if (s_pFBTex && (s_fbW != w || s_fbH != h)) {
-					IDirect3DTexture9_Release(s_pFBTex);
-					s_pFBTex = NULL;
+				if (g_mesaPresenterTexture &&
+				    (g_mesaPresenterWidth != w || g_mesaPresenterHeight != h)) {
+					gldShutdownMesaPresenter();
 				}
-				if (!s_pFBTex) {
+				if (!g_mesaPresenterTexture) {
 					hr = IDirect3DDevice9_CreateTexture(pDev, w, h, 1,
-						D3DUSAGE_DYNAMIC, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT,
-						&s_pFBTex, NULL);
-					if (SUCCEEDED(hr)) { s_fbW = w; s_fbH = h; }
+						0, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT,
+						&g_mesaPresenterTexture, NULL);
+					if (SUCCEEDED(hr)) {
+						g_mesaPresenterWidth = w;
+						g_mesaPresenterHeight = h;
+					}
 				}
 
-				if (s_pFBTex) {
+				if (g_mesaPresenterTexture) {
 					/* Read Mesa's framebuffer via GDI (window DC) into the D3D9 texture */
 					IDirect3DSurface9 *pTexSurf = NULL;
-					hr = IDirect3DTexture9_GetSurfaceLevel(s_pFBTex, 0, &pTexSurf);
+					hr = IDirect3DTexture9_GetSurfaceLevel(g_mesaPresenterTexture, 0, &pTexSurf);
 					if (SUCCEEDED(hr) && pTexSurf) {
 						/* Use a sysmem staging surface for the GDI BitBlt */
-						static IDirect3DSurface9 *s_pStaging = NULL;
-						static int s_stW = 0, s_stH = 0;
-						if (s_pStaging && (s_stW != w || s_stH != h)) {
-							IDirect3DSurface9_Release(s_pStaging);
-							s_pStaging = NULL;
-						}
-						if (!s_pStaging) {
+						if (!g_mesaPresenterStaging) {
 							hr = IDirect3DDevice9_CreateOffscreenPlainSurface(pDev,
-								w, h, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &s_pStaging, NULL);
-							if (SUCCEEDED(hr)) { s_stW = w; s_stH = h; }
+								w, h, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM,
+								&g_mesaPresenterStaging, NULL);
 						}
-						if (s_pStaging) {
+						if (g_mesaPresenterStaging) {
 							HDC hSurfDC = NULL;
-							hr = IDirect3DSurface9_GetDC(s_pStaging, &hSurfDC);
+							hr = IDirect3DSurface9_GetDC(g_mesaPresenterStaging, &hSurfDC);
 							if (SUCCEEDED(hr) && hSurfDC) {
 								HDC hWndDC = GetDC(hWnd);
 								if (hWndDC) {
 									BitBlt(hSurfDC, 0, 0, w, h, hWndDC, 0, 0, SRCCOPY);
 									ReleaseDC(hWnd, hWndDC);
 								}
-								IDirect3DSurface9_ReleaseDC(s_pStaging, hSurfDC);
+								IDirect3DSurface9_ReleaseDC(g_mesaPresenterStaging, hSurfDC);
 								/* Upload staging → texture */
 								{
 									POINT pt = {0, 0};
 									RECT srcR = {0, 0, w, h};
-									IDirect3DDevice9_UpdateSurface(pDev, s_pStaging, &srcR, pTexSurf, &pt);
+									IDirect3DDevice9_UpdateSurface(pDev, g_mesaPresenterStaging, &srcR, pTexSurf, &pt);
 								}
 							}
 						}
@@ -1290,28 +1384,38 @@ BOOL APIENTRY _GLD_WGL_EXPORT(SwapBuffers)(
 							{ (float)w,  (float)h,  0.0f, 1.0f, 1.0f, 1.0f },
 							{ 0.0f,      (float)h,  0.0f, 1.0f, 0.0f, 1.0f }
 						};
-						IDirect3DDevice9_SetTexture(pDev, 0, (IDirect3DBaseTexture9*)s_pFBTex);
-						IDirect3DDevice9_SetTextureStageState(pDev, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-						IDirect3DDevice9_SetTextureStageState(pDev, 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-						IDirect3DDevice9_SetTextureStageState(pDev, 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-						IDirect3DDevice9_SetTextureStageState(pDev, 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-						IDirect3DDevice9_SetTextureStageState(pDev, 1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-						IDirect3DDevice9_SetTextureStageState(pDev, 1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-						IDirect3DDevice9_SetSamplerState(pDev, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-						IDirect3DDevice9_SetSamplerState(pDev, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-						IDirect3DDevice9_SetRenderState(pDev, D3DRS_LIGHTING, FALSE);
-						IDirect3DDevice9_SetRenderState(pDev, D3DRS_ZENABLE, FALSE);
-						IDirect3DDevice9_SetRenderState(pDev, D3DRS_ALPHABLENDENABLE, FALSE);
-						IDirect3DDevice9_SetVertexShader(pDev, NULL);
-						IDirect3DDevice9_SetPixelShader(pDev, NULL);
-						IDirect3DDevice9_SetFVF(pDev, D3DFVF_XYZRHW | D3DFVF_TEX1);
-						IDirect3DDevice9_DrawPrimitiveUP(pDev, D3DPT_TRIANGLEFAN, 2, quad, sizeof(FBVertex));
-						IDirect3DDevice9_SetTexture(pDev, 0, NULL);
+						if (SUCCEEDED(IDirect3DDevice9_BeginScene(pDev))) {
+							IDirect3DDevice9_SetTexture(pDev, 0, (IDirect3DBaseTexture9*)g_mesaPresenterTexture);
+							IDirect3DDevice9_SetTextureStageState(pDev, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+							IDirect3DDevice9_SetTextureStageState(pDev, 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+							IDirect3DDevice9_SetTextureStageState(pDev, 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+							IDirect3DDevice9_SetTextureStageState(pDev, 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+							IDirect3DDevice9_SetTextureStageState(pDev, 1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+							IDirect3DDevice9_SetTextureStageState(pDev, 1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+							IDirect3DDevice9_SetSamplerState(pDev, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+							IDirect3DDevice9_SetSamplerState(pDev, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+							IDirect3DDevice9_SetRenderState(pDev, D3DRS_LIGHTING, FALSE);
+							IDirect3DDevice9_SetRenderState(pDev, D3DRS_ZENABLE, FALSE);
+							IDirect3DDevice9_SetRenderState(pDev, D3DRS_ALPHABLENDENABLE, FALSE);
+							IDirect3DDevice9_SetVertexShader(pDev, NULL);
+							IDirect3DDevice9_SetPixelShader(pDev, NULL);
+							IDirect3DDevice9_SetFVF(pDev, D3DFVF_XYZRHW | D3DFVF_TEX1);
+							IDirect3DDevice9_DrawPrimitiveUP(pDev, D3DPT_TRIANGLEFAN, 2, quad, sizeof(FBVertex));
+							IDirect3DDevice9_SetTexture(pDev, 0, NULL);
+							IDirect3DDevice9_EndScene(pDev);
+						}
 					}
 				}
 			}
 
-			gldCompatSwapBuffers();
+			{
+				HRESULT presentResult =
+					IDirect3DDevice9_Present(pDev, NULL, NULL, NULL, NULL);
+				if (FAILED(presentResult)) {
+					gldDiagLog("SwapBuffers (Mesa): D3D9 Present failed (0x%08lX)",
+					           (unsigned long)presentResult);
+				}
+			}
 		}
 
 		return result;

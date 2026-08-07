@@ -1,0 +1,30 @@
+glmap.json - provenance
+=======================
+
+Source:     Khronos OpenGL-Registry gl.xml (https://github.com/KhronosGroup/OpenGL-Registry)
+Coverage:   OpenGL 1.0 - 4.6, core commands plus the extension aliases that were
+            promoted into core.
+Generated:  2026-08-02
+Frozen:     yes.  This is a committed snapshot, not a build-time download.  Keeping
+            it current against a newer registry is a manual re-run of
+            gen_gl_stubs.py against a newer glmap.json, not an automated pipeline.
+
+Shape
+-----
+  core           { "glName": { "version", "ret", "params" [C declarations], "arity" } }
+  alias_to_core  { "glNameEXT": "glName" }  extension spelling -> core spelling
+  missing_core   [ "glName", ... ]   core names the wrapper did not resolve (487)
+  missing_alias  [ "glNameEXT", ... ] alias names the wrapper did not resolve (335)
+  resolvable     [ "glName", ... ]   names already reachable via opengl32.def or
+                                     src/gl46/gl_modern_stubs.h
+
+Why it is here
+--------------
+gldGetProcAddress_GL46 used to hand unknown names a no-op picked by guessing the
+argument count from the name (_glsGuessArgCount).  A wrong guess corrupts the
+stack on x86, where __stdcall makes the callee pop the arguments.  params[] here
+is the ground truth that lets gen_gl_stubs.py emit an exactly-typed forwarding
+stub for every one of the 822 unresolved names instead.
+
+  python tools/gen_gl_stubs.py        # rewrites src/gl46/gl_generated_stubs.h
+  python tools/check_gl_coverage.py   # asserts all 822 names are accounted for

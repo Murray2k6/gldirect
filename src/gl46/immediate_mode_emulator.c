@@ -752,39 +752,3 @@ void gldImTranslatef(float x, float y, float z)
 
     gldImMultMatrixf(trans);
 }
-
-/* ===================================================================
- * Legacy lighting/material stubs (Task 17.2)
- * =================================================================== */
-
-void gldImLightfv(GLenum light, GLenum pname, const float *params)
-{
-    /*
-     * Stub: forward light parameters to the Fixed_Function_Emulator.
-     * The fixed-function emulator maintains its own light state arrays.
-     * For now, log the call for debugging purposes.
-     */
-    (void)light;
-    (void)pname;
-    (void)params;
-
-    gldLogPrintf(GLDLOG_DEBUG,
-        "gldImLightfv: light=0x%04X pname=0x%04X (stub — forwarded to FF emulator)",
-        (unsigned)light, (unsigned)pname);
-}
-
-void gldImMaterialfv(GLenum face, GLenum pname, const float *params)
-{
-    /*
-     * Stub: forward material parameters to the Fixed_Function_Emulator.
-     * The fixed-function emulator maintains material state as uniforms.
-     * For now, log the call for debugging purposes.
-     */
-    (void)face;
-    (void)pname;
-    (void)params;
-
-    gldLogPrintf(GLDLOG_DEBUG,
-        "gldImMaterialfv: face=0x%04X pname=0x%04X (stub — forwarded to FF emulator)",
-        (unsigned)face, (unsigned)pname);
-}

@@ -36,6 +36,12 @@
 
 #include "glsl_to_hlsl.h"
 #include "../gld_log.h"
+/* Shader compilation diagnostics go to the diagnostic log as well as the
+ * normal one. gldirect.log is buffered, so when a game stops responding after
+ * a failed compile - which is exactly what an engine does when it cannot load
+ * its shaders - the process is killed with the explanation still sitting in
+ * an unflushed buffer. gldDiagLog flushes every line, so the reason survives. */
+#include "../gld_diag.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +59,27 @@
 
 #define GLSL_SHADER_VERTEX      0
 #define GLSL_SHADER_PIXEL       1
+
+/* Longest profile ladder any device tier produces (2_a/2_b + 2_0 + slack). */
+#define GLSL_MAX_LADDER         4
+
+/* Samplers a single shader may have texelFetch/textureSize lowered against.
+ * Matches GLSL_MAX_SAMPLERS — a shader cannot reference more samplers than
+ * D3D9 has stages to bind them to. */
+#define GLSL_MAX_TEXDIM         GLSL_MAX_SAMPLERS
+
+/* Object-like "#define NAME <integer>" lines kept from one shader.  Only ever
+ * consulted to give an array uniform its extent, so a modest table is enough:
+ * a shader that declares more than this many integer constants is not going to
+ * have used the ones past the cap to size an array. */
+#define GLSL_MAX_DEFINES        64
+
+/* glslVarDecl::arraySize when a declaration *is* an array but its extent could
+ * not be worked out.  Distinct from 0 ("not an array"), because emitting a
+ * scalar for an array is a silent miscompile: HLSL accepts foo[0..3] against a
+ * scalar float4 foo as a component swizzle, so the shader compiles and then
+ * reads the wrong values.  Transpilation stops instead. */
+#define GLSL_ARRAY_UNRESOLVED   (-1)
 
 /*
  * ID3DBlob COM interface — minimal definition for accessing
@@ -85,8 +112,34 @@ typedef struct {
     char    type[GLSL_MAX_TYPE_LEN];
     char    name[GLSL_MAX_NAME_LEN];
     int     location;
+    int     arraySize;      /* 0 when the declaration is not an array,
+                             * GLSL_ARRAY_UNRESOLVED when it is one whose
+                             * extent could not be resolved */
     BOOL    isFlat;
 } glslVarDecl;
+
+/* Fragment shader outputs need their own statement-level reflection.  The
+ * general declaration parser predates GLSL 1.30 and deliberately consumes
+ * one declaration per source line.  Modern generators commonly emit an input
+ * and a layout-qualified output on the same line, so using that parser alone
+ * loses the output name and leaves assignments to an undeclared HLSL symbol. */
+typedef struct {
+    char    name[GLSL_MAX_NAME_LEN];
+    int     location;
+} glslFragOutput;
+
+/*
+ * One object-like "#define NAME <integer>" collected from the GLSL source.
+ *
+ * Kept for exactly one purpose: resolving "uniform vec4 bones[MAX_BONES];" to
+ * its real extent.  Defines used anywhere else in the shader are not resolved
+ * here — #define lines never survive into the emitted HLSL at all, which is a
+ * separate and wider gap than this table is meant to close.
+ */
+typedef struct {
+    char    name[GLSL_MAX_NAME_LEN];
+    int     value;
+} glslDefine;
 
 /*
  * Type replacement table entry.
@@ -96,11 +149,28 @@ typedef struct {
     const char *hlsl;
 } glslTypeMap;
 
+/*
+ * Samplers whose texelFetch/textureSize calls were lowered onto tex2Dlod, and
+ * which therefore need a synthesized _glsl_texdim_<name> uniform carrying
+ * (width, height, 1/width, 1/height).  Collected while the function rewrites
+ * run and consumed when the HLSL globals are emitted.
+ */
+typedef struct {
+    char    names[GLSL_MAX_TEXDIM][GLSL_MAX_NAME_LEN];
+    int     count;
+} glslTexDimSet;
+
 /*---------------------- Module-level state ----------------------*/
 
 static HMODULE          s_hD3DCompiler  = NULL;
 static PFN_D3DCompile   s_pfnD3DCompile = NULL;
 static BOOL             s_bInitialized  = FALSE;
+
+/* Live device shader-model ceiling, pushed in by glslSetDeviceCaps.
+ * Invalid means "assume vs_3_0/ps_3_0", the behaviour that predates the
+ * caps being consulted at all. */
+static D3DCAPS9         s_deviceCaps;
+static BOOL             s_bDeviceCapsValid = FALSE;
 
 /*---------------------- Type replacement table ----------------------*/
 
@@ -123,13 +193,29 @@ static const glslTypeMap s_typeReplacements[] = {
     { "mat2x2",     "float2x2"  },
     { "mat3x3",     "float3x3"  },
     { "mat4x4",     "float4x4"  },
-    { "mat2x3",     "float2x3"  },
-    { "mat2x4",     "float2x4"  },
-    { "mat3x2",     "float3x2"  },
-    { "mat3x4",     "float3x4"  },
-    { "mat4x2",     "float4x2"  },
-    { "mat4x3",     "float4x3"  },
+    /* The two languages name a non-square matrix by opposite axes: GLSL's
+     * matCxR is C columns of R rows, HLSL's floatRxC is R rows of C columns.
+     * So the same matrix is mat2x3 in GLSL and float3x2 in HLSL, and mapping
+     * mat2x3 onto float2x3 would hand the compiler the transpose — which is
+     * why "vec3 * uniform mat2x3" arrived as an operand-size error rather than
+     * merely as the missing-mul() error it really was.  Square types are
+     * unaffected; the pair only differs when C != R. */
+    { "mat2x3",     "float3x2"  },
+    { "mat2x4",     "float4x2"  },
+    { "mat3x2",     "float2x3"  },
+    { "mat3x4",     "float4x3"  },
+    { "mat4x2",     "float2x4"  },
+    { "mat4x3",     "float3x4"  },
     { "samplerCube","samplerCUBE"},
+    /* GLSL 1.30's integer samplers describe how the *application* interprets
+     * what it sampled; SM3 has one untyped sampler and no return-type
+     * distinction, so both collapse onto it.  Whether the integers come back
+     * intact is decided entirely by the D3D9 format the (untouched) texture
+     * upload path chose for the GL internal format — D3D9 has no true integer
+     * texture formats, so a wide integer format such as GL_R32UI has no
+     * correct representation at all and is not claimed to work here. */
+    { "usampler2D", "sampler"   },
+    { "isampler2D", "sampler"   },
     { NULL, NULL }
 };
 
@@ -145,26 +231,52 @@ static int  glslFindMatchingParen(const char *text, int startPos);
 static void glslStripVersionLines(char *src);
 static void glslStripPrecisionQualifiers(char *src);
 static void glslStripLayoutQualifiers(char *src, glslVarDecl *vars, int *pVarCount);
+static void glslRewriteVectorSplats(char *text, int textSize);
+static void glslRewriteMatrixDiagonal(char *text, int textSize,
+                                      const char (*matNames)[GLSL_MAX_NAME_LEN],
+                                      int matCount);
+static void glslRewriteMatrixProducts(char *text, int textSize,
+                                      const char (*matNames)[GLSL_MAX_NAME_LEN],
+                                      int matCount);
+static int  glslCollectMatrixSymbols(const char *src,
+                                     char (*out)[GLSL_MAX_NAME_LEN], int maxOut);
 static void glslApplyTypeReplacements(char *text);
-static void glslApplyFunctionReplacements(char *text);
-static void glslApplyTextureLodRewrite(char *text);
+static void glslApplyFunctionReplacements(char *text, glslTexDimSet *texDim,
+                                           const glslVarDecl *uniforms,
+                                           int uniformCount);
+static void glslApplyTextureLodRewrite(char *text,
+                                       const glslVarDecl *uniforms,
+                                       int uniformCount);
+static void glslApplyTexelFetchRewrite(char *text, glslTexDimSet *texDim);
+static void glslApplyTextureSizeRewrite(char *text, glslTexDimSet *texDim);
+static void glslDetectUnlowerableConstructs(const char *src);
 static void glslReplaceBuiltinVars(char *text, int shaderType);
 static const char *glslConvertType(const char *glslType);
 static int  glslParseDeclarations(const char *src, int shaderType,
                                   glslVarDecl *attributes, int *pAttrCount,
                                   glslVarDecl *varyings, int *pVaryCount,
-                                  glslVarDecl *uniforms, int *pUnifCount);
+                                  glslVarDecl *uniforms, int *pUnifCount,
+                                  const glslDefine *defines, int defineCount,
+                                  BOOL *pUnresolvedArray);
+static int  glslCollectDefines(const char *src, glslDefine *out, int maxOut);
+static void glslRenameReservedWords(char *text);
+static const char *glslReservedWordRenameOf(const char *name);
+static BOOL glslNameCollidesWithBuiltin(const char *name);
 static void glslExtractMainBody(const char *src, char *body, int bodySize);
 static void glslRemoveDeclarationLines(char *src);
+static int  glslCollectFragmentOutputs(const char *src,
+                                       glslFragOutput *outputs, int maxOutputs);
 static void glslBuildVertexShader(const glslVarDecl *attrs, int attrCount,
                                   const glslVarDecl *varyings, int varyCount,
                                   const glslVarDecl *uniforms, int unifCount,
-                                  const char *mainBody, char *hlslOut, int hlslBufSize);
+                                  const char *mainBody, char *hlslOut, int hlslBufSize,
+                                  const glslTexDimSet *texDim);
 static void glslBuildPixelShader(const glslVarDecl *varyings, int varyCount,
                                  const glslVarDecl *uniforms, int unifCount,
                                  const char *mainBody, char *hlslOut, int hlslBufSize,
                                  BOOL usesFragData, int maxFragData,
-                                 BOOL usesFragCoord, BOOL usesFrontFacing);
+                                 BOOL usesFragCoord, BOOL usesFrontFacing,
+                                 const glslTexDimSet *texDim);
 
 
 /**********************************************************************/
@@ -206,6 +318,102 @@ void glslTranspilerShutdown(void)
     s_bInitialized = FALSE;
 }
 
+void glslSetDeviceCaps(const D3DCAPS9 *pCaps)
+{
+    if (pCaps) {
+        memcpy(&s_deviceCaps, pCaps, sizeof(s_deviceCaps));
+        s_bDeviceCapsValid = TRUE;
+    } else {
+        memset(&s_deviceCaps, 0, sizeof(s_deviceCaps));
+        s_bDeviceCapsValid = FALSE;
+    }
+}
+
+/**********************************************************************/
+/*****            Compile-profile ladder                          *****/
+/**********************************************************************/
+
+/*
+ * The device's reported shader version is a hard ceiling, not a hint:
+ * CreateVertexShader/CreatePixelShader reject bytecode above it outright.  So
+ * the ladder starts at the highest profile the device admits to and only ever
+ * descends from there.
+ *
+ * There is no point putting lower rungs under a 3.0 ceiling.  Recompiling the
+ * same generated HLSL at a lower profile helps only when the ceiling itself is
+ * the problem: HLSL's language rules do not change between profiles, so a
+ * translation defect produces the identical error at every rung and the retries
+ * are pure cost.  What changes across profiles is the instruction/register
+ * budget, and that only bites once the ceiling is already below 3.0.
+ *
+ * The 2_a / 2_b sub-tiers are detected best-effort from the documented
+ * capability bits.  The exact thresholds D3DX9's D3DXGetPixelShaderProfile used
+ * are not in the public d3d9caps.h and D3DX9 is not in this tree, so the
+ * detection is deliberately biased to under-detect: an unrecognised 2_x device
+ * falls back to plain 2_0, which every 2_x device can run.
+ *
+ * Returns the number of rungs written.  Zero means the device cannot run
+ * anything this compiler can emit.
+ */
+static int glslBuildVSLadder(const D3DCAPS9 *caps, const char **ladder, int maxRungs)
+{
+    int n = 0;
+
+    if (maxRungs <= 0)
+        return 0;
+
+    /* No caps known — assume the ceiling this transpiler always assumed. */
+    if (!caps) {
+        ladder[n++] = "vs_3_0";
+        return n;
+    }
+
+    if (caps->VertexShaderVersion >= D3DVS_VERSION(3, 0)) {
+        ladder[n++] = "vs_3_0";
+    } else if (caps->VertexShaderVersion >= D3DVS_VERSION(2, 0)) {
+        if ((caps->VS20Caps.Caps & D3DVS20CAPS_PREDICATION) && n < maxRungs)
+            ladder[n++] = "vs_2_a";
+        if (n < maxRungs) ladder[n++] = "vs_2_0";
+    } else if (caps->VertexShaderVersion >= D3DVS_VERSION(1, 1)) {
+        ladder[n++] = "vs_1_1";
+    }
+    /* Below vs_1_1 there is no programmable vertex pipeline at all. */
+
+    return n;
+}
+
+static int glslBuildPSLadder(const D3DCAPS9 *caps, const char **ladder, int maxRungs)
+{
+    int n = 0;
+
+    if (maxRungs <= 0)
+        return 0;
+
+    if (!caps) {
+        ladder[n++] = "ps_3_0";
+        return n;
+    }
+
+    if (caps->PixelShaderVersion >= D3DPS_VERSION(3, 0)) {
+        ladder[n++] = "ps_3_0";
+    } else if (caps->PixelShaderVersion >= D3DPS_VERSION(2, 0)) {
+        if ((caps->PS20Caps.Caps & D3DPS20CAPS_ARBITRARYSWIZZLE) &&
+            (caps->PS20Caps.Caps & D3DPS20CAPS_GRADIENTINSTRUCTIONS)) {
+            if (n < maxRungs) ladder[n++] = "ps_2_a";
+        } else if (caps->PS20Caps.Caps & D3DPS20CAPS_NOTEXINSTRUCTIONLIMIT) {
+            if (n < maxRungs) ladder[n++] = "ps_2_b";
+        }
+        if (n < maxRungs) ladder[n++] = "ps_2_0";
+    }
+    /* ps_1_1 through ps_1_4 are deliberately never appended.  d3dcompiler_47
+     * refuses all four unconditionally — "error X3539: ps_1_x is no longer
+     * supported", hr = E_NOTIMPL — no matter what the shader contains, so a
+     * rung for them would only ever produce a confusing failure instead of the
+     * accurate "this device is below what we can target" message. */
+
+    return n;
+}
+
 /**********************************************************************/
 /*****            Public API: Transpile and Compile               *****/
 /**********************************************************************/
@@ -216,8 +424,11 @@ BOOL glslTranspileAndCompile(int shaderType, const char *glslSource,
     char *hlslSource = NULL;
     ID3DBlob *pCode = NULL;
     ID3DBlob *pErrors = NULL;
-    const char *profile;
-    HRESULT hr;
+    const char *profile = NULL;
+    const char *ladder[GLSL_MAX_LADDER];
+    const D3DCAPS9 *caps;
+    int rungCount, rung;
+    HRESULT hr = E_FAIL;
     void *bytecodeData;
     SIZE_T bytecodeLen;
 
@@ -244,33 +455,140 @@ BOOL glslTranspileAndCompile(int shaderType, const char *glslSource,
         return FALSE;
     }
 
+    /* Name anything in the GLSL that has no SM3 lowering at all before the
+     * compiler gets a chance to report it as a syntax error two rewrites
+     * downstream.  Purely a diagnostic: transpilation and compilation then
+     * proceed exactly as they would have. */
+    glslDetectUnlowerableConstructs(glslSource);
     if (!glslDoTranspile(shaderType, glslSource, hlslSource, HLSL_MAX_OUTPUT)) {
+        gldDiagLog("GLSL->HLSL: transpilation failed before the compiler was reached "
+                   "(%s stage)", shaderType == 0 ? "vertex" : "fragment");
         gldLogPrintf(GLDLOG_ERROR, "glslTranspileAndCompile: GLSL to HLSL transpilation failed\n");
         free(hlslSource);
         return FALSE;
     }
+    caps = s_bDeviceCapsValid ? &s_deviceCaps : NULL;
+    rungCount = (shaderType == GLSL_SHADER_VERTEX)
+              ? glslBuildVSLadder(caps, ladder, GLSL_MAX_LADDER)
+              : glslBuildPSLadder(caps, ladder, GLSL_MAX_LADDER);
 
-    gldLogPrintf(GLDLOG_DEBUG, "glslTranspileAndCompile: Transpiled HLSL:\n%s\n", hlslSource);
+    if (rungCount == 0) {
+        /* Calling D3DCompile here would be pointless: whatever it produced
+         * could not be turned into a shader object on this device.  Say so
+         * once, precisely, instead of dumping a compiler transcript that
+         * describes the wrong problem. */
+        gldDiagLog("D3DCompile skipped: device reports %s 0x%08X, below the "
+                   "lowest profile this compiler can target (%s). No %s bytecode "
+                   "this device could load can be produced.",
+                   shaderType == GLSL_SHADER_VERTEX ? "VertexShaderVersion" : "PixelShaderVersion",
+                   (unsigned)(shaderType == GLSL_SHADER_VERTEX
+                              ? (caps ? caps->VertexShaderVersion : 0)
+                              : (caps ? caps->PixelShaderVersion : 0)),
+                   shaderType == GLSL_SHADER_VERTEX ? "vs_1_1" : "ps_2_0",
+                   shaderType == GLSL_SHADER_VERTEX ? "vertex shader" : "pixel shader");
+        gldLogPrintf(GLDLOG_ERROR, "glslTranspileAndCompile: device shader model is below "
+                     "the lowest profile D3DCompile can target\n");
+        free(hlslSource);
+        return FALSE;
+    }
 
-    profile = (shaderType == GLSL_SHADER_VERTEX) ? "vs_3_0" : "ps_3_0";
+    /* Highest supported profile first, descending.  Every rung is within the
+     * device's ceiling, so a rung that compiles produces bytecode the device
+     * can actually load. */
+    for (rung = 0; rung < rungCount; rung++) {
+        profile = ladder[rung];
+        pCode   = NULL;
+        pErrors = NULL;
 
-    hr = s_pfnD3DCompile(
-        hlslSource, strlen(hlslSource),
-        NULL, NULL, NULL,
-        "main",
-        profile,
-        0, 0,
-        &pCode, &pErrors);
+        hr = s_pfnD3DCompile(
+            hlslSource, strlen(hlslSource),
+            NULL, NULL, NULL,
+            "main",
+            profile,
+            0, 0,
+            &pCode, &pErrors);
+        if (SUCCEEDED(hr)) {
+            /* A compiled rung still has to clear the ceiling in bytecode, not
+             * just in name.  d3dcompiler_47 stamps vs_2_a/ps_2_a output with a
+             * 2.1 version token, and a device reporting a 2.0 ceiling refuses
+             * that at CreateVertexShader/CreatePixelShader time — the very
+             * rejection this ladder exists to avoid.  So an overshooting rung
+             * counts as a failed rung whenever there is a lower one to fall
+             * to; on the last rung it is kept, since something the device may
+             * refuse still beats nothing at all. */
+            DWORD ceiling, token;
+
+            if (!caps || rung + 1 >= rungCount || !pCode ||
+                pCode->lpVtbl->GetBufferSize(pCode) < sizeof(DWORD))
+                break;
+
+            ceiling = (shaderType == GLSL_SHADER_VERTEX)
+                    ? caps->VertexShaderVersion : caps->PixelShaderVersion;
+            token   = *(const DWORD *)pCode->lpVtbl->GetBufferPointer(pCode);
+            if (token <= ceiling)
+                break;
+
+            gldDiagLog("D3DCompile: profile=%s compiled but produced a %u.%u version "
+                       "token, above this device's %u.%u ceiling; dropping to %s",
+                       profile,
+                       (unsigned)D3DSHADER_VERSION_MAJOR(token),
+                       (unsigned)D3DSHADER_VERSION_MINOR(token),
+                       (unsigned)D3DSHADER_VERSION_MAJOR(ceiling),
+                       (unsigned)D3DSHADER_VERSION_MINOR(ceiling),
+                       ladder[rung + 1]);
+            if (pErrors) { pErrors->lpVtbl->Release(pErrors); pErrors = NULL; }
+            pCode->lpVtbl->Release(pCode);
+            pCode = NULL;
+            hr = E_FAIL;
+            continue;
+        }
+
+        if (rung + 1 >= rungCount)
+            break;      /* last rung — fall through to the full failure report */
+
+        /* Another rung left: drop this rung's diagnostics and try lower.  Only
+         * the final rung's error text is worth keeping, since it is the one
+         * that describes what the device could actually have run. */
+        if (pErrors) { pErrors->lpVtbl->Release(pErrors); pErrors = NULL; }
+        if (pCode)   { pCode->lpVtbl->Release(pCode);     pCode   = NULL; }
+        gldDiagLog("D3DCompile FAILED (0x%08X) profile=%s; retrying at the next lower "
+                   "profile this device supports (%s)", hr, profile, ladder[rung + 1]);
+    }
 
     if (FAILED(hr)) {
+        if (rungCount > 1)
+            gldDiagLog("D3DCompile: exhausted all %d profile rungs the device supports; "
+                       "the diagnostics below are from the last one (%s)",
+                       rungCount, profile);
         if (pErrors) {
             const char *errMsg = (const char *)pErrors->lpVtbl->GetBufferPointer(pErrors);
+            /* The compiler's own text says which line and construct it rejected;
+             * without it every failure looks alike and the only way forward is
+             * guesswork. Truncated because a bad translation can produce
+             * hundreds of cascading errors and the first ones are the real ones. */
+            gldDiagLog("D3DCompile FAILED (0x%08X) profile=%s:\n%.1200s",
+                       hr, profile, errMsg ? errMsg : "(no error message)");
             gldLogPrintf(GLDLOG_ERROR, "glslTranspileAndCompile: D3DCompile failed (0x%08X):\n%s\n",
                          hr, errMsg ? errMsg : "(no error message)");
             pErrors->lpVtbl->Release(pErrors);
         } else {
+            gldDiagLog("D3DCompile FAILED (0x%08X) profile=%s, compiler returned no message",
+                       hr, profile);
             gldLogPrintf(GLDLOG_ERROR, "glslTranspileAndCompile: D3DCompile failed (0x%08X)\n", hr);
         }
+        /* The HLSL the compiler rejected is the other half of the picture.
+         * It has to arrive whole: the compiler names a line and column, and a
+         * truncated dump that stops short of that line turns an actionable
+         * diagnostic into a guess.  A shader that overruns even this bound is
+         * far past anything the SM3 profiles can compile anyway.  gldDiagLog
+         * vfprintf's straight to the file, so there is no intermediate buffer
+         * this width has to fit inside. */
+        gldDiagLog("D3DCompile: rejected HLSL follows ---\n%.65000s\n--- end HLSL", hlslSource);
+        /* The HLSL alone only shows the symptom.  When the fault is in the
+         * translation rather than in the shader, the input GLSL is what names
+         * the construct that was mishandled, and an application's GLSL is not
+         * recoverable from anywhere else afterwards. */
+        gldDiagLog("D3DCompile: input GLSL follows ---\n%.65000s\n--- end GLSL", glslSource);
         free(hlslSource);
         return FALSE;
     }
@@ -444,6 +762,178 @@ int glslReflectConstants(const void *bytecode, DWORD size,
 
 
 /**********************************************************************/
+/*****            Public API: Attribute reflection                *****/
+/**********************************************************************/
+
+/* GLSL type name -> the GL enum glGetActiveAttrib reports. */
+static int glslTypeNameToGLEnum(const char *type)
+{
+    if (!strcmp(type, "float")) return 0x1406;  /* GL_FLOAT       */
+    if (!strcmp(type, "vec2"))  return 0x8B50;  /* GL_FLOAT_VEC2  */
+    if (!strcmp(type, "vec3"))  return 0x8B51;  /* GL_FLOAT_VEC3  */
+    if (!strcmp(type, "vec4"))  return 0x8B52;  /* GL_FLOAT_VEC4  */
+    if (!strcmp(type, "int"))   return 0x1404;  /* GL_INT         */
+    if (!strcmp(type, "ivec2")) return 0x8B53;
+    if (!strcmp(type, "ivec3")) return 0x8B54;
+    if (!strcmp(type, "ivec4")) return 0x8B55;
+    if (!strcmp(type, "mat2"))  return 0x8B5A;  /* GL_FLOAT_MAT2  */
+    if (!strcmp(type, "mat3"))  return 0x8B5B;
+    if (!strcmp(type, "mat4"))  return 0x8B5C;
+    return 0x8B52;                              /* default vec4   */
+}
+
+int glslReflectAttributes(const char *glslSource, glslAttribInfo *out, int maxOut)
+{
+    glslVarDecl *attributes = NULL, *varyings = NULL, *uniforms = NULL;
+    int attrCount = 0, varyCount = 0, unifCount = 0;
+    int i, n = 0;
+
+    if (!glslSource || !out || maxOut <= 0) return 0;
+
+    attributes = (glslVarDecl *)malloc(sizeof(glslVarDecl) * GLSL_MAX_VARS);
+    varyings   = (glslVarDecl *)malloc(sizeof(glslVarDecl) * GLSL_MAX_VARS);
+    uniforms   = (glslVarDecl *)malloc(sizeof(glslVarDecl) * GLSL_MAX_VARS);
+    if (!attributes || !varyings || !uniforms) {
+        free(attributes); free(varyings); free(uniforms);
+        return 0;
+    }
+
+    /* Attribute reflection answers glGetActiveAttrib, which only ever reports
+     * a name, a type and an element count.  An unresolved array extent is a
+     * transpilation-stopping condition, and glslDoTranspile is where it stops;
+     * repeating the check here would only make glGetActiveAttrib fail early
+     * for a shader that is about to fail anyway, with a worse message. */
+    glslParseDeclarations(glslSource, GLSL_SHADER_VERTEX,
+                          attributes, &attrCount,
+                          varyings, &varyCount,
+                          uniforms, &unifCount,
+                          NULL, 0, NULL);
+
+    for (i = 0; i < attrCount && n < maxOut; i++) {
+        strncpy(out[n].name, attributes[i].name, GLSL_UNIFORM_NAME_LEN - 1);
+        out[n].name[GLSL_UNIFORM_NAME_LEN - 1] = '\0';
+        out[n].glType    = glslTypeNameToGLEnum(attributes[i].type);
+        out[n].arraySize = attributes[i].arraySize > 0 ? attributes[i].arraySize : 1;
+        n++;
+    }
+
+    free(attributes); free(varyings); free(uniforms);
+    return n;
+}
+
+static int glslTypeComponents(const char *type)
+{
+    const char *p;
+    if (!type) return 4;
+    if (!strncmp(type, "mat", 3)) return 4;
+    p = type + strlen(type);
+    if (p > type && p[-1] >= '2' && p[-1] <= '4') return p[-1] - '0';
+    return 1;
+}
+
+int glslReflectVaryings(const char *glslSource, int shaderType,
+                        glslVaryingInfo *out, int maxOut)
+{
+    glslVarDecl *attributes = NULL, *varyings = NULL, *uniforms = NULL;
+    int attrCount = 0, varyCount = 0, unifCount = 0;
+    int i, n = 0;
+
+    if (!glslSource || !out || maxOut <= 0) return 0;
+    attributes = (glslVarDecl *)malloc(sizeof(glslVarDecl) * GLSL_MAX_VARS);
+    varyings = (glslVarDecl *)malloc(sizeof(glslVarDecl) * GLSL_MAX_VARS);
+    uniforms = (glslVarDecl *)malloc(sizeof(glslVarDecl) * GLSL_MAX_VARS);
+    if (!attributes || !varyings || !uniforms) {
+        free(attributes); free(varyings); free(uniforms);
+        return 0;
+    }
+
+    glslParseDeclarations(glslSource,
+                          shaderType ? GLSL_SHADER_PIXEL : GLSL_SHADER_VERTEX,
+                          attributes, &attrCount, varyings, &varyCount,
+                          uniforms, &unifCount, NULL, 0, NULL);
+    for (i = 0; i < varyCount && n < maxOut; ++i) {
+        const char *type = varyings[i].type;
+        if (shaderType && !strcmp(varyings[i].qualifier, "fragout"))
+            continue;
+        strncpy(out[n].name, varyings[i].name, GLSL_UNIFORM_NAME_LEN - 1);
+        out[n].name[GLSL_UNIFORM_NAME_LEN - 1] = '\0';
+        out[n].glType = glslTypeNameToGLEnum(type);
+        out[n].components = glslTypeComponents(type);
+        out[n].location = varyings[i].location;
+        out[n].arraySize = varyings[i].arraySize > 0 ? varyings[i].arraySize : 1;
+        out[n].isFlat = varyings[i].isFlat;
+        out[n].isUnsigned = (!strncmp(type, "uvec", 4) || !strcmp(type, "uint"));
+        out[n].isInteger = out[n].isUnsigned || !strncmp(type, "ivec", 4) ||
+                           !strcmp(type, "int") || !strncmp(type, "bvec", 4) ||
+                           !strcmp(type, "bool");
+        ++n;
+    }
+    free(attributes); free(varyings); free(uniforms);
+    return n;
+}
+
+/* Constant registers one uniform of this type occupies, per element.  D3D9
+ * registers are four floats wide, so everything up to a vec4 costs one and a
+ * matrix costs one per row. */
+static int glslTypeRegisterRows(const char *type)
+{
+    if (!strncmp(type, "mat", 3)) {
+        /* matCxR is C columns of R rows in GLSL and floatRxC in HLSL, which
+         * packs one register per row - that is C registers, the first digit. */
+        if (isdigit((unsigned char)type[3]))
+            return type[3] - '0';
+        return 4;
+    }
+    return 1;
+}
+
+int glslReflectDeclaredUniforms(const char *glslSource, glslUniformMap *out, int maxOut)
+{
+    glslVarDecl *attributes = NULL, *varyings = NULL, *uniforms = NULL;
+    int attrCount = 0, varyCount = 0, unifCount = 0;
+    int i, n = 0;
+
+    if (!glslSource || !out || maxOut <= 0) return 0;
+
+    attributes = (glslVarDecl *)malloc(sizeof(glslVarDecl) * GLSL_MAX_VARS);
+    varyings   = (glslVarDecl *)malloc(sizeof(glslVarDecl) * GLSL_MAX_VARS);
+    uniforms   = (glslVarDecl *)malloc(sizeof(glslVarDecl) * GLSL_MAX_VARS);
+    if (!attributes || !varyings || !uniforms) {
+        free(attributes); free(varyings); free(uniforms);
+        return 0;
+    }
+
+    /* Same reasoning as glslReflectAttributes: an unresolved array extent stops
+     * transpilation in glslDoTranspile, so it is not re-checked here. */
+    glslParseDeclarations(glslSource, GLSL_SHADER_VERTEX,
+                          attributes, &attrCount,
+                          varyings, &varyCount,
+                          uniforms, &unifCount,
+                          NULL, 0, NULL);
+
+    for (i = 0; i < unifCount && n < maxOut; i++) {
+        const char *type = uniforms[i].type;
+        int elems = uniforms[i].arraySize > 0 ? uniforms[i].arraySize : 1;
+        BOOL isSampler = (strstr(type, "sampler") != NULL);
+
+        strncpy(out[n].name, uniforms[i].name, GLSL_UNIFORM_NAME_LEN - 1);
+        out[n].name[GLSL_UNIFORM_NAME_LEN - 1] = '\0';
+        out[n].registerSet   = isSampler ? GLSL_RS_SAMPLER : GLSL_RS_FLOAT4;
+        out[n].registerCount = isSampler ? elems
+                                         : glslTypeRegisterRows(type) * elems;
+        /* -1 marks "declared, but the compiler assigned it no register".  The
+         * caller turns that into a GL location that accepts uploads and drops
+         * them, which is what an inactive uniform must do. */
+        out[n].registerIndex = -1;
+        n++;
+    }
+
+    free(attributes); free(varyings); free(uniforms);
+    return n;
+}
+
+
+/**********************************************************************/
 /*****            String Utility Helpers                          *****/
 /**********************************************************************/
 
@@ -460,6 +950,61 @@ static char *glslSkipWhitespace(const char *p)
     while (*p && (*p == ' ' || *p == '\t'))
         p++;
     return (char *)p;
+}
+
+/*
+ * glslSkipDeclQualifiers — step past anything that may sit in front of a
+ * declaration's storage qualifier.
+ *
+ * GLSL 1.30+ lets a layout block and the interpolation/auxiliary qualifiers
+ * appear in any combination ahead of attribute/varying/uniform/in/out, so
+ * "layout(location = 1) out vec2 v;" and "smooth out vec2 v;" are both
+ * ordinary declarations.  A caller that looked only at the line's first token
+ * would take neither for a declaration and drop it.
+ *
+ * The scan never crosses a newline, so it is safe on a pointer into a whole
+ * source buffer as well as on a single extracted line.  Keywords are matched
+ * on a word boundary, so an identifier that merely starts with one of them
+ * (flatten, into, outer) is left alone.  isFlat, when non-NULL, reports
+ * whether a "flat" qualifier was among them.
+ */
+static char *glslSkipDeclQualifiers(char *p, BOOL *isFlat)
+{
+    static const char *kQualifiers[] = {
+        "flat", "smooth", "noperspective", "centroid", "invariant"
+    };
+    BOOL progressed = TRUE;
+
+    p = glslSkipWhitespace(p);
+
+    while (progressed) {
+        int i;
+        progressed = FALSE;
+
+        if (strncmp(p, "layout", 6) == 0 && glslIsWordBoundary(p[6])) {
+            char *rp = p + 6;
+            while (*rp && *rp != ')' && *rp != '\n')
+                rp++;
+            if (*rp == ')') {
+                p = glslSkipWhitespace(rp + 1);
+                progressed = TRUE;
+                continue;
+            }
+        }
+
+        for (i = 0; i < (int)(sizeof(kQualifiers) / sizeof(kQualifiers[0])); i++) {
+            size_t len = strlen(kQualifiers[i]);
+            if (strncmp(p, kQualifiers[i], len) == 0 && glslIsWordBoundary(p[len])) {
+                if (isFlat && strcmp(kQualifiers[i], "flat") == 0)
+                    *isFlat = TRUE;
+                p = glslSkipWhitespace(p + len);
+                progressed = TRUE;
+                break;
+            }
+        }
+    }
+
+    return p;
 }
 
 static void glslReplaceWord(char *text, const char *oldWord, const char *newWord)
@@ -561,6 +1106,204 @@ static void glslReplaceAll(char *text, const char *oldStr, const char *newStr)
     *dst = '\0';
     strcpy(text, buf);
     free(buf);
+}
+
+/*
+ * glslReplaceWordNotCalled — glslReplaceWord, except that an occurrence which
+ * is immediately followed (past spaces and tabs) by '(' is left alone.
+ *
+ * Exists for exactly one word.  "texture" is both a perfectly ordinary GLSL
+ * identifier and, since GLSL 1.30, the name of the generic sampling builtin;
+ * only the identifier spelling collides with HLSL's reserved "texture", and
+ * only the call spelling is what glslApplyFunctionReplacements later rewrites
+ * to tex2D.  Renaming both would break sampling; renaming neither leaves the
+ * X3000 this whole pass exists to remove.
+ */
+static void glslReplaceWordNotCalled(char *text, const char *oldWord, const char *newWord)
+{
+    char *buf;
+    int textLen, oldLen, newLen, bufLen;
+    char *src, *dst, *found;
+
+    if (!text || !oldWord || !newWord)
+        return;
+    oldLen = (int)strlen(oldWord);
+    newLen = (int)strlen(newWord);
+    if (oldLen == 0)
+        return;
+
+    textLen = (int)strlen(text);
+    bufLen = textLen * 2 + 256;
+    if (bufLen > HLSL_MAX_OUTPUT)
+        bufLen = HLSL_MAX_OUTPUT;
+
+    buf = (char *)malloc(bufLen);
+    if (!buf) return;
+
+    src = text;
+    dst = buf;
+
+    while ((found = strstr(src, oldWord)) != NULL) {
+        BOOL leftOk  = (found == text) || glslIsWordBoundary(*(found - 1));
+        BOOL rightOk = glslIsWordBoundary(*(found + oldLen));
+        BOOL isCall  = FALSE;
+
+        if (leftOk && rightOk) {
+            const char *after = glslSkipWhitespace(found + oldLen);
+            isCall = (*after == '(');
+        }
+
+        if (leftOk && rightOk && !isCall) {
+            int prefixLen = (int)(found - src);
+            if (dst + prefixLen + newLen >= buf + bufLen - 1) break;
+            memcpy(dst, src, prefixLen);
+            dst += prefixLen;
+            memcpy(dst, newWord, newLen);
+            dst += newLen;
+            src = found + oldLen;
+        } else {
+            int prefixLen = (int)(found - src) + 1;
+            if (dst + prefixLen >= buf + bufLen - 1) break;
+            memcpy(dst, src, prefixLen);
+            dst += prefixLen;
+            src = found + 1;
+        }
+    }
+    {
+        int remaining = (int)strlen(src);
+        if (dst + remaining < buf + bufLen) {
+            memcpy(dst, src, remaining);
+            dst += remaining;
+        }
+    }
+    *dst = '\0';
+    strcpy(text, buf);
+    free(buf);
+}
+
+/**********************************************************************/
+/*****            Reserved-word and builtin-collision renames     *****/
+/**********************************************************************/
+
+/*
+ * Words that are legal identifiers in GLSL and reserved in HLSL.
+ *
+ * A shader is free to name a parameter "sampler", a local "matrix" or a
+ * varying "vector"; D3DCompile answers every one of them with "error X3000:
+ * syntax error: unexpected token" at the declaration and then "error X3004:
+ * undeclared identifier" at every use, which describes the *rewritten HLSL*
+ * and names nothing the shader author would recognise.  Renaming them here is
+ * safe in a way a type-aware fix would not need to be: the rename is
+ * whole-word (glslIsWordBoundary), so "sampler2D", "textureCube" and
+ * "column_majorish" are all untouched, and the renamed spelling is uniform
+ * across declarations and uses because the pass runs on the whole source
+ * before it is split into declarations, main body and helpers.
+ *
+ * The list is the set confirmed against d3dcompiler_47 to fail as bare
+ * identifiers, plus "half", which compiles as one but is a reserved type word
+ * in every HLSL reference and costs nothing to move out of the way.
+ */
+static const glslTypeMap kGlslReservedWords[] = {
+    { "sampler",      "_glsl_kw_sampler"      },
+    { "texture",      "_glsl_kw_texture"      },
+    { "matrix",       "_glsl_kw_matrix"       },
+    { "vector",       "_glsl_kw_vector"       },
+    { "half",         "_glsl_kw_half"         },
+    { "string",       "_glsl_kw_string"       },
+    { "technique",    "_glsl_kw_technique"    },
+    { "pass",         "_glsl_kw_pass"         },
+    { "compile",      "_glsl_kw_compile"      },
+    { "pixelshader",  "_glsl_kw_pixelshader"  },
+    { "vertexshader", "_glsl_kw_vertexshader" },
+    { "row_major",    "_glsl_kw_row_major"    },
+    { "column_major", "_glsl_kw_column_major" },
+    { NULL,           NULL                    }
+};
+
+static void glslRenameReservedWords(char *text)
+{
+    int i;
+
+    if (!text) return;
+
+    for (i = 0; kGlslReservedWords[i].glsl; i++) {
+        if (strcmp(kGlslReservedWords[i].glsl, "texture") == 0)
+            glslReplaceWordNotCalled(text, kGlslReservedWords[i].glsl,
+                                     kGlslReservedWords[i].hlsl);
+        else
+            glslReplaceWord(text, kGlslReservedWords[i].glsl,
+                            kGlslReservedWords[i].hlsl);
+    }
+}
+
+/* The renamed spelling of `name`, or NULL when it is not a reserved word.
+ * Lets a name collected from the *original* source be brought into the
+ * renamed spelling the rewritten body now uses. */
+static const char *glslReservedWordRenameOf(const char *name)
+{
+    int i;
+
+    if (!name) return NULL;
+
+    for (i = 0; kGlslReservedWords[i].glsl; i++)
+        if (strcmp(name, kGlslReservedWords[i].glsl) == 0)
+            return kGlslReservedWords[i].hlsl;
+    return NULL;
+}
+
+/*
+ * Names a user-defined function must not keep.
+ *
+ * Three overlapping sets, all of which end the same way if a shader defines a
+ * function of that name:
+ *
+ *   - the GLSL builtins glslApplyFunctionReplacements matches.  A user
+ *     function called "textureLod" is rewritten *at its own definition* —
+ *     glslApplyTextureLodRewrite's fallback branch fires because a definition
+ *     header does not parse as a 3-argument call — producing HLSL like
+ *     "float4 tex2Dlod( sampler2D sampler, ... )".
+ *   - the HLSL names those become.  Same outcome by a different route: the
+ *     definition survives intact and shadows the intrinsic.
+ *   - the rest of the SM1-3 intrinsic set.  D3DCompile tolerates a shadowing
+ *     definition right up until it is reachable from main() and refers to
+ *     itself, at which point it is "error X3500: recursive functions not
+ *     allowed" — so the same shader compiles or does not depending on whether
+ *     the wrapper is dead code, which is not a distinction worth relying on.
+ *
+ * Renaming is uniform: every occurrence of the name becomes _glsl_userfn_<name>
+ * in both the main body and the helpers.  A shader that expects some call
+ * sites of one name to resolve to a user overload and others to the builtin
+ * cannot be served by a whole-word rename, and is not served here.
+ */
+static const char *const kGlslCollisionNames[] = {
+    /* GLSL-side names glslApplyFunctionReplacements matches */
+    "mix", "fract", "mod", "inversesqrt", "dFdx", "dFdy",
+    "texture2D", "textureCube", "texture3D", "textureLod",
+    "texelFetch", "textureSize", "texture", "atan",
+    /* HLSL-side names they become */
+    "lerp", "frac", "fmod", "rsqrt", "ddx", "ddy",
+    "tex2D", "texCUBE", "tex3D", "tex2Dlod", "atan2",
+    /* the rest of the SM1-3 intrinsic set */
+    "abs", "acos", "asin", "ceil", "clamp", "clip", "cos", "cosh", "cross",
+    "degrees", "determinant", "distance", "dot", "exp", "exp2", "faceforward",
+    "floor", "frexp", "isnan", "isinf", "ldexp", "length", "log", "log2",
+    "max", "min", "modf", "mul", "normalize", "pow", "radians", "reflect",
+    "refract", "round", "saturate", "sign", "sin", "sincos", "smoothstep",
+    "sqrt", "step", "tan", "tanh", "tex1D", "tex2Dbias", "tex2Dgrad",
+    "tex2Dproj", "transpose", "trunc",
+    NULL
+};
+
+static BOOL glslNameCollidesWithBuiltin(const char *name)
+{
+    int i;
+
+    if (!name || !name[0]) return FALSE;
+
+    for (i = 0; kGlslCollisionNames[i]; i++)
+        if (strcmp(name, kGlslCollisionNames[i]) == 0)
+            return TRUE;
+    return FALSE;
 }
 
 static int glslFindMatchingParen(const char *text, int startPos)
@@ -668,6 +1411,58 @@ static const char *glslConvertType(const char *glslType)
     return glslType;
 }
 
+static const char *glslSamplerType(const glslVarDecl *uniforms, int uniformCount,
+                                   const char *expression)
+{
+    char name[GLSL_MAX_NAME_LEN];
+    int i, length = 0;
+
+    if (!uniforms || !expression) return NULL;
+    expression = glslSkipWhitespace(expression);
+    while ((isalnum((unsigned char)expression[length]) || expression[length] == '_') &&
+           length < GLSL_MAX_NAME_LEN - 1)
+        ++length;
+    if (!length) return NULL;
+    memcpy(name, expression, (size_t)length);
+    name[length] = '\0';
+    for (i = 0; i < uniformCount; ++i)
+        if (!strcmp(uniforms[i].name, name))
+            return uniforms[i].type;
+    return NULL;
+}
+
+static const char *glslTextureIntrinsic(const char *samplerType,
+                                        BOOL lod, BOOL bias)
+{
+    const char *base = "tex2D";
+    if (samplerType) {
+        if (strstr(samplerType, "Cube") || strstr(samplerType, "CUBE"))
+            base = "texCUBE";
+        else if (strstr(samplerType, "3D"))
+            base = "tex3D";
+        else if (strstr(samplerType, "1D"))
+            base = "tex1D";
+    }
+    if (lod) {
+        if (!strcmp(base, "texCUBE")) return "texCUBElod";
+        if (!strcmp(base, "tex3D")) return "tex3Dlod";
+        if (!strcmp(base, "tex1D")) return "tex1Dlod";
+        return "tex2Dlod";
+    }
+    if (bias) {
+        if (!strcmp(base, "texCUBE")) return "texCUBEbias";
+        if (!strcmp(base, "tex3D")) return "tex3Dbias";
+        if (!strcmp(base, "tex1D")) return "tex1Dbias";
+        return "tex2Dbias";
+    }
+    return base;
+}
+
+static BOOL glslIsSamplerType(const char *type)
+{
+    return type && strstr(type, "sampler") != NULL;
+}
+
 static void glslApplyTypeReplacements(char *text)
 {
     int i;
@@ -676,11 +1471,620 @@ static void glslApplyTypeReplacements(char *text)
     }
 }
 
+/* Number of comma-separated arguments at paren depth 1 in `args`, which must
+ * start at the constructor's '(' and end at its matching ')'. */
+static int glslConstructorArgCount(const char *args, int len)
+{
+    int depth = 0, count = 0, i;
+    BOOL sawText = FALSE;
+
+    for (i = 0; i < len; i++) {
+        char c = args[i];
+        if (c == '(' || c == '[') {
+            depth++;
+            if (depth == 1) continue;       /* the constructor's own paren */
+        } else if (c == ')' || c == ']') {
+            depth--;
+            if (depth == 0) break;
+        } else if (c == ',' && depth == 1) {
+            count++;
+            continue;
+        }
+        if (depth >= 1 && c != ' ' && c != '\t' && c != '\n' && c != '\r')
+            sawText = TRUE;
+    }
+    return sawText ? count + 1 : 0;
+}
+
 /*
- * glslApplyTextureLodRewrite — rewrite textureLod(s, uv, lod) to
- * tex2Dlod(s, float4((uv), 0, (lod))).
+ * glslRewriteVectorSplats — turn a one-argument vector constructor into a cast.
+ *
+ * GLSL lets a vector constructor take a single value: vec4(x) splats a scalar
+ * across all four components and vec3(v) truncates a wider vector.  HLSL has no
+ * such rule.  Its constructors take exactly as many components as the type has,
+ * so float4(dot(a, b)) is "error X3014: incorrect number of arguments to
+ * numeric-type constructor" — which is what every DP3/DP4/DPH/RCP/RSQ/EX2/LG2/
+ * SIN/COS/POW an ARB program lowers to was hitting, and what any hand-written
+ * GLSL that says vec4(0.0) would hit too.
+ *
+ * An HLSL cast has exactly the GLSL constructor's meaning in both cases: a
+ * scalar cast to a vector replicates, and a wider vector cast to a narrower one
+ * truncates.  So the rewrite is vecN(expr) -> ((vecN)(expr)), left in GLSL
+ * spelling so the type-replacement pass that runs next renames it to floatN.
+ *
+ * Only vector types are rewritten.  mat4(x) builds a diagonal matrix in GLSL
+ * while (float4x4)x replicates in HLSL, so matrices are deliberately left alone
+ * rather than silently mistranslated into something that compiles but is wrong.
+ *
+ * One pass only rewrites the outermost constructor on any given expression, so
+ * the whole scan repeats until it stops changing anything: a scalar PARAM
+ * literal reaching DP4 produces vec4(dot(vec4(0.5), b)), and the inner splat
+ * only becomes visible once the outer one is no longer a constructor.
  */
-static void glslApplyTextureLodRewrite(char *text)
+static void glslRewriteVectorSplats(char *text, int textSize)
+{
+    static const char *const vecTypes[] = {
+        "vec2", "vec3", "vec4",
+        "ivec2", "ivec3", "ivec4",
+        "uvec2", "uvec3", "uvec4",
+        "bvec2", "bvec3", "bvec4",
+        NULL
+    };
+    char *buf;
+    int bufLen;
+    int pass;
+
+    if (!text || textSize < 2)
+        return;
+
+    bufLen = (int)strlen(text) * 2 + 256;
+    if (bufLen > HLSL_MAX_OUTPUT)
+        bufLen = HLSL_MAX_OUTPUT;
+    buf = (char *)malloc(bufLen);
+    if (!buf)
+        return;
+
+    /* Bounded rather than "until stable" so a pathological input cannot spin
+     * here; nesting deeper than this does not occur in generated GLSL. */
+    for (pass = 0; pass < 8; pass++) {
+        const char *src = text;
+        char *dst = buf;
+        BOOL changed = FALSE;
+        int i;
+
+        while (*src) {
+            const char *name = NULL;
+            int nameLen = 0;
+            int openIdx = -1;
+            int closeIdx = -1;
+
+            if (src == text || glslIsWordBoundary(*(src - 1))) {
+                for (i = 0; vecTypes[i]; i++) {
+                    int len = (int)strlen(vecTypes[i]);
+                    if (strncmp(src, vecTypes[i], (size_t)len) != 0)
+                        continue;
+                    {
+                        const char *q = glslSkipWhitespace(src + len);
+                        if (*q == '(') {
+                            name = vecTypes[i];
+                            nameLen = len;
+                            openIdx = (int)(q - text);
+                        }
+                    }
+                    break;
+                }
+            }
+
+            if (name)
+                closeIdx = glslFindMatchingParen(text, openIdx);
+
+            if (name && closeIdx > openIdx + 1 &&
+                glslConstructorArgCount(text + openIdx, closeIdx - openIdx + 1) == 1) {
+                int innerLen = closeIdx - openIdx - 1;
+                if (dst + innerLen + nameLen + 8 >= buf + bufLen - 1)
+                    break;
+                *dst++ = '(';
+                *dst++ = '(';
+                memcpy(dst, name, (size_t)nameLen);
+                dst += nameLen;
+                *dst++ = ')';
+                *dst++ = '(';
+                memcpy(dst, text + openIdx + 1, (size_t)innerLen);
+                dst += innerLen;
+                *dst++ = ')';
+                *dst++ = ')';
+                src = text + closeIdx + 1;
+                changed = TRUE;
+                continue;
+            }
+
+            if (dst >= buf + bufLen - 1)
+                break;
+            *dst++ = *src++;
+        }
+        *dst = '\0';
+
+        if (!changed)
+            break;
+        /* A scan that ran out of room stopped part-way through the shader.
+         * Writing that back would silently truncate it into something that
+         * compiles to the wrong thing, so the original is kept instead and the
+         * compiler gets to report the real X3014 it would have reported. */
+        if (*src != '\0' || (int)(dst - buf) >= textSize)
+            break;
+        strcpy(text, buf);
+    }
+
+    free(buf);
+}
+
+/**********************************************************************/
+/*****            Matrix lowering                                 *****/
+/**********************************************************************/
+
+/*
+ * GLSL spells matrix arithmetic with the ordinary operators; HLSL spells the
+ * same arithmetic with mul() and gives '*' the component-wise meaning instead.
+ * So "uMVP * aPos" is a matrix product in one language and a component-wise
+ * multiply in the other — which is why it arrives as "error X3020: type
+ * mismatch" the moment the operand shapes stop agreeing, and would silently
+ * compute the wrong thing whenever they happen to agree.
+ *
+ * Operand order is preserved.  The matrices themselves are not transposed
+ * anywhere: GL hands over column-major data, HLSL's default constant packing is
+ * column-major, and _glsUploadMatrices copies straight through, so the HLSL
+ * matrix is the same matrix the GLSL source declared.  What differs is only
+ * how the two languages *name* a non-square shape, which the type table
+ * accounts for.
+ *
+ * Listed longest-first purely for readability; the word-boundary test is what
+ * actually stops "mat2x3" being read as "mat2".
+ */
+static const char *const kGlslMatrixTypes[] = {
+    "mat2x2", "mat2x3", "mat2x4",
+    "mat3x2", "mat3x3", "mat3x4",
+    "mat4x2", "mat4x3", "mat4x4",
+    "mat2", "mat3", "mat4",
+    NULL
+};
+
+/*
+ * glslCollectMatrixSymbols — the names this file is willing to treat as
+ * matrices.
+ *
+ * There is no type system here, so the set is whatever a "matN name" spelling
+ * appears for anywhere in the source: uniform declarations, local declarations,
+ * and function parameters all match the same pattern.  Anything reached
+ * indirectly — a struct field, a helper's return value — is simply not
+ * recognised and keeps today's untouched '*', which is a compile failure rather
+ * than a silent miscompile.
+ */
+static int glslCollectMatrixSymbols(const char *src,
+                                    char (*out)[GLSL_MAX_NAME_LEN], int maxOut)
+{
+    int count = 0;
+    const char *p;
+
+    if (!src || !out || maxOut <= 0)
+        return 0;
+
+    for (p = src; *p; ) {
+        BOOL matched = FALSE;
+        int i;
+
+        if (p == src || glslIsWordBoundary(*(p - 1))) {
+            for (i = 0; kGlslMatrixTypes[i]; i++) {
+                int len = (int)strlen(kGlslMatrixTypes[i]);
+                const char *q;
+
+                if (strncmp(p, kGlslMatrixTypes[i], (size_t)len) != 0)
+                    continue;
+                if (!glslIsWordBoundary(p[len]))
+                    break;              /* e.g. "mat2" inside "mat2x3" */
+
+                q = glslSkipWhitespace(p + len);
+                if (isalpha((unsigned char)*q) || *q == '_') {
+                    const char *nameStart = q;
+                    int nameLen;
+                    while (isalnum((unsigned char)*q) || *q == '_') q++;
+                    nameLen = (int)(q - nameStart);
+                    if (nameLen < GLSL_MAX_NAME_LEN) {
+                        int j;
+                        BOOL dup = FALSE;
+                        for (j = 0; j < count; j++)
+                            if ((int)strlen(out[j]) == nameLen &&
+                                strncmp(out[j], nameStart, (size_t)nameLen) == 0) {
+                                dup = TRUE;
+                                break;
+                            }
+                        if (!dup && count < maxOut) {
+                            memcpy(out[count], nameStart, (size_t)nameLen);
+                            out[count][nameLen] = '\0';
+                            count++;
+                        }
+                    }
+                    p = q;
+                    matched = TRUE;
+                }
+                break;
+            }
+        }
+
+        if (!matched)
+            p++;
+    }
+
+    return count;
+}
+
+/* Trim `a`/`b` to the non-whitespace span they bracket. */
+static void glslTrimSpan(const char *text, int *a, int *b)
+{
+    while (*a < *b && (text[*a] == ' ' || text[*a] == '\t' ||
+                       text[*a] == '\n' || text[*a] == '\r')) (*a)++;
+    while (*b > *a && (text[*b - 1] == ' ' || text[*b - 1] == '\t' ||
+                       text[*b - 1] == '\n' || text[*b - 1] == '\r')) (*b)--;
+}
+
+/* Does text[a,b) name something this pass is prepared to call a matrix? */
+static BOOL glslSpanIsMatrix(const char *text, int a, int b,
+                             const char (*matNames)[GLSL_MAX_NAME_LEN], int matCount)
+{
+    int len, i;
+
+    glslTrimSpan(text, &a, &b);
+    len = b - a;
+    if (len <= 0) return FALSE;
+
+    /* A mul() this same rewrite produced on an earlier pass — that is how
+     * chains like "uProj * uView * aPos" reassociate correctly. */
+    if (len > 4 && strncmp(text + a, "mul", 3) == 0 &&
+        *glslSkipWhitespace(text + a + 3) == '(')
+        return TRUE;
+
+    /* A matrix constructor.  Still in GLSL spelling: this pass deliberately
+     * runs ahead of glslApplyTypeReplacements. */
+    for (i = 0; kGlslMatrixTypes[i]; i++) {
+        int tl = (int)strlen(kGlslMatrixTypes[i]);
+        if (len > tl && strncmp(text + a, kGlslMatrixTypes[i], (size_t)tl) == 0 &&
+            glslIsWordBoundary(text[a + tl]) &&
+            *glslSkipWhitespace(text + a + tl) == '(')
+            return TRUE;
+    }
+
+    for (i = 0; i < matCount; i++)
+        if ((int)strlen(matNames[i]) == len &&
+            strncmp(text + a, matNames[i], (size_t)len) == 0)
+            return TRUE;
+
+    return FALSE;
+}
+
+/* A numeric literal, so that "M * 2.0" is left alone: scaling a matrix by a
+ * scalar is component-wise in both languages already. */
+static BOOL glslSpanIsNumericLiteral(const char *text, int a, int b)
+{
+    int i;
+
+    glslTrimSpan(text, &a, &b);
+    if (b <= a) return FALSE;
+    if (!isdigit((unsigned char)text[a]) && text[a] != '.') return FALSE;
+
+    for (i = a; i < b; i++) {
+        char c = text[i];
+        if (isxdigit((unsigned char)c) || c == '.' || c == 'x' || c == 'X' ||
+            c == 'u' || c == 'U' || c == 'l' || c == 'L' ||
+            c == '+' || c == '-')
+            continue;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/*
+ * Walk backwards from `end` over one postfix expression (identifier, call,
+ * subscript, member chain).  Returns its first index, or -1 when there is no
+ * operand there — an operator, an open bracket, a statement boundary.
+ */
+static int glslScanOperandBackward(const char *text, int end)
+{
+    int i = end - 1;
+    int start = -1;
+
+    while (i >= 0 && (text[i] == ' ' || text[i] == '\t' ||
+                      text[i] == '\n' || text[i] == '\r')) i--;
+    if (i < 0) return -1;
+
+    for (;;) {
+        if (text[i] == ')' || text[i] == ']') {
+            char close = text[i];
+            char open  = (close == ')') ? '(' : '[';
+            int depth  = 0;
+            while (i >= 0) {
+                if (text[i] == close) depth++;
+                else if (text[i] == open) { depth--; if (depth == 0) break; }
+                i--;
+            }
+            if (i < 0) return -1;
+            start = i;
+            i--;
+            /* the callee / array name in front of the bracket */
+            while (i >= 0 && (isalnum((unsigned char)text[i]) || text[i] == '_')) {
+                start = i;
+                i--;
+            }
+        } else if (isalnum((unsigned char)text[i]) || text[i] == '_' || text[i] == '.') {
+            while (i >= 0 && (isalnum((unsigned char)text[i]) ||
+                              text[i] == '_' || text[i] == '.')) {
+                start = i;
+                i--;
+            }
+        } else {
+            break;
+        }
+
+        /* a member access or a further bracket continues the same postfix chain */
+        if (i >= 0 && (text[i] == '.' || text[i] == ')' || text[i] == ']'))
+            continue;
+        break;
+    }
+
+    return start;
+}
+
+/*
+ * Walk forwards from `start` over one postfix expression, or a parenthesised
+ * sub-expression.  Returns one past its last index, or -1.  A leading unary
+ * sign is deliberately not consumed: leaving such an operand unrecognised keeps
+ * today's behaviour rather than guessing at the grouping.
+ */
+static int glslScanOperandForward(const char *text, int start)
+{
+    int i = start;
+    int first;
+
+    while (text[i] == ' ' || text[i] == '\t' ||
+           text[i] == '\n' || text[i] == '\r') i++;
+    first = i;
+    if (!text[i]) return -1;
+
+    for (;;) {
+        if (isalnum((unsigned char)text[i]) || text[i] == '_' || text[i] == '.') {
+            while (isalnum((unsigned char)text[i]) || text[i] == '_' || text[i] == '.') i++;
+        } else if (text[i] == '(' || text[i] == '[') {
+            char open  = text[i];
+            char close = (open == '(') ? ')' : ']';
+            int depth  = 0;
+            while (text[i]) {
+                if (text[i] == open) depth++;
+                else if (text[i] == close) { depth--; if (depth == 0) { i++; break; } }
+                i++;
+            }
+            if (depth != 0) return -1;
+        } else {
+            break;
+        }
+
+        if (text[i] == '(' || text[i] == '[' || text[i] == '.')
+            continue;
+        break;
+    }
+
+    return (i > first) ? i : -1;
+}
+
+/*
+ * glslRewriteMatrixProducts — turn "A * B" into "mul(A, B)" whenever either
+ * operand is a recognised matrix.
+ *
+ * Bounded multi-pass, one rewrite per pass, in the same spirit as
+ * glslRewriteVectorSplats: rewriting the leftmost product and re-scanning is
+ * what makes a chain reassociate the way GLSL's left-associative '*' does —
+ * "uProj * uView * aPos" becomes mul(uProj, uView) * aPos and then
+ * mul(mul(uProj, uView), aPos).  A pass that runs out of buffer abandons the
+ * whole rewrite rather than writing back a partial one.
+ */
+static void glslRewriteMatrixProducts(char *text, int textSize,
+                                      const char (*matNames)[GLSL_MAX_NAME_LEN],
+                                      int matCount)
+{
+    char *buf;
+    int bufLen, pass;
+
+    if (!text || !text[0] || textSize < 2)
+        return;
+    if (!strchr(text, '*'))
+        return;
+
+    bufLen = (int)strlen(text) * 2 + 256;
+    if (bufLen > HLSL_MAX_OUTPUT) bufLen = HLSL_MAX_OUTPUT;
+    buf = (char *)malloc(bufLen);
+    if (!buf) return;
+
+    for (pass = 0; pass < 16; pass++) {
+        int i;
+        BOOL rewrote = FALSE;
+
+        for (i = 0; text[i]; i++) {
+            int ls, rs, re, la, lb, ra, rb, len;
+            BOOL leftIsMatrix, rightIsMatrix;
+
+            if (text[i] != '*') continue;
+            /* '*=' , '**' and the two comment delimiters are not products */
+            if (text[i + 1] == '=' || text[i + 1] == '*' || text[i + 1] == '/') continue;
+            if (i > 0 && (text[i - 1] == '*' || text[i - 1] == '/')) continue;
+
+            ls = glslScanOperandBackward(text, i);
+            if (ls < 0) continue;
+            rs = i + 1;
+            re = glslScanOperandForward(text, rs);
+            if (re < 0) continue;
+
+            leftIsMatrix  = glslSpanIsMatrix(text, ls, i,  matNames, matCount);
+            rightIsMatrix = glslSpanIsMatrix(text, rs, re, matNames, matCount);
+            if (!leftIsMatrix && !rightIsMatrix) continue;
+            if (!leftIsMatrix  && glslSpanIsNumericLiteral(text, ls, i))  continue;
+            if (!rightIsMatrix && glslSpanIsNumericLiteral(text, rs, re)) continue;
+
+            la = ls; lb = i;  glslTrimSpan(text, &la, &lb);
+            ra = rs; rb = re; glslTrimSpan(text, &ra, &rb);
+            if (lb <= la || rb <= ra) continue;
+
+            len = ls + (int)strlen(text + re) + (lb - la) + (rb - ra) + 8;
+            if (len >= bufLen || len >= textSize) break;
+
+            {
+                char *dst = buf;
+                memcpy(dst, text, (size_t)ls);              dst += ls;
+                memcpy(dst, "mul(", 4);                     dst += 4;
+                memcpy(dst, text + la, (size_t)(lb - la));  dst += lb - la;
+                memcpy(dst, ", ", 2);                       dst += 2;
+                memcpy(dst, text + ra, (size_t)(rb - ra));  dst += rb - ra;
+                *dst++ = ')';
+                strcpy(dst, text + re);
+            }
+
+            strcpy(text, buf);
+            rewrote = TRUE;
+            break;
+        }
+
+        if (!rewrote)
+            break;
+    }
+
+    free(buf);
+}
+
+/*
+ * glslRewriteMatrixDiagonal — matN(x) builds a diagonal matrix in GLSL.
+ *
+ * This is the case glslRewriteVectorSplats deliberately refuses: an HLSL cast
+ * (float4x4)x replicates x into all sixteen components, which compiles and is
+ * wrong, so matrix constructors were left to fail as X3014 instead.  Spelling
+ * the diagonal out explicitly is the actual lowering.
+ *
+ * The argument text is duplicated N times, so an argument with a side effect
+ * would run N times.  Nothing else in this file duplicates an expression; it is
+ * accepted here because GLSL's scalar matrix constructor is, in practice,
+ * always given a literal or a plain variable read.
+ *
+ * A single argument that is itself a matrix is a GLSL matrix-conversion
+ * constructor, not a diagonal one, and is left alone.
+ */
+static void glslRewriteMatrixDiagonal(char *text, int textSize,
+                                      const char (*matNames)[GLSL_MAX_NAME_LEN],
+                                      int matCount)
+{
+    static const struct { const char *name; int dim; } kSquare[] = {
+        { "mat2x2", 2 }, { "mat3x3", 3 }, { "mat4x4", 4 },
+        { "mat2",   2 }, { "mat3",   3 }, { "mat4",   4 },
+        { NULL, 0 }
+    };
+    char *buf;
+    int bufLen, pass;
+
+    if (!text || !text[0] || textSize < 2)
+        return;
+    if (!strstr(text, "mat"))
+        return;
+
+    bufLen = (int)strlen(text) * 2 + 256;
+    if (bufLen > HLSL_MAX_OUTPUT) bufLen = HLSL_MAX_OUTPUT;
+    buf = (char *)malloc(bufLen);
+    if (!buf) return;
+
+    for (pass = 0; pass < 8; pass++) {
+        const char *src = text;
+        char *dst = buf;
+        BOOL changed = FALSE;
+
+        while (*src) {
+            const char *name = NULL;
+            int nameLen = 0, dim = 0, openIdx = -1, closeIdx = -1;
+            int i;
+
+            if (src == text || glslIsWordBoundary(*(src - 1))) {
+                for (i = 0; kSquare[i].name; i++) {
+                    int len = (int)strlen(kSquare[i].name);
+                    if (strncmp(src, kSquare[i].name, (size_t)len) != 0)
+                        continue;
+                    if (!glslIsWordBoundary(src[len]))
+                        break;
+                    if (*glslSkipWhitespace(src + len) == '(') {
+                        name    = kSquare[i].name;
+                        nameLen = len;
+                        dim     = kSquare[i].dim;
+                        openIdx = (int)(glslSkipWhitespace(src + len) - text);
+                    }
+                    break;
+                }
+            }
+
+            if (name)
+                closeIdx = glslFindMatchingParen(text, openIdx);
+
+            if (name && closeIdx > openIdx + 1 &&
+                glslConstructorArgCount(text + openIdx, closeIdx - openIdx + 1) == 1 &&
+                !glslSpanIsMatrix(text, openIdx + 1, closeIdx, matNames, matCount)) {
+                int a = openIdx + 1, b = closeIdx;
+                int argLen, r, c;
+
+                glslTrimSpan(text, &a, &b);
+                argLen = b - a;
+                if (argLen <= 0) goto copyChar;
+                /* dim*dim slots, each either the argument or "0", plus commas */
+                if (dst + nameLen + dim * dim * (argLen + 4) + 8 >= buf + bufLen - 1)
+                    break;
+
+                memcpy(dst, name, (size_t)nameLen);
+                dst += nameLen;
+                *dst++ = '(';
+                for (r = 0; r < dim; r++) {
+                    for (c = 0; c < dim; c++) {
+                        if (r || c) { *dst++ = ','; *dst++ = ' '; }
+                        if (r == c) {
+                            *dst++ = '(';
+                            memcpy(dst, text + a, (size_t)argLen);
+                            dst += argLen;
+                            *dst++ = ')';
+                        } else {
+                            *dst++ = '0';
+                        }
+                    }
+                }
+                *dst++ = ')';
+                src = text + closeIdx + 1;
+                changed = TRUE;
+                continue;
+            }
+
+copyChar:
+            if (dst >= buf + bufLen - 1)
+                break;
+            *dst++ = *src++;
+        }
+        *dst = '\0';
+
+        if (!changed)
+            break;
+        /* Same rule as glslRewriteVectorSplats: a scan that stopped short is
+         * discarded whole rather than written back truncated. */
+        if (*src != '\0' || (int)(dst - buf) >= textSize)
+            break;
+        strcpy(text, buf);
+    }
+
+    free(buf);
+}
+
+/*
+ * glslApplyTextureLodRewrite — rewrite textureLod using the declared sampler
+ * dimensionality. SM3 carries explicit LOD in the final coordinate component.
+ */
+static void glslApplyTextureLodRewrite(char *text,
+                                       const glslVarDecl *uniforms,
+                                       int uniformCount)
 {
     char *buf;
     int bufLen;
@@ -773,9 +2177,27 @@ static void glslApplyTextureLodRewrite(char *text)
                                     ap--;
                                 }
                             }
-                            /* Emit: tex2Dlod(sampler, float4((uv), 0, (lod))) */
-                            dst += sprintf(dst, "tex2Dlod(%s, float4((%s), 0, (%s)))",
-                                           args[0], args[1], args[2]);
+                            {
+                                const char *samplerType = glslSamplerType(
+                                    uniforms, uniformCount, args[0]);
+                                const char *intrinsic = glslTextureIntrinsic(
+                                    samplerType, TRUE, FALSE);
+                                if (samplerType && strstr(samplerType, "1D"))
+                                    dst += sprintf(dst,
+                                        "%s(%s, float4((%s), 0, 0, (%s)))",
+                                        intrinsic, args[0], args[1], args[2]);
+                                else if (samplerType &&
+                                         (strstr(samplerType, "3D") ||
+                                          strstr(samplerType, "Cube") ||
+                                          strstr(samplerType, "CUBE")))
+                                    dst += sprintf(dst,
+                                        "%s(%s, float4((%s), (%s)))",
+                                        intrinsic, args[0], args[1], args[2]);
+                                else
+                                    dst += sprintf(dst,
+                                        "%s(%s, float4((%s), 0, (%s)))",
+                                        intrinsic, args[0], args[1], args[2]);
+                            }
                             src = text + closeIdx + 1;
                             continue;
                         }
@@ -799,7 +2221,289 @@ static void glslApplyTextureLodRewrite(char *text)
     free(buf);
 }
 
-static void glslApplyFunctionReplacements(char *text)
+/*---------------------- texelFetch / textureSize lowering ----------------------*/
+
+/*
+ * SM3 has no integer texel addressing and no runtime size query.  Both are
+ * recoverable from one extra constant: (width, height, 1/width, 1/height) for
+ * the texture bound to that sampler, pushed per draw by the caller.  With that
+ * in hand texelFetch is an ordinary tex2Dlod at an explicit LOD, and
+ * textureSize is a swizzle.
+ *
+ * Only the sampler2D / usampler2D / isampler2D (2D) forms are lowered; the
+ * 3D/array/cube overloads are mechanically similar but are not implemented.
+ */
+
+static void glslTexDimAdd(glslTexDimSet *set, const char *name)
+{
+    int i;
+    if (!set || !name || !name[0]) return;
+    for (i = 0; i < set->count; i++)
+        if (strcmp(set->names[i], name) == 0) return;
+    if (set->count >= GLSL_MAX_TEXDIM) return;
+    strncpy(set->names[set->count], name, GLSL_MAX_NAME_LEN - 1);
+    set->names[set->count][GLSL_MAX_NAME_LEN - 1] = '\0';
+    set->count++;
+}
+
+static BOOL glslTexDimHas(const glslTexDimSet *set, const char *name)
+{
+    int i;
+    if (!set || !name) return FALSE;
+    for (i = 0; i < set->count; i++)
+        if (strcmp(set->names[i], name) == 0) return TRUE;
+    return FALSE;
+}
+
+static BOOL glslIsPlainIdentifier(const char *s)
+{
+    if (!s || !(isalpha((unsigned char)*s) || *s == '_')) return FALSE;
+    for (s++; *s; s++)
+        if (!(isalnum((unsigned char)*s) || *s == '_')) return FALSE;
+    return TRUE;
+}
+
+/*
+ * Split the argument list of a call whose '(' sits at text[openIdx] and whose
+ * matching ')' sits at text[closeIdx].  The arguments are copied into `buf`,
+ * NUL-terminated at each depth-0 comma and trimmed.  Returns the argument
+ * count, or -1 when the list does not fit, has too many arguments, or contains
+ * an empty one.
+ */
+static int glslSplitCallArgs(const char *text, int openIdx, int closeIdx,
+                             char *buf, int bufSize, char **args, int maxArgs)
+{
+    int argLen = closeIdx - openIdx - 1;
+    int depth = 0, count = 0, i;
+
+    if (argLen <= 0 || argLen >= bufSize || maxArgs <= 0)
+        return -1;
+
+    memcpy(buf, text + openIdx + 1, (size_t)argLen);
+    buf[argLen] = '\0';
+
+    args[count++] = buf;
+    for (i = 0; buf[i]; i++) {
+        if (buf[i] == '(' || buf[i] == '[') depth++;
+        else if (buf[i] == ')' || buf[i] == ']') depth--;
+        else if (buf[i] == ',' && depth == 0) {
+            if (count >= maxArgs) return -1;
+            buf[i] = '\0';
+            args[count++] = &buf[i + 1];
+        }
+    }
+
+    for (i = 0; i < count; i++) {
+        char *ap;
+        args[i] = glslSkipWhitespace(args[i]);
+        ap = args[i] + strlen(args[i]);
+        while (ap > args[i] &&
+               (ap[-1] == ' ' || ap[-1] == '\t' || ap[-1] == '\n' || ap[-1] == '\r'))
+            *--ap = '\0';
+        if (!args[i][0]) return -1;
+    }
+    return count;
+}
+
+/* Writes the replacement for one call into `dst`, or returns -1 to leave the
+ * call exactly as it was found (which keeps today's compiler error rather than
+ * inventing a wrong translation). */
+typedef int (*glslCallEmitFn)(char *dst, int dstRoom, char **args, int argCount,
+                              glslTexDimSet *texDim,
+                              const glslVarDecl *uniforms, int uniformCount);
+
+/*
+ * Rewrite every call to `funcName` in `text` through `emit`.
+ *
+ * Same shape as glslApplyTextureLodRewrite: scan, split the arguments, emit a
+ * replacement, and fall back to copying the call through untouched when the
+ * shape is not one the rewrite understands.  A scan that runs out of buffer
+ * abandons the whole rewrite and leaves `text` alone rather than writing back
+ * a half-rewritten shader.
+ */
+static void glslRewriteCall(char *text, const char *funcName,
+                            glslCallEmitFn emit, glslTexDimSet *texDim,
+                            const glslVarDecl *uniforms, int uniformCount)
+{
+    char *buf;
+    int bufLen;
+    const char *src;
+    char *dst;
+    int funcLen = (int)strlen(funcName);
+
+    if (!text || !text[0] || !strstr(text, funcName))
+        return;
+
+    bufLen = (int)strlen(text) * 2 + 256;
+    if (bufLen > HLSL_MAX_OUTPUT) bufLen = HLSL_MAX_OUTPUT;
+    buf = (char *)malloc(bufLen);
+    if (!buf) return;
+
+    src = text;
+    dst = buf;
+
+    while (*src) {
+        const char *found = strstr(src, funcName);
+        int prefixLen;
+
+        if (!found) {
+            int rem = (int)strlen(src);
+            if (dst + rem >= buf + bufLen - 1) { free(buf); return; }
+            memcpy(dst, src, (size_t)rem);
+            dst += rem;
+            break;
+        }
+
+        if (!((found == text) || glslIsWordBoundary(*(found - 1))) ||
+            !glslIsWordBoundary(*(found + funcLen))) {
+            prefixLen = (int)(found - src) + 1;
+            if (dst + prefixLen >= buf + bufLen - 1) { free(buf); return; }
+            memcpy(dst, src, (size_t)prefixLen);
+            dst += prefixLen;
+            src = found + 1;
+            continue;
+        }
+
+        prefixLen = (int)(found - src);
+        if (dst + prefixLen >= buf + bufLen - 1) { free(buf); return; }
+        memcpy(dst, src, (size_t)prefixLen);
+        dst += prefixLen;
+
+        {
+            const char *parenStart = glslSkipWhitespace(found + funcLen);
+            int openIdx  = (int)(parenStart - text);
+            int closeIdx = (*parenStart == '(')
+                         ? glslFindMatchingParen(text, openIdx) : -1;
+            char argBuf[2048];
+            char *args[4];
+            int argCount = (closeIdx > openIdx)
+                         ? glslSplitCallArgs(text, openIdx, closeIdx, argBuf,
+                                             (int)sizeof(argBuf), args, 4)
+                         : -1;
+            int written = -1;
+
+            if (argCount > 0)
+                written = emit(dst, (int)(buf + bufLen - 1 - dst), args, argCount,
+                               texDim, uniforms, uniformCount);
+
+            if (written >= 0) {
+                dst += written;
+                src = text + closeIdx + 1;
+                continue;
+            }
+        }
+
+        if (dst + funcLen >= buf + bufLen - 1) { free(buf); return; }
+        memcpy(dst, funcName, (size_t)funcLen);
+        dst += funcLen;
+        src = found + funcLen;
+    }
+
+    *dst = '\0';
+    strcpy(text, buf);
+    free(buf);
+}
+
+/* texelFetch(s, coord[, lod]) -> tex2Dlod at the texel centre.
+ *
+ * The +0.5 puts the sample at the centre of the addressed texel rather than on
+ * its corner, which is where D3D9's half-texel-offset rule would otherwise land
+ * it; the multiply by the reciprocal in .zw is the same thing as dividing by
+ * the size, done as a multiply because the reciprocal is already sitting in the
+ * constant. */
+static int glslEmitTexelFetch(char *dst, int dstRoom, char **args, int argCount,
+                              glslTexDimSet *texDim,
+                              const glslVarDecl *uniforms, int uniformCount)
+{
+    const char *lod = (argCount == 3) ? args[2] : "0";
+    int need;
+
+    (void)uniforms;
+    (void)uniformCount;
+    if (argCount != 2 && argCount != 3) return -1;
+    if (!glslIsPlainIdentifier(args[0]))  return -1;   /* cannot name a uniform after it */
+
+    need = 96 + 2 * (int)strlen(args[0]) + (int)strlen(args[1]) + (int)strlen(lod);
+    if (dstRoom < need) return -1;
+
+    glslTexDimAdd(texDim, args[0]);
+    return sprintf(dst,
+                   "tex2Dlod(%s, float4((((float2)(%s)) + 0.5) * _glsl_texdim_%s.zw, 0, (%s)))",
+                   args[0], args[1], args[0], lod);
+}
+
+/* textureSize(s[, lod]) -> the dimension uniform's .xy.
+ *
+ * The lod argument is dropped: SM3 cannot query a mip level's size at runtime,
+ * and the constant carries level 0's size.  Correct for lod == 0, which is what
+ * essentially every call site asks for; a non-zero lod silently gets level 0's
+ * size rather than failing to compile. */
+static int glslEmitTextureSize(char *dst, int dstRoom, char **args, int argCount,
+                               glslTexDimSet *texDim,
+                               const glslVarDecl *uniforms, int uniformCount)
+{
+    (void)uniforms;
+    (void)uniformCount;
+    if (argCount != 1 && argCount != 2) return -1;
+    if (!glslIsPlainIdentifier(args[0])) return -1;
+    if (dstRoom < (int)strlen(args[0]) + 32) return -1;
+
+    glslTexDimAdd(texDim, args[0]);
+    return sprintf(dst, "_glsl_texdim_%s.xy", args[0]);
+}
+
+static int glslEmitTexture(char *dst, int dstRoom, char **args, int argCount,
+                           glslTexDimSet *texDim,
+                           const glslVarDecl *uniforms, int uniformCount)
+{
+    const char *samplerType;
+    const char *intrinsic;
+    int need;
+
+    (void)texDim;
+    if (argCount != 2 && argCount != 3) return -1;
+    samplerType = glslSamplerType(uniforms, uniformCount, args[0]);
+    intrinsic = glslTextureIntrinsic(samplerType, FALSE, argCount == 3);
+    need = (int)strlen(intrinsic) + (int)strlen(args[0]) +
+           (int)strlen(args[1]) + 32;
+    if (argCount == 3) need += (int)strlen(args[2]) + 20;
+    if (dstRoom < need) return -1;
+
+    if (argCount == 2)
+        return sprintf(dst, "%s(%s, (%s))", intrinsic, args[0], args[1]);
+
+    if (samplerType && strstr(samplerType, "1D"))
+        return sprintf(dst, "%s(%s, float4((%s), 0, 0, (%s)))",
+                       intrinsic, args[0], args[1], args[2]);
+    if (samplerType &&
+        (strstr(samplerType, "3D") ||
+         strstr(samplerType, "Cube") || strstr(samplerType, "CUBE")))
+        return sprintf(dst, "%s(%s, float4((%s), (%s)))",
+                       intrinsic, args[0], args[1], args[2]);
+    return sprintf(dst, "%s(%s, float4((%s), 0, (%s)))",
+                   intrinsic, args[0], args[1], args[2]);
+}
+
+static void glslApplyTexelFetchRewrite(char *text, glslTexDimSet *texDim)
+{
+    glslRewriteCall(text, "texelFetch", glslEmitTexelFetch, texDim, NULL, 0);
+}
+
+static void glslApplyTextureSizeRewrite(char *text, glslTexDimSet *texDim)
+{
+    glslRewriteCall(text, "textureSize", glslEmitTextureSize, texDim, NULL, 0);
+}
+
+static void glslApplyTextureRewrite(char *text, glslTexDimSet *texDim,
+                                    const glslVarDecl *uniforms, int uniformCount)
+{
+    glslRewriteCall(text, "texture", glslEmitTexture, texDim,
+                    uniforms, uniformCount);
+}
+
+static void glslApplyFunctionReplacements(char *text, glslTexDimSet *texDim,
+                                           const glslVarDecl *uniforms,
+                                           int uniformCount)
 {
     /* Simple word-for-word renames */
     glslReplaceWord(text, "mix",            "lerp");
@@ -815,10 +2519,15 @@ static void glslApplyFunctionReplacements(char *text)
     glslReplaceWord(text, "texture3D",      "tex3D");
 
     /* textureLod needs argument rewriting — do it before generic "texture" */
-    glslApplyTextureLodRewrite(text);
+    glslApplyTextureLodRewrite(text, uniforms, uniformCount);
 
-    /* Generic texture() -> tex2D() (GLSL 1.30+ with sampler2D) */
-    glslReplaceWord(text, "texture",        "tex2D");
+    /* texelFetch/textureSize likewise, and they also register the samplers
+     * that need a synthesized dimension uniform. */
+    glslApplyTexelFetchRewrite(text, texDim);
+    glslApplyTextureSizeRewrite(text, texDim);
+
+    /* Generic texture() dispatches by the declared sampler dimensionality. */
+    glslApplyTextureRewrite(text, texDim, uniforms, uniformCount);
 
     /* atan(y, x) -> atan2(y, x) */
     glslReplaceWord(text, "atan",           "atan2");
@@ -870,25 +2579,188 @@ static int glslTryParseLocation(const char *line)
 }
 
 /*
+ * glslParseUIntToken — read a whole token as an unsigned decimal or 0x-hex
+ * integer.  Succeeds only when the token is *entirely* consumed, so "4" and
+ * "0x10u" resolve and "4 + N", "N" and "" do not.
+ *
+ * Deliberately stricter than atoi, which is what this replaces: atoi("N")
+ * answers 0, and 0 is the same value that means "not an array" — that is the
+ * whole shape of the silent miscompile being closed here.
+ */
+static BOOL glslParseUIntToken(const char *tok, int *pValue)
+{
+    const char *p = tok;
+    long v = 0;
+    int digits = 0;
+
+    if (!tok || !pValue) return FALSE;
+
+    while (*p == ' ' || *p == '\t') p++;
+
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+        while (isxdigit((unsigned char)*p)) {
+            int d = isdigit((unsigned char)*p)
+                  ? (*p - '0')
+                  : (tolower((unsigned char)*p) - 'a' + 10);
+            if (v > (0x7FFFFFF0L - d) / 16) return FALSE;   /* would overflow */
+            v = v * 16 + d;
+            digits++;
+            p++;
+        }
+    } else {
+        while (isdigit((unsigned char)*p)) {
+            int d = *p - '0';
+            if (v > (0x7FFFFFF0L - d) / 10) return FALSE;   /* would overflow */
+            v = v * 10 + d;
+            digits++;
+            p++;
+        }
+    }
+
+    if (digits == 0) return FALSE;
+
+    while (*p == 'u' || *p == 'U' || *p == 'l' || *p == 'L') p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+    if (*p != '\0') return FALSE;
+
+    *pValue = (int)v;
+    return TRUE;
+}
+
+/*
+ * glslCollectDefines — gather object-like "#define NAME <integer>" lines.
+ *
+ * Scoped to what an array uniform's extent can be spelled as, and no further:
+ * function-like macros are skipped, and so is any value that is not wholly an
+ * integer literal.  Resolving defines anywhere else in a shader is a separate
+ * and much wider gap — #define lines do not survive into the emitted HLSL at
+ * all — and widening this table would not close it.
+ */
+static int glslCollectDefines(const char *src, glslDefine *out, int maxOut)
+{
+    int count = 0;
+    const char *lineStart;
+
+    if (!src || !out || maxOut <= 0) return 0;
+
+    lineStart = src;
+    while (lineStart && *lineStart) {
+        const char *lineEnd = strchr(lineStart, '\n');
+        char lineBuf[1024];
+        char nameBuf[GLSL_MAX_NAME_LEN];
+        int lineLen, nameLen = 0, value = 0, i;
+        char *p;
+        BOOL dup = FALSE;
+
+        if (lineEnd)
+            lineLen = (int)(lineEnd - lineStart);
+        else
+            lineLen = (int)strlen(lineStart);
+
+        if (lineLen >= (int)sizeof(lineBuf))
+            lineLen = (int)sizeof(lineBuf) - 1;
+
+        memcpy(lineBuf, lineStart, lineLen);
+        lineBuf[lineLen] = '\0';
+        lineStart = lineEnd ? lineEnd + 1 : NULL;
+
+        /* "  #  define NAME 4" is as legal as "#define NAME 4". */
+        p = glslSkipWhitespace(lineBuf);
+        if (*p != '#') continue;
+        p = glslSkipWhitespace(p + 1);
+        if (strncmp(p, "define", 6) != 0 || !glslIsWordBoundary(p[6])) continue;
+        p = glslSkipWhitespace(p + 6);
+
+        if (!isalpha((unsigned char)*p) && *p != '_') continue;
+        while ((isalnum((unsigned char)*p) || *p == '_') &&
+               nameLen < GLSL_MAX_NAME_LEN - 1)
+            nameBuf[nameLen++] = *p++;
+        nameBuf[nameLen] = '\0';
+
+        /* A '(' touching the name makes it function-like: never an extent. */
+        if (*p == '(') continue;
+
+        p = glslSkipWhitespace(p);
+        if (!glslParseUIntToken(p, &value)) continue;
+
+        for (i = 0; i < count; i++) {
+            if (strcmp(out[i].name, nameBuf) == 0) {
+                out[i].value = value;       /* a later #define wins */
+                dup = TRUE;
+                break;
+            }
+        }
+        if (!dup && count < maxOut) {
+            strcpy(out[count].name, nameBuf);
+            out[count].value = value;
+            count++;
+        }
+    }
+
+    return count;
+}
+
+/*
  * glslParseDeclarations — scan GLSL source for attribute, varying, uniform,
  * in, and out declarations. Populates the provided arrays.
+ *
+ * `defines` (nullable) resolves an array extent written as a macro name.
+ * `pUnresolvedArray` (nullable) is set TRUE when a declaration is an array
+ * whose extent could be worked out from neither a literal nor `defines`; the
+ * caller is expected to stop rather than emit HLSL from a declaration set it
+ * knows to be wrong.  Both follow glslStripLayoutQualifiers' convention of
+ * being safe to pass as NULL.
  *
  * Returns the total number of declarations found.
  */
 static int glslParseDeclarations(const char *src, int shaderType,
                                  glslVarDecl *attributes, int *pAttrCount,
                                  glslVarDecl *varyings, int *pVaryCount,
-                                 glslVarDecl *uniforms, int *pUnifCount)
+                                 glslVarDecl *uniforms, int *pUnifCount,
+                                 const glslDefine *defines, int defineCount,
+                                 BOOL *pUnresolvedArray)
 {
     char lineBuf[1024];
+    char *statementSource;
     const char *lineStart;
     int totalFound = 0;
+    int sourceLength, sourceIndex, braceDepth = 0;
+    BOOL lineComment = FALSE, blockComment = FALSE;
 
     *pAttrCount = 0;
     *pVaryCount = 0;
     *pUnifCount = 0;
 
-    lineStart = src;
+    if (!src) return 0;
+    sourceLength = (int)strlen(src);
+    statementSource = (char *)malloc((size_t)sourceLength + 1);
+    if (!statementSource) return 0;
+    memcpy(statementSource, src, (size_t)sourceLength + 1);
+
+    /* Declarations are statements, not lines. Minified game shaders routinely
+     * put several globals before main() on one physical line. Turn top-level
+     * semicolons into line boundaries while preserving comments and function
+     * bodies, allowing the established parser below to consume every global. */
+    for (sourceIndex = 0; sourceIndex < sourceLength; ++sourceIndex) {
+        char c = statementSource[sourceIndex];
+        char n = sourceIndex + 1 < sourceLength ? statementSource[sourceIndex + 1] : '\0';
+        if (lineComment) {
+            if (c == '\n') lineComment = FALSE;
+            continue;
+        }
+        if (blockComment) {
+            if (c == '*' && n == '/') { blockComment = FALSE; ++sourceIndex; }
+            continue;
+        }
+        if (c == '/' && n == '/') { lineComment = TRUE; ++sourceIndex; continue; }
+        if (c == '/' && n == '*') { blockComment = TRUE; ++sourceIndex; continue; }
+        if (c == '{') { ++braceDepth; continue; }
+        if (c == '}') { if (braceDepth > 0) --braceDepth; continue; }
+        if (c == ';' && braceDepth == 0) statementSource[sourceIndex] = '\n';
+    }
+
+    lineStart = statementSource;
     while (lineStart && *lineStart) {
         const char *lineEnd = strchr(lineStart, '\n');
         int lineLen;
@@ -896,10 +2768,12 @@ static int glslParseDeclarations(const char *src, int shaderType,
         char qualifier[32] = {0};
         char typeName[GLSL_MAX_TYPE_LEN] = {0};
         char varName[GLSL_MAX_NAME_LEN] = {0};
+        char arrayTok[GLSL_MAX_NAME_LEN] = {0};
+        BOOL hasBracket = FALSE;
         int location = -1;
+        int arraySize = 0;
         BOOL isFlat = FALSE;
         char *tok;
-        char *saveptr;
         int tokenIdx;
 
         if (lineEnd)
@@ -917,7 +2791,9 @@ static int glslParseDeclarations(const char *src, int shaderType,
         /* Check for layout location before stripping */
         location = glslTryParseLocation(lineBuf);
 
-        trimmed = glslSkipWhitespace(lineBuf);
+        /* Step past any layout(...) block and interpolation qualifiers so the
+         * storage qualifier below is always the first token examined. */
+        trimmed = glslSkipDeclQualifiers(lineBuf, &isFlat);
 
         /* Skip preprocessor, comments, empty lines */
         if (trimmed[0] == '#' || trimmed[0] == '/' || trimmed[0] == '\0')
@@ -925,13 +2801,6 @@ static int glslParseDeclarations(const char *src, int shaderType,
         /* Skip lines inside function bodies (heuristic: contains '{' or starts with common statements) */
         if (strchr(trimmed, '{') || strchr(trimmed, '}'))
             continue;
-
-        /* Check for flat qualifier */
-        if (strncmp(trimmed, "flat ", 5) == 0) {
-            isFlat = TRUE;
-            trimmed += 5;
-            trimmed = glslSkipWhitespace(trimmed);
-        }
 
         /* Determine qualifier */
         if (strncmp(trimmed, "attribute ", 10) == 0) {
@@ -956,19 +2825,43 @@ static int glslParseDeclarations(const char *src, int shaderType,
             continue;
         }
 
-        /* Remove layout(...) text, semicolons, array brackets for parsing */
-        {
-            char *lp = strstr(trimmed, "layout");
-            if (lp) {
-                char *rp = strchr(lp, ')');
-                if (rp) {
-                    while (lp <= rp) { *lp = ' '; lp++; }
-                }
-            }
-        }
+        /* Remove semicolons and array brackets for parsing.  Any layout(...)
+         * block is already behind `trimmed` — glslSkipDeclQualifiers stepped
+         * over it before the storage qualifier was matched. */
         {
             char *semi = strchr(trimmed, ';');
             if (semi) *semi = '\0';
+        }
+
+        /* Excise an array suffix like [4] before tokenizing, wherever it sits.
+         *
+         * The bracket must not be left for strtok to find.  "uniform vec4
+         * _va_ [4];" — the spelling a real shipped shader used — tokenizes as
+         * "_va_" and "[4]", and the name branch below stops at the name and
+         * never reads the second token, so the extent was silently lost and
+         * the uniform emitted as a scalar.  With the bracket gone up front,
+         * strtok only ever sees "type name", whatever the whitespace does.
+         *
+         * An unterminated '[' is treated as an unresolved extent rather than
+         * ignored: the declaration is an array of *something*, and guessing is
+         * exactly what this is here to stop. */
+        {
+            char *open = strchr(trimmed, '[');
+            if (open) {
+                char *close = strchr(open, ']');
+                int inner = close ? (int)(close - open) - 1 : (int)strlen(open + 1);
+                if (inner < 0) inner = 0;
+                if (inner > (int)sizeof(arrayTok) - 1)
+                    inner = (int)sizeof(arrayTok) - 1;
+                if (inner > 0)
+                    memcpy(arrayTok, open + 1, (size_t)inner);
+                arrayTok[inner] = '\0';
+                hasBracket = TRUE;
+                if (close)
+                    memmove(open, close + 1, strlen(close + 1) + 1);
+                else
+                    *open = '\0';
+            }
         }
 
         /* Tokenize: [qualifier] type name */
@@ -986,9 +2879,6 @@ static int glslParseDeclarations(const char *src, int shaderType,
                 strncpy(typeName, tok, GLSL_MAX_TYPE_LEN - 1);
                 tokenIdx++;
             } else if (tokenIdx == 1) {
-                /* Remove array suffix like [4] */
-                char *bracket = strchr(tok, '[');
-                if (bracket) *bracket = '\0';
                 strncpy(varName, tok, GLSL_MAX_NAME_LEN - 1);
                 tokenIdx++;
                 break;
@@ -998,6 +2888,44 @@ static int glslParseDeclarations(const char *src, int shaderType,
 
         if (tokenIdx < 2 || typeName[0] == '\0' || varName[0] == '\0')
             continue;
+
+        /* Resolve the extent.  A literal first (the common case), then an
+         * object-like #define, and otherwise nothing — an array uniform whose
+         * extent is unknown cannot be emitted, because emitting it as a scalar
+         * compiles (HLSL reads foo[0..3] on a scalar float4 as a swizzle) and
+         * silently returns the wrong values for every element. */
+        if (hasBracket) {
+            char *at = arrayTok;
+            char *ae;
+
+            while (*at == ' ' || *at == '\t') at++;
+            ae = at + strlen(at);
+            while (ae > at && (ae[-1] == ' ' || ae[-1] == '\t' || ae[-1] == '\r'))
+                ae--;
+            *ae = '\0';
+
+            if (!glslParseUIntToken(at, &arraySize)) {
+                int d;
+                arraySize = GLSL_ARRAY_UNRESOLVED;
+                for (d = 0; d < defineCount && defines; d++) {
+                    if (strcmp(defines[d].name, at) == 0) {
+                        arraySize = defines[d].value;
+                        break;
+                    }
+                }
+            }
+            if (arraySize < 0) {
+                arraySize = GLSL_ARRAY_UNRESOLVED;
+                if (pUnresolvedArray) *pUnresolvedArray = TRUE;
+                gldDiagLog("GLSL->HLSL: '%s %s %s[%s]' - the array extent '%s' is "
+                           "neither an integer literal nor an object-like "
+                           "'#define %s <integer>' in this shader. Emitting the "
+                           "uniform without its extent would put every element "
+                           "past the first on the wrong constant register and "
+                           "would still compile, so the shader is not translated.",
+                           qualifier, typeName, varName, at, at, at);
+            }
+        }
 
         /* Store the declaration */
         {
@@ -1017,13 +2945,160 @@ static int glslParseDeclarations(const char *src, int shaderType,
                 strncpy(decl->type, typeName, GLSL_MAX_TYPE_LEN - 1);
                 strncpy(decl->name, varName, GLSL_MAX_NAME_LEN - 1);
                 decl->location = location;
+                decl->arraySize = arraySize;
                 decl->isFlat = isFlat;
                 totalFound++;
             }
         }
     }
 
+    free(statementSource);
     return totalFound;
+}
+
+/* Collect global fragment outputs statement-by-statement rather than
+ * line-by-line.  This accepts both
+ *
+ *     in vec4 color; layout(location=0) out vec4 result;
+ *
+ * on one physical line and the more usual one-declaration-per-line spelling.
+ * Function parameters using the `out` direction qualifier are rejected by
+ * requiring the storage word to appear outside parentheses and braces. */
+static int glslCollectFragmentOutputs(const char *src,
+                                      glslFragOutput *outputs, int maxOutputs)
+{
+    const char *statement = src;
+    const char *p = src;
+    int braceDepth = 0;
+    int parenDepth = 0;
+    int count = 0;
+    BOOL used[GLSL_MAX_FRAGDATA];
+    int i;
+
+    memset(used, 0, sizeof(used));
+    if (!src || !outputs || maxOutputs <= 0)
+        return 0;
+
+    while (*p) {
+        if (*p == '{') braceDepth++;
+        else if (*p == '}' && braceDepth > 0) braceDepth--;
+        else if (*p == '(') parenDepth++;
+        else if (*p == ')' && parenDepth > 0) parenDepth--;
+
+        if (*p == ';' && braceDepth == 0) {
+            const char *q = statement;
+            const char *outWord = NULL;
+            int localParen = 0;
+
+            while (q < p) {
+                if (*q == '(') localParen++;
+                else if (*q == ')' && localParen > 0) localParen--;
+                else if (localParen == 0 && q + 3 <= p &&
+                         q[0] == 'o' && q[1] == 'u' && q[2] == 't' &&
+                         (q == statement || glslIsWordBoundary(q[-1])) &&
+                         (q + 3 == p || glslIsWordBoundary(q[3]))) {
+                    outWord = q;
+                    break;
+                }
+                q++;
+            }
+
+            if (outWord && count < maxOutputs) {
+                const char *t = outWord + 3;
+                const char *typeStart, *typeEnd, *nameStart, *nameEnd;
+                int location = -1;
+                const char *loc = statement;
+
+                /* Read an optional explicit location anywhere before `out`. */
+                while (loc < outWord) {
+                    const char *hit = strstr(loc, "location");
+                    if (!hit || hit >= outWord) break;
+                    if ((hit == statement || glslIsWordBoundary(hit[-1])) &&
+                        glslIsWordBoundary(hit[8])) {
+                        const char *eq = hit + 8;
+                        while (eq < outWord && *eq != '=') eq++;
+                        if (eq < outWord) {
+                            char *endNum;
+                            long parsed;
+                            eq++;
+                            while (eq < outWord && isspace((unsigned char)*eq)) eq++;
+                            parsed = strtol(eq, &endNum, 10);
+                            if (endNum != eq && parsed >= 0 && parsed < 0x7fffffffL)
+                                location = (int)parsed;
+                        }
+                    }
+                    loc = hit + 8;
+                }
+
+                while (t < p && isspace((unsigned char)*t)) t++;
+                /* Precision can legally follow the storage qualifier. */
+                for (;;) {
+                    const char *wordEnd = t;
+                    int wordLen;
+                    while (wordEnd < p &&
+                           (isalnum((unsigned char)*wordEnd) || *wordEnd == '_'))
+                        wordEnd++;
+                    wordLen = (int)(wordEnd - t);
+                    if ((wordLen == 5 && !strncmp(t, "highp", 5)) ||
+                        (wordLen == 7 && !strncmp(t, "mediump", 7)) ||
+                        (wordLen == 4 && !strncmp(t, "lowp", 4)) ||
+                        (wordLen == 7 && !strncmp(t, "precise", 7))) {
+                        t = wordEnd;
+                        while (t < p && isspace((unsigned char)*t)) t++;
+                        continue;
+                    }
+                    break;
+                }
+
+                typeStart = t;
+                while (t < p && (isalnum((unsigned char)*t) || *t == '_')) t++;
+                typeEnd = t;
+                while (t < p && isspace((unsigned char)*t)) t++;
+                nameStart = t;
+                while (t < p && (isalnum((unsigned char)*t) || *t == '_')) t++;
+                nameEnd = t;
+
+                if (typeEnd > typeStart && nameEnd > nameStart &&
+                    (nameEnd - nameStart) < GLSL_MAX_NAME_LEN) {
+                    int duplicate = -1;
+                    for (i = 0; i < count; ++i) {
+                        int len = (int)(nameEnd - nameStart);
+                        if ((int)strlen(outputs[i].name) == len &&
+                            !strncmp(outputs[i].name, nameStart, (size_t)len)) {
+                            duplicate = i;
+                            break;
+                        }
+                    }
+                    if (duplicate < 0) {
+                        int len = (int)(nameEnd - nameStart);
+                        memcpy(outputs[count].name, nameStart, (size_t)len);
+                        outputs[count].name[len] = '\0';
+                        outputs[count].location = location;
+                        if (location >= 0 && location < GLSL_MAX_FRAGDATA)
+                            used[location] = TRUE;
+                        count++;
+                    }
+                }
+            }
+
+            statement = p + 1;
+            parenDepth = 0;
+        }
+        p++;
+    }
+
+    /* GLSL permits the linker to choose locations for outputs without an
+     * explicit layout qualifier.  Choose the lowest free slot, matching the
+     * declaration-order assignment used by the rest of this translator. */
+    for (i = 0; i < count; ++i) {
+        if (outputs[i].location < 0) {
+            int slot;
+            for (slot = 0; slot < GLSL_MAX_FRAGDATA && used[slot]; ++slot) {}
+            outputs[i].location = slot;
+            if (slot < GLSL_MAX_FRAGDATA) used[slot] = TRUE;
+        }
+    }
+    return count;
 }
 
 
@@ -1094,11 +3169,9 @@ static void glslRemoveDeclarationLines(char *src)
     char *line = src;
     while (line && *line) {
         char *next = strchr(line, '\n');
-        char *trimmed = glslSkipWhitespace(line);
-
-        /* Skip "flat" prefix */
-        if (strncmp(trimmed, "flat ", 5) == 0)
-            trimmed = glslSkipWhitespace(trimmed + 5);
+        /* Same leading layout(...)/interpolation-qualifier skip the declaration
+         * parser uses, so exactly the lines it consumed are the lines blanked. */
+        char *trimmed = glslSkipDeclQualifiers(line, NULL);
 
         if (strncmp(trimmed, "attribute ", 10) == 0 ||
             strncmp(trimmed, "varying ",   8) == 0 ||
@@ -1125,9 +3198,34 @@ static void glslRemoveDeclarationLines(char *src)
  * glslGetSemanticForAttr — determine the HLSL semantic for a vertex
  * shader input attribute based on its name and location.
  */
+/*
+ * glslExplicitSemantic — a variable whose name contains "_SEM_<SEMANTIC>"
+ * names its HLSL semantic outright.
+ *
+ * Generated shaders (arb_asm_translator.c) need inputs and interpolators
+ * pinned to exact semantics: an ARB program's result.texcoord[3] and the
+ * fragment program's fragment.texcoord[3] are separate compilations that must
+ * still meet on the same interpolator, which neither the declaration-order nor
+ * the name-guessing rule below can guarantee.  Hand-written GLSL never
+ * contains this marker, so those rules are untouched for real GLSL.
+ */
+static const char *glslExplicitSemantic(const char *name, char *semBuf, int bufSize)
+{
+    const char *marker = strstr(name, "_SEM_");
+    if (!marker) return NULL;
+    strncpy(semBuf, marker + 5, bufSize - 1);
+    semBuf[bufSize - 1] = '\0';
+    return semBuf[0] ? semBuf : NULL;
+}
+
 static const char *glslGetSemanticForAttr(const glslVarDecl *attr, int index)
 {
     static char semBuf[64];
+
+    {
+        const char *explicitSem = glslExplicitSemantic(attr->name, semBuf, sizeof(semBuf));
+        if (explicitSem) return explicitSem;
+    }
 
     /* If location is specified, use TEXCOORD[N] (location 0 can be POSITION) */
     if (attr->location >= 0) {
@@ -1165,6 +3263,11 @@ static const char *glslGetSemanticForVarying(const glslVarDecl *vary, int index)
 {
     static char semBuf[64];
 
+    {
+        const char *explicitSem = glslExplicitSemantic(vary->name, semBuf, sizeof(semBuf));
+        if (explicitSem) return explicitSem;
+    }
+
     if (vary->location >= 0) {
         sprintf(semBuf, "TEXCOORD%d", vary->location);
         return semBuf;
@@ -1187,18 +3290,38 @@ static const char *glslGetSemanticForVarying(const glslVarDecl *vary, int index)
 static void glslBuildVertexShader(const glslVarDecl *attrs, int attrCount,
                                   const glslVarDecl *varyings, int varyCount,
                                   const glslVarDecl *uniforms, int unifCount,
-                                  const char *mainBody, char *hlslOut, int hlslBufSize)
+                                  const char *mainBody, char *hlslOut, int hlslBufSize,
+                                  const glslTexDimSet *texDim)
 {
     int off = 0;
     int i;
     BOOL usesPointSize = (strstr(mainBody, "_glsl_out.psize") != NULL);
+    BOOL pretransformed = (strstr(mainBody, "gldPos_SEM_POSITION") != NULL);
 
     hlslOut[0] = '\0';
 
+    /* D3D9 cannot represent an OpenGL viewport that extends beyond the render
+     * target. The draw path clips the physical D3D viewport and supplies the
+     * affine clip-space correction which preserves GL's original mapping. */
+    if (!pretransformed)
+        off += sprintf(hlslOut + off, "float4 _glsl_viewportAdjust;\n");
+
     /* Emit uniforms as globals */
     for (i = 0; i < unifCount; i++) {
-        off += sprintf(hlslOut + off, "%s %s;\n",
-                       glslConvertType(uniforms[i].type), uniforms[i].name);
+        if (glslIsSamplerType(uniforms[i].type))
+            off += sprintf(hlslOut + off, "sampler %s;\n", uniforms[i].name);
+        else if (uniforms[i].arraySize > 0)
+            off += sprintf(hlslOut + off, "%s %s[%d];\n",
+                           glslConvertType(uniforms[i].type), uniforms[i].name,
+                           uniforms[i].arraySize);
+        else
+            off += sprintf(hlslOut + off, "%s %s;\n",
+                           glslConvertType(uniforms[i].type), uniforms[i].name);
+
+        /* Vertex texture fetch is rare but legal, so the dimension uniform a
+         * lowered texelFetch/textureSize needs is emitted here too. */
+        if (glslTexDimHas(texDim, uniforms[i].name))
+            off += sprintf(hlslOut + off, "float4 _glsl_texdim_%s;\n", uniforms[i].name);
     }
     off += sprintf(hlslOut + off, "\n");
 
@@ -1241,11 +3364,25 @@ static void glslBuildVertexShader(const glslVarDecl *attrs, int attrCount,
                        attrs[i].name, attrs[i].name);
     }
 
-    /* Declare local aliases for varyings (will be written to output) */
+    /* Declare local aliases for varyings (will be written to output).
+     *
+     * Zero-initialized, the same way the temp registers and the pixel shader's
+     * _glsl_fragColor/_glsl_fragData locals are.  A GLSL (or lowered ARB)
+     * program is free to write only part of a varying — result.texcoord[0].xy,
+     * say — and the copy-out at the end of this function then reads the whole
+     * vector back, which HLSL rejects as "error X4000: used without having been
+     * completely initialized".  Zero is also the right value: GL says the
+     * components the program never wrote are undefined, and reading them as
+     * zero is a legal choice, so this is the GL semantic rather than a
+     * workaround for the compiler.
+     *
+     * The (TYPE)0 cast form is used instead of a spelled-out float4(0,0,0,0)
+     * because glslConvertType can return any of float2/float3/float4/int4/...
+     * here; it mirrors the (VS_OUTPUT)0 initializer a few lines above. */
     for (i = 0; i < varyCount; i++) {
-        off += sprintf(hlslOut + off, "    %s %s;\n",
-                       glslConvertType(varyings[i].type),
-                       varyings[i].name);
+        const char *vType = glslConvertType(varyings[i].type);
+        off += sprintf(hlslOut + off, "    %s %s = (%s)0;\n",
+                       vType, varyings[i].name, vType);
     }
 
     off += sprintf(hlslOut + off, "\n");
@@ -1258,6 +3395,13 @@ static void glslBuildVertexShader(const glslVarDecl *attrs, int attrCount,
         off += sprintf(hlslOut + off, "    _glsl_out.%s = %s;\n",
                        varyings[i].name, varyings[i].name);
     }
+
+    if (!pretransformed)
+        off += sprintf(hlslOut + off,
+                       "    float4 _gld_clip = _glsl_out.pos;\n"
+                       "    _glsl_out.pos.x = _gld_clip.x * _glsl_viewportAdjust.x + _gld_clip.w * _glsl_viewportAdjust.z;\n"
+                       "    _glsl_out.pos.y = _gld_clip.y * _glsl_viewportAdjust.y + _gld_clip.w * _glsl_viewportAdjust.w;\n"
+                       "    _glsl_out.pos.z = 0.5 * (_gld_clip.z + _gld_clip.w);\n");
 
     off += sprintf(hlslOut + off, "    return _glsl_out;\n");
     off += sprintf(hlslOut + off, "}\n");
@@ -1278,7 +3422,8 @@ static void glslBuildPixelShader(const glslVarDecl *varyings, int varyCount,
                                  const glslVarDecl *uniforms, int unifCount,
                                  const char *mainBody, char *hlslOut, int hlslBufSize,
                                  BOOL usesFragData, int maxFragData,
-                                 BOOL usesFragCoord, BOOL usesFrontFacing)
+                                 BOOL usesFragCoord, BOOL usesFrontFacing,
+                                 const glslTexDimSet *texDim)
 {
     int off = 0;
     int i;
@@ -1287,12 +3432,20 @@ static void glslBuildPixelShader(const glslVarDecl *varyings, int varyCount,
 
     /* Emit uniforms as globals (separate samplers from regular uniforms) */
     for (i = 0; i < unifCount; i++) {
-        if (strcmp(uniforms[i].type, "sampler2D") == 0 ||
-            strcmp(uniforms[i].type, "samplerCube") == 0 ||
-            strcmp(uniforms[i].type, "samplerCUBE") == 0 ||
-            strcmp(uniforms[i].type, "sampler3D") == 0) {
-            /* Sampler declaration — keep as-is for HLSL SM3.0 */
+        if (glslIsSamplerType(uniforms[i].type)) {
+            /* SM3 sampler registers are untyped; dimensionality is carried by
+             * the tex1D/tex2D/tex3D/texCUBE intrinsic selected at each call. */
             off += sprintf(hlslOut + off, "sampler %s;\n", uniforms[i].name);
+            /* (width, height, 1/width, 1/height) for the texture bound to this
+             * sampler, pushed once per draw.  An ordinary named uniform, so it
+             * reaches the driver through the existing CTAB reflection with no
+             * new reflection code. */
+            if (glslTexDimHas(texDim, uniforms[i].name))
+                off += sprintf(hlslOut + off, "float4 _glsl_texdim_%s;\n", uniforms[i].name);
+        } else if (uniforms[i].arraySize > 0) {
+            off += sprintf(hlslOut + off, "%s %s[%d];\n",
+                           glslConvertType(uniforms[i].type), uniforms[i].name,
+                           uniforms[i].arraySize);
         } else {
             off += sprintf(hlslOut + off, "%s %s;\n",
                            glslConvertType(uniforms[i].type), uniforms[i].name);
@@ -1410,9 +3563,51 @@ static void glslRewriteFragDataAccess(char *text, int maxFragData)
 
     for (i = 0; i < maxFragData && i < GLSL_MAX_FRAGDATA; i++) {
         sprintf(oldPat, "_glsl_fragData[%d]", i);
-        sprintf(newPat, "_glsl_fragData%d", i);
+        if (maxFragData <= 1)
+            strcpy(newPat, "_glsl_fragColor");
+        else
+            sprintf(newPat, "_glsl_fragData%d", i);
         glslReplaceAll(text, oldPat, newPat);
     }
+}
+
+/*
+ * glslRecordFnName — add the identifier immediately before `open` to a
+ * deduplicated name table.  No-ops when the table is absent or full.
+ *
+ * A definition names a return type before the function name, so an identifier
+ * that starts the line is rejected: that shape is a call or a control-flow
+ * keyword, not a definition.
+ */
+static void glslRecordFnName(const char *line, const char *open,
+                             char (*fnNames)[GLSL_MAX_NAME_LEN],
+                             int *pFnCount, int maxFn)
+{
+    const char *e, *b;
+    int len, i;
+
+    if (!fnNames || !pFnCount || !line || !open) return;
+    if (*pFnCount >= maxFn) return;
+
+    e = open;
+    while (e > line && (e[-1] == ' ' || e[-1] == '\t')) e--;
+    b = e;
+    while (b > line && (isalnum((unsigned char)b[-1]) || b[-1] == '_')) b--;
+
+    len = (int)(e - b);
+    if (len <= 0 || len >= GLSL_MAX_NAME_LEN) return;
+    if (b == line) return;                          /* no return type in front */
+    if (isdigit((unsigned char)*b)) return;         /* not an identifier */
+
+    for (i = 0; i < *pFnCount; i++) {
+        if ((int)strlen(fnNames[i]) == len &&
+            strncmp(fnNames[i], b, (size_t)len) == 0)
+            return;
+    }
+
+    memcpy(fnNames[*pFnCount], b, (size_t)len);
+    fnNames[*pFnCount][len] = '\0';
+    (*pFnCount)++;
 }
 
 /*
@@ -1423,13 +3618,25 @@ static void glslRewriteFragDataAccess(char *text, int maxFragData)
  * For simplicity, we detect functions by looking for patterns like:
  *   type name(...) {
  * that are NOT "void main".
+ *
+ * `fnNames`/`pFnCount` (nullable, following glslStripLayoutQualifiers'
+ * convention) collect the extracted functions' names, deduplicated.  The
+ * caller needs them to rename any that would collide with a GLSL or HLSL
+ * builtin before the rewrite passes see them.  The heuristic above also
+ * matches things that are not function definitions at all — an indented
+ * "if (...) {" inside main() among them — so the names it yields are a
+ * superset; the caller filters by an explicit collision list rather than
+ * trusting every captured name to be a function.
  */
-static void glslExtractHelperFunctions(const char *src, char *helpers, int helpersSize)
+static void glslExtractHelperFunctions(const char *src, char *helpers, int helpersSize,
+                                       char (*fnNames)[GLSL_MAX_NAME_LEN],
+                                       int *pFnCount, int maxFn)
 {
     const char *p = src;
     int off = 0;
 
     helpers[0] = '\0';
+    if (pFnCount) *pFnCount = 0;
 
     /* Look for function definitions that aren't main() */
     while (*p) {
@@ -1454,6 +3661,7 @@ static void glslExtractHelperFunctions(const char *src, char *helpers, int helpe
             !strstr(lineBuf, "attribute ") && !strstr(lineBuf, "varying ") &&
             !strstr(lineBuf, "uniform ") && !strstr(lineBuf, "#")) {
             /* Check if next non-whitespace after ')' is '{' */
+            char *openParen  = strchr(lineBuf, '(');
             char *closeParen = strchr(lineBuf, ')');
             if (closeParen) {
                 char *afterParen = glslSkipWhitespace(closeParen + 1);
@@ -1476,6 +3684,8 @@ static void glslExtractHelperFunctions(const char *src, char *helpers, int helpe
                                         helpers[off++] = '\n';
                                         helpers[off] = '\0';
                                     }
+                                    glslRecordFnName(lineBuf, openParen,
+                                                     fnNames, pFnCount, maxFn);
                                     p = scan + 1;
                                     goto next_iter;
                                 }
@@ -1488,6 +3698,138 @@ static void glslExtractHelperFunctions(const char *src, char *helpers, int helpe
 
         p = lineEnd ? lineEnd + 1 : p + strlen(p);
 next_iter:;
+    }
+}
+
+/*
+ * glslDetectUnlowerableConstructs — name the GLSL constructs that have no
+ * Shader Model 3 lowering at all, once each, before the compiler gets to them.
+ *
+ * This changes nothing about what compiles.  Transpilation and D3DCompile run
+ * exactly as they would have, and a shader using any of these still fails with
+ * the compiler's own message.  What it adds is a line that names the actual
+ * construct, because the compiler's message describes the *rewritten HLSL*, and
+ * by then the reason has usually turned into a syntax error some distance from
+ * the GLSL that caused it.
+ *
+ * Bitwise operators head the list because they look the most fixable and are
+ * not: D3DCompile rejects &, |, ^, ~, << and >> with "error X3535: Bitwise
+ * operations not supported on target ps_3_0" on every SM3 profile, whatever the
+ * operands are.  Emulating them means decomposing values bit by bit in the
+ * float domain, against a 24-bit exact-integer ceiling — a separate feature,
+ * not attempted here.  (Plain int/uint arithmetic is fine and needs nothing:
+ * D3DCompile lowers +, -, *, / and % to float operations itself.)
+ *
+ * The list is not exhaustive and is not meant to be.  Anything it misses still
+ * produces D3DCompile's own error text, exactly as before.
+ */
+static BOOL glslHasWord(const char *src, const char *word)
+{
+    int len = (int)strlen(word);
+    const char *p = src;
+    while ((p = strstr(p, word)) != NULL) {
+        BOOL leftOk  = (p == src) || glslIsWordBoundary(*(p - 1));
+        if (leftOk && glslIsWordBoundary(p[len]))
+            return TRUE;
+        p++;
+    }
+    return FALSE;
+}
+
+static BOOL glslHasWordPrefix(const char *src, const char *prefix)
+{
+    int len = (int)strlen(prefix);
+    const char *p = src;
+    while ((p = strstr(p, prefix)) != NULL) {
+        if ((p == src) || glslIsWordBoundary(*(p - 1)))
+            return TRUE;
+        p++;
+    }
+    return FALSE;
+}
+
+static void glslDetectUnlowerableConstructs(const char *src)
+{
+    static BOOL warnedBitwise = FALSE;
+    static BOOL warnedBuffer  = FALSE;
+    static BOOL warnedImage   = FALSE;
+    static BOOL warnedAtomic  = FALSE;
+    static BOOL warnedStage   = FALSE;
+
+    static const char *const kImageTypes[] = {
+        "image1D", "image2D", "image3D", "imageCube",
+        "iimage1D", "iimage2D", "iimage3D", "iimageCube",
+        "uimage1D", "uimage2D", "uimage3D", "uimageCube",
+        NULL
+    };
+    static const char *const kStageOnly[] = {
+        "gl_in", "gl_out", "gl_TessCoord", "gl_InvocationID", "gl_PrimitiveIDIn",
+        NULL
+    };
+    int i;
+
+    if (!src) return;
+
+    if (!warnedBitwise) {
+        const char *p;
+        const char *hit = NULL;
+        for (p = src; *p && !hit; p++) {
+            switch (*p) {
+            /* && and || are distinct tokens; a lone & or | can only be
+             * bitwise, GLSL has no third meaning for either. */
+            case '&': if (p[1] != '&' && !(p != src && p[-1] == '&')) hit = "&"; break;
+            case '|': if (p[1] != '|' && !(p != src && p[-1] == '|')) hit = "|"; break;
+            case '^': hit = "^ or ^^"; break;
+            case '~': hit = "~"; break;
+            case '<': if (p[1] == '<') hit = "<<"; break;
+            case '>': if (p[1] == '>') hit = ">>"; break;
+            default: break;
+            }
+        }
+        if (hit) {
+            warnedBitwise = TRUE;
+            gldDiagLog("GLSL->HLSL: shader uses the bitwise operator '%s'. D3DCompile "
+                       "rejects bitwise operations on every Shader Model 3 profile "
+                       "(error X3535) and no lowering for them exists here, so this "
+                       "shader cannot compile. Plain integer +,-,*,/,%% are fine.", hit);
+        }
+    }
+
+    if (!warnedBuffer && glslHasWord(src, "buffer")) {
+        warnedBuffer = TRUE;
+        gldDiagLog("GLSL->HLSL: shader uses the 'buffer' storage qualifier (shader "
+                   "storage block). D3D9 has no shader storage buffers and no "
+                   "lowering exists.");
+    }
+
+    if (!warnedImage) {
+        for (i = 0; kImageTypes[i]; i++) {
+            if (glslHasWord(src, kImageTypes[i])) {
+                warnedImage = TRUE;
+                gldDiagLog("GLSL->HLSL: shader declares '%s' (image load/store). "
+                           "D3D9 has no read-write images and no lowering exists.",
+                           kImageTypes[i]);
+                break;
+            }
+        }
+    }
+
+    if (!warnedAtomic && glslHasWordPrefix(src, "atomic")) {
+        warnedAtomic = TRUE;
+        gldDiagLog("GLSL->HLSL: shader calls an atomic* builtin. D3D9 shaders have "
+                   "no atomic operations and no lowering exists.");
+    }
+
+    if (!warnedStage) {
+        for (i = 0; kStageOnly[i]; i++) {
+            if (glslHasWord(src, kStageOnly[i])) {
+                warnedStage = TRUE;
+                gldDiagLog("GLSL->HLSL: shader uses '%s', which only exists in a "
+                           "geometry or tessellation stage. D3D9 has neither stage "
+                           "and no lowering exists.", kStageOnly[i]);
+                break;
+            }
+        }
     }
 }
 
@@ -1518,6 +3860,19 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
     int maxFragData = 0;
     BOOL usesFragCoord = FALSE;
     BOOL usesFrontFacing = FALSE;
+    glslFragOutput fragOutputs[GLSL_MAX_FRAGDATA + 1];
+    int fragOutputCount = 0;
+    glslTexDimSet texDim;
+    char matNames[GLSL_MAX_VARS][GLSL_MAX_NAME_LEN];
+    int matCount = 0;
+    char fnNames[GLSL_MAX_VARS][GLSL_MAX_NAME_LEN];
+    int fnCount = 0;
+    glslDefine defines[GLSL_MAX_DEFINES];
+    int defineCount = 0;
+    BOOL unresolvedArray = FALSE;
+    int idx;
+
+    texDim.count = 0;
 
     if (!glslSource || !hlslOut || hlslBufSize < 256)
         return FALSE;
@@ -1540,18 +3895,61 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
     /* Step 1: Copy and preprocess */
     strcpy(workBuf, glslSource);
 
+    /* Rename GLSL identifiers that HLSL reserves, before anything else looks
+     * at the source.  It has to be here rather than on mainBody/helpers later:
+     * the declaration parse, the VS_INPUT field emission and the uniform
+     * globals all come off this same buffer, and renaming only the bodies
+     * would leave the declaration under its original, illegal spelling and
+     * turn one X3000 into a pile of X3004s. */
+    glslRenameReservedWords(workBuf);
+
     /* Detect built-in usage before any transformations */
     if (shaderType == GLSL_SHADER_PIXEL) {
         usesFragData = glslDetectFragDataUsage(workBuf, &maxFragData);
         usesFragCoord = (strstr(workBuf, "gl_FragCoord") != NULL);
         usesFrontFacing = (strstr(workBuf, "gl_FrontFacing") != NULL);
+        fragOutputCount = glslCollectFragmentOutputs(
+            workBuf, fragOutputs, GLSL_MAX_FRAGDATA + 1);
+        for (idx = 0; idx < fragOutputCount; ++idx) {
+            int required = fragOutputs[idx].location + 1;
+            if (required > GLSL_MAX_FRAGDATA) {
+                gldDiagLog("GLSL->HLSL: fragment output '%s' uses color location %d, "
+                           "but D3D9 exposes only %d simultaneous color targets",
+                           fragOutputs[idx].name, fragOutputs[idx].location,
+                           GLSL_MAX_FRAGDATA);
+                free(workBuf);
+                free(mainBody);
+                free(helpers);
+                return FALSE;
+            }
+            if (required > maxFragData) maxFragData = required;
+        }
+        if (maxFragData > 1) usesFragData = TRUE;
     }
+
+    /* Integer #defines, read from the untouched source: an array uniform is
+     * as likely to be sized by a macro as by a literal. */
+    defineCount = glslCollectDefines(glslSource, defines, GLSL_MAX_DEFINES);
 
     /* Parse declarations from original source (before stripping) */
     glslParseDeclarations(workBuf, shaderType,
                           attributes, &attrCount,
                           varyings, &varyCount,
-                          uniforms, &unifCount);
+                          uniforms, &unifCount,
+                          defines, defineCount, &unresolvedArray);
+
+    /* An array whose extent could not be resolved stops here.  Carrying on
+     * would emit the uniform as a scalar, which D3DCompile *accepts* — it
+     * reads foo[0..3] on a scalar float4 as a component swizzle — so the
+     * shader would compile and then read the wrong values for every element
+     * with nothing to show for it.  glslParseDeclarations has already named
+     * the offending declaration in the diagnostic log. */
+    if (unresolvedArray) {
+        free(workBuf);
+        free(mainBody);
+        free(helpers);
+        return FALSE;
+    }
 
     gldLogPrintf(GLDLOG_DEBUG, "glslDoTranspile: Found %d attributes, %d varyings, %d uniforms\n",
                  attrCount, varyCount, unifCount);
@@ -1565,7 +3963,8 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
     glslRemoveDeclarationLines(workBuf);
 
     /* Extract helper functions (before main) */
-    glslExtractHelperFunctions(workBuf, helpers, HLSL_MAX_OUTPUT / 4);
+    glslExtractHelperFunctions(workBuf, helpers, HLSL_MAX_OUTPUT / 4,
+                               fnNames, &fnCount, GLSL_MAX_VARS);
 
     /* Extract main() body */
     glslExtractMainBody(workBuf, mainBody, HLSL_MAX_OUTPUT / 2);
@@ -1577,16 +3976,90 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
         return FALSE;
     }
 
-    /* Step 5: Apply type replacements to main body and helpers */
+    /* Move any user-defined function whose name is also a GLSL or HLSL builtin
+     * out of the way, before a single rewrite pass has looked at the body.
+     *
+     * Order is the whole point.  Run afterwards, the function-name rewrites
+     * would have already mangled the user function's own definition — a
+     * "vec4 textureLod(sampler2D s, vec2 uv, float lod) {" header does not
+     * parse as a 3-argument call, so glslApplyTextureLodRewrite takes its
+     * fallback branch and renames the definition to tex2Dlod, shadowing the
+     * intrinsic its own body then calls.  Renaming first leaves the wrapper
+     * intact under a name nothing else matches, while the genuine builtin
+     * calls inside it are still lowered normally. */
+    for (idx = 0; idx < fnCount; idx++) {
+        char renamed[GLSL_MAX_NAME_LEN + 16];
+
+        if (!glslNameCollidesWithBuiltin(fnNames[idx]))
+            continue;
+
+        sprintf(renamed, "_glsl_userfn_%s", fnNames[idx]);
+        gldDiagLog("GLSL->HLSL: shader defines its own '%s', which is also a "
+                   "builtin this translation rewrites; renamed to '%s' so the "
+                   "definition survives and the builtin stays reachable.",
+                   fnNames[idx], renamed);
+        glslReplaceWord(mainBody, fnNames[idx], renamed);
+        glslReplaceWord(helpers,  fnNames[idx], renamed);
+    }
+
+    /* Step 5: Apply type replacements to main body and helpers.
+     * The splat rewrite has to run first: it works on the GLSL spelling and
+     * relies on the rename that follows to turn the cast it leaves behind
+     * ((vec4)(x)) into HLSL ((float4)(x)). */
+    glslRewriteVectorSplats(mainBody, HLSL_MAX_OUTPUT / 2);
+    glslRewriteVectorSplats(helpers, HLSL_MAX_OUTPUT / 4);
+
+    /* The two matrix rewrites also work on the GLSL spelling, and both run
+     * before the rename for the same reason.  The symbol set is collected from
+     * the original source, which still holds the declarations the body's
+     * matrix names come from — glslRemoveDeclarationLines has blanked them out
+     * of workBuf by now.  Diagonal constructors go first so that a
+     * "mat4(1.0) * v" is already a recognisable matrix constructor by the time
+     * the product rewrite looks at it. */
+    matCount = glslCollectMatrixSymbols(glslSource, matNames, GLSL_MAX_VARS);
+
+    /* The symbol set comes off the original source, which still spells a
+     * matrix named after an HLSL reserved word ("mat4 matrix;") the way the
+     * author wrote it, while mainBody/helpers are already in the renamed
+     * spelling.  Bring the names across, or the two rewrites below would look
+     * for a name that is no longer there. */
+    for (idx = 0; idx < matCount; idx++) {
+        const char *kw = glslReservedWordRenameOf(matNames[idx]);
+        if (kw) {
+            strncpy(matNames[idx], kw, GLSL_MAX_NAME_LEN - 1);
+            matNames[idx][GLSL_MAX_NAME_LEN - 1] = '\0';
+        }
+    }
+
+    glslRewriteMatrixDiagonal(mainBody, HLSL_MAX_OUTPUT / 2, matNames, matCount);
+    glslRewriteMatrixDiagonal(helpers,  HLSL_MAX_OUTPUT / 4, matNames, matCount);
+    glslRewriteMatrixProducts(mainBody, HLSL_MAX_OUTPUT / 2, matNames, matCount);
+    glslRewriteMatrixProducts(helpers,  HLSL_MAX_OUTPUT / 4, matNames, matCount);
+
     glslApplyTypeReplacements(mainBody);
     glslApplyTypeReplacements(helpers);
 
     /* Step 6: Apply function replacements */
-    glslApplyFunctionReplacements(mainBody);
-    glslApplyFunctionReplacements(helpers);
+    glslApplyFunctionReplacements(mainBody, &texDim, uniforms, unifCount);
+    glslApplyFunctionReplacements(helpers, &texDim, uniforms, unifCount);
 
     /* Step 7: Replace built-in variables */
     glslReplaceBuiltinVars(mainBody, shaderType);
+
+    /* Named GLSL 1.30+ fragment outputs are local aliases for the same D3D9
+     * COLOR registers used by gl_FragColor/gl_FragData.  Perform this after
+     * extracting main so declaration text can never be rewritten into an
+     * invalid HLSL declaration. */
+    if (shaderType == GLSL_SHADER_PIXEL) {
+        for (idx = 0; idx < fragOutputCount; ++idx) {
+            char target[64];
+            if (maxFragData <= 1)
+                strcpy(target, "_glsl_fragColor");
+            else
+                sprintf(target, "_glsl_fragData%d", fragOutputs[idx].location);
+            glslReplaceWord(mainBody, fragOutputs[idx].name, target);
+        }
+    }
 
     /* For pixel shaders, rewrite gl_FragData[N] access */
     if (shaderType == GLSL_SHADER_PIXEL && usesFragData) {
@@ -1610,13 +4083,15 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
         glslBuildVertexShader(attributes, attrCount,
                               varyings, varyCount,
                               uniforms, unifCount,
-                              mainBody, hlslOut, hlslBufSize);
+                              mainBody, hlslOut, hlslBufSize,
+                              &texDim);
     } else {
         glslBuildPixelShader(varyings, varyCount,
                              uniforms, unifCount,
                              mainBody, hlslOut, hlslBufSize,
                              usesFragData, maxFragData,
-                             usesFragCoord, usesFrontFacing);
+                             usesFragCoord, usesFrontFacing,
+                             &texDim);
     }
 
     /* Insert helper functions before the main function */

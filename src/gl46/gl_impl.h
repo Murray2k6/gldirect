@@ -35,6 +35,11 @@ void _glsDeleteRenderbuffers(int n, const unsigned int *renderbuffers);
 void _glsBindRenderbuffer(unsigned int target, unsigned int renderbuffer);
 void _glsRenderbufferStorage(unsigned int target, unsigned int internalformat, int width, int height);
 void _glsGenQueries(int n, unsigned int *ids);
+void _glsGetQueryiv(unsigned int target, unsigned int pname, int *params);
+void _glsGetQueryObjectiv(unsigned int id, unsigned int pname, int *params);
+void _glsGetQueryObjectuiv(unsigned int id, unsigned int pname, unsigned int *params);
+void _glsGetQueryObjecti64v(unsigned int id, unsigned int pname, __int64 *params);
+void _glsGetQueryObjectui64v(unsigned int id, unsigned int pname, unsigned __int64 *params);
 void _glsDeleteQueries(int n, const unsigned int *ids);
 void _glsGenSamplers(int count, unsigned int *samplers);
 void _glsDeleteSamplers(int count, const unsigned int *samplers);
@@ -122,6 +127,9 @@ void _glsGetShaderInfoLog(unsigned int shader, int bufSize, int *length, char *i
 unsigned int _glsCreateProgram(void);
 void _glsDeleteProgram(unsigned int program);
 void _glsAttachShader(unsigned int program, unsigned int shader);
+void _glsDetachShader(unsigned int program, unsigned int shader);
+unsigned char _glsIsVertexArray(unsigned int array);
+void _glsGetBufferPointerv(unsigned int target, unsigned int pname, void **params);
 void _glsLinkProgram(unsigned int program);
 void _glsUseProgram(unsigned int program);
 void _glsGetProgramiv(unsigned int program, unsigned int pname, int *params);
@@ -185,6 +193,18 @@ void _glsClientActiveTexture(unsigned int texture);
 void _glsEnableClientState(unsigned int array);
 void _glsDisableClientState(unsigned int array);
 
+void _glsArrayElement(int i);
+void _glsInterleavedArrays(unsigned int format, int stride, const void *pointer);
+void _glsIndexPointer(unsigned int type, int stride, const void *pointer);
+void _glsLockArraysEXT(int first, int count);
+void _glsUnlockArraysEXT(void);
+
+/* ===== Program introspection ===== */
+void _glsGetActiveUniform(unsigned int program, unsigned int index, int bufSize, int *length, int *size, unsigned int *type, char *name);
+void _glsGetActiveAttrib(unsigned int program, unsigned int index, int bufSize, int *length, int *size, unsigned int *type, char *name);
+unsigned char _glsIsBuffer(unsigned int buffer);
+void _glsGetBufferParameteriv(unsigned int target, unsigned int pname, int *params);
+
 void _glsEnableVertexAttribArray(unsigned int index);
 void _glsDisableVertexAttribArray(unsigned int index);
 void _glsVertexAttribIPointer(unsigned int index, int size, unsigned int type, int stride, const void *pointer);
@@ -236,8 +256,15 @@ void _glsBindAttribLocation(unsigned int program, unsigned int index, const char
 /* ===== GL 3.1+ ===== */
 void _glsDrawArraysInstanced(unsigned int mode, int first, int count, int instancecount);
 void _glsDrawElementsInstanced(unsigned int mode, int count, unsigned int type, const void *indices, int instancecount);
+void _glsDrawArraysInstancedBaseInstance(unsigned int mode, int first, int count,
+                                         int instancecount, unsigned int baseinstance);
+void _glsDrawElementsInstancedBaseVertexBaseInstance(
+    unsigned int mode, int count, unsigned int type, const void *indices,
+    int instancecount, int basevertex, unsigned int baseinstance);
 void _glsCopyBufferSubData(unsigned int readTarget, unsigned int writeTarget, ptrdiff_t readOffset, ptrdiff_t writeOffset, ptrdiff_t size);
 void _glsTexBuffer(unsigned int target, unsigned int internalformat, unsigned int buffer);
+void _glsTexBufferRange(unsigned int target, unsigned int internalformat,
+                        unsigned int buffer, ptrdiff_t offset, ptrdiff_t size);
 void _glsPrimitiveRestartIndex(unsigned int index);
 void _glsUniformBlockBinding(unsigned int program, unsigned int blockIndex, unsigned int blockBinding);
 
@@ -295,12 +322,27 @@ void _glsTextureBarrier(void);
 /* ===== Texture 3D / misc ===== */
 void _glsTexImage3D(unsigned int target, int level, int internalformat, int width, int height, int depth, int border, unsigned int format, unsigned int type, const void *pixels);
 void _glsTexSubImage3D(unsigned int target, int level, int xoffset, int yoffset, int zoffset, int width, int height, int depth, unsigned int format, unsigned int type, const void *pixels);
+
+/* Private software-stage resource bridge.  It transfers one existing texture
+ * level by object instead of by public binding, so the compute/programmable
+ * stage worker can keep its context private without perturbing application GL
+ * state.  Cube faces are selected with a face target; volume levels transfer
+ * all slices. */
+BOOL _glsTransferTextureLevel(GLS_Texture *texture, unsigned int target, int level,
+                              unsigned int format, unsigned int type, void *pixels,
+                              BOOL writeToTexture, int *width, int *height, int *depth);
+BOOL _glsWriteBufferObject(GLS_Buffer *buffer, ptrdiff_t offset,
+                           ptrdiff_t size, const void *data);
 void _glsCompressedTexImage3D(unsigned int target, int level, unsigned int internalformat, int width, int height, int depth, int border, int imageSize, const void *data);
 void _glsCompressedTexSubImage2D(unsigned int target, int level, int xoffset, int yoffset, int width, int height, unsigned int format, int imageSize, const void *data);
 void _glsCompressedTexImage1D(unsigned int target, int level, unsigned int internalformat, int width, int border, int imageSize, const void *data);
 void _glsCompressedTexSubImage1D(unsigned int target, int level, int xoffset, int width, unsigned int format, int imageSize, const void *data);
 void _glsCompressedTexSubImage3D(unsigned int target, int level, int xoffset, int yoffset, int zoffset, int width, int height, int depth, unsigned int format, int imageSize, const void *data);
 void _glsGetCompressedTexImage(unsigned int target, int level, void *img);
+void _glsGetTexImage(unsigned int target, int level, unsigned int format, unsigned int type, void *pixels);
+void _glsGetTexLevelParameteriv(unsigned int target, int level, unsigned int pname, int *params);
+void _glsGetTexParameteriv(unsigned int target, unsigned int pname, int *params);
+unsigned char _glsAreTexturesResident(int n, const unsigned int *textures, unsigned char *residences);
 void _glsCopyTexSubImage3D(unsigned int target, int level, int xoffset, int yoffset, int zoffset, int x, int y, int width, int height);
 void _glsDrawRangeElements(unsigned int mode, unsigned int start, unsigned int end, int count, unsigned int type, const void *indices);
 void _glsSampleCoverage(float value, unsigned char invert);
@@ -328,6 +370,7 @@ void _glsGetBufferSubData(unsigned int target, ptrdiff_t offset, ptrdiff_t size,
 
 /* ===== ARB program (assembly shaders) ===== */
 void _glsGenProgramsARB(int n, unsigned int *programs);
+void _glsDeleteProgramsARB(int n, const unsigned int *programs);
 void _glsBindProgramARB(unsigned int target, unsigned int program);
 void _glsProgramStringARB(unsigned int target, unsigned int format, int len, const void *string);
 void _glsProgramEnvParameter4fvARB(unsigned int target, unsigned int index, const float *params);
@@ -338,9 +381,33 @@ void _glsDeleteObjectARB(unsigned int obj);
 void _glsGetObjectParameterivARB(unsigned int obj, unsigned int pname, int *params);
 void _glsGetInfoLogARB(unsigned int obj, int maxLength, int *length, char *infoLog);
 
-/* ===== Multitexture ===== */
+/* ===== Multitexture =====
+ *
+ * All four arities, all eight units.  The scalar/vector spellings in the
+ * exported surface (d/f/i/s and their v forms) all convert to float and land
+ * here, matching how the existing ARB wrappers were already written.
+ *
+ * Note on reach: these record complete 4-component coordinates for every unit,
+ * which is what glGet and any ARB/GLSL shader reading the attribute observe.
+ * The fixed-function submission path narrows that to units 0-1 at two
+ * components: GLS_D3DVertex carries four texcoord sets, but sets 2 and 3 are
+ * reserved for ARB generic attributes 6/7 rather than texture units.  Giving
+ * units 2-7 real coordinates is a separate change and is not done here. */
+void _glsMultiTexCoord1fARB(unsigned int target, float s);
 void _glsMultiTexCoord2fARB(unsigned int target, float s, float t);
+void _glsMultiTexCoord3fARB(unsigned int target, float s, float t, float r);
+void _glsMultiTexCoord4fARB(unsigned int target, float s, float t, float r, float q);
+void _glsMultiTexCoord1fvARB(unsigned int target, const float *v);
 void _glsMultiTexCoord2fvARB(unsigned int target, const float *v);
+void _glsMultiTexCoord3fvARB(unsigned int target, const float *v);
+void _glsMultiTexCoord4fvARB(unsigned int target, const float *v);
+
+/* ===== Texture coordinate generation ===== */
+void _glsTexGeni(unsigned int coord, unsigned int pname, int param);
+void _glsTexGenfv(unsigned int coord, unsigned int pname, const float *params);
+void _glsGetTexGenfv(unsigned int coord, unsigned int pname, float *params);
+void _glsGetTexGeniv(unsigned int coord, unsigned int pname, int *params);
+void _glsApplyTexGenState(int unit);
 
 /* ===== Stencil two-side ===== */
 void _glsActiveStencilFaceEXT(unsigned int face);
@@ -402,29 +469,142 @@ void _glsGetMaterialiv(unsigned int face, unsigned int pname, int *params);
  * Normals and the second texcoord set are always present even when the
  * application supplies neither.  Selecting a narrower FVF per draw would save
  * bandwidth but requires a matching struct layout per permutation; a single
- * format keeps assembly correct, which matters more here than the 44 bytes.
+ * format keeps assembly correct, which matters more here than the few bytes.
+ *
+ * Texcoord sets 2 and 3 are not texture coordinates at all: they carry ARB
+ * generic vertex attributes 6 and 7, the only two indices ARB_vertex_program
+ * leaves without a conventional alias (every other index aliases position,
+ * weight, normal, colour, fogcoord or a texcoord set).  A spare texcoord set
+ * is the cheapest way to hand a vertex shader arbitrary per-vertex data under
+ * an FVF.  They are 4-component because a generic attribute is a vec4 in
+ * general and the translator always declares its inputs as float4; the
+ * default 2-component texcoord size would silently truncate one.
  */
 typedef struct {
     float x, y, z;
     float nx, ny, nz;
     DWORD color;
+    DWORD specular;     /* glSecondaryColor; D3D9 mandates this order */
     float u0, v0;
     float u1, v1;
+    float genericAttrib6[4];    /* texcoord set 2: ARB vertex.attrib[6] */
+    float genericAttrib7[4];    /* texcoord set 3: ARB vertex.attrib[7] */
 } GLS_D3DVertex;
 
-#define GLS_D3DFVF (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX2)
+#define GLS_D3DFVF (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | \
+                    D3DFVF_TEX4 | D3DFVF_TEXCOORDSIZE4(2) | D3DFVF_TEXCOORDSIZE4(3))
 
 /* ===== D3D9 helper functions ===== */
 D3DFORMAT _glsMapGLFormatToD3D(unsigned int internalformat);
 D3DFORMAT _glsMapCompressedFormatToD3D(unsigned int internalformat);
-void _glsCopyPixelsToD3D(void *dst, const void *src, int width, int height, unsigned int glFormat, unsigned int glType, int dstPitch);
+void _glsCopyPixelsToD3D(void *dst, const void *src, int width, int height, unsigned int glFormat, unsigned int glType, int dstPitch, D3DFORMAT dstFmt);
+/* Mirror of the above.  `flipRows` reverses row order, which glReadPixels needs
+ * because GL images run bottom-up and D3D9 surfaces top-down. */
+void _glsCopyPixelsFromD3D(void *dst, const void *src, int width, int height, unsigned int glFormat, unsigned int glType, int srcPitch, D3DFORMAT srcFmt, int flipRows);
 void _glsApplyD3DCullMode(void);
 D3DBLEND _glsMapBlendFactor(unsigned int glFactor);
 D3DCMPFUNC _glsMapCompareFunc(unsigned int glFunc);
 
+/* ===== Pixel read-back / framebuffer-to-texture ===== */
+void _glsReadPixels(int x, int y, int width, int height, unsigned int format, unsigned int type, void *pixels);
+void _glsCopyTexImage2D(unsigned int target, int level, unsigned int internalformat, int x, int y, int width, int height, int border);
+void _glsCopyTexSubImage2D(unsigned int target, int level, int xoffset, int yoffset, int x, int y, int width, int height);
+void _glsCopyPixels(int x, int y, int width, int height, unsigned int type);
+void _glsDrawPixels(int width, int height, unsigned int format, unsigned int type, const void *pixels);
+
 /* ===== Draw calls ===== */
 void _glsDrawArrays(unsigned int mode, int first, int count);
 void _glsDrawElements(unsigned int mode, int count, unsigned int type, const void *indices);
+void _glsDrawElementsBaseVertex(unsigned int mode, int count, unsigned int type,
+                                const void *indices, int basevertex);
+
+
+/* ===== GL 1.x fixed-function paths (gl_legacy_impl.c) ===== */
+void _glsApplyTexEnv(int unit);
+void _glsInitTexEnvDefaults(void);
+void _glsTexEnvf(unsigned int target, unsigned int pname, float param);
+void _glsTexEnvfv(unsigned int target, unsigned int pname, const float *params);
+void _glsTexEnvi(unsigned int target, unsigned int pname, int param);
+void _glsTexEnviv(unsigned int target, unsigned int pname, const int *params);
+void _glsGetTexEnvfv(unsigned int target, unsigned int pname, float *params);
+void _glsGetTexEnviv(unsigned int target, unsigned int pname, int *params);
+void _glsTexImage1D(unsigned int target, int level, int internalformat, int width, int border, unsigned int format, unsigned int type, const void *pixels);
+void _glsTexSubImage1D(unsigned int target, int level, int xoffset, int width, unsigned int format, unsigned int type, const void *pixels);
+void _glsRasterPos4f(float x, float y, float z, float w);
+void _glsWindowPos3f(float x, float y, float z);
+void _glsPixelZoom(float xfactor, float yfactor);
+void _glsBitmap(int width, int height, float xorig, float yorig, float xmove, float ymove, const unsigned char *bitmap);
+void _glsMap1f(unsigned int target, float u1, float u2, int stride, int order, const float *points);
+void _glsMap2f(unsigned int target, float u1, float u2, int ustride, int uorder, float v1, float v2, int vstride, int vorder, const float *points);
+void _glsEvalCoord1f(float u);
+void _glsEvalCoord2f(float u, float v);
+void _glsMapGrid1f(int un, float u1, float u2);
+void _glsMapGrid2f(int un, float u1, float u2, int vn, float v1, float v2);
+void _glsEvalMesh1(unsigned int mode, int i1, int i2);
+void _glsEvalMesh2(unsigned int mode, int i1, int i2, int j1, int j2);
+void _glsEvalPoint1(int i);
+void _glsEvalPoint2(int i, int j);
+void _glsGetMapfv(unsigned int target, unsigned int query, float *v);
+BOOL _glsSetEvalEnable(unsigned int cap, BOOL enable);
+void _glsSelectBuffer(int size, unsigned int *buffer);
+void _glsFeedbackBuffer(int size, unsigned int type, float *buffer);
+void _glsInitNames(void);
+void _glsPushName(unsigned int name);
+void _glsPopName(void);
+void _glsLoadName(unsigned int name);
+void _glsPassThrough(float token);
+int  _glsRenderMode(unsigned int mode);
+void _glsSelectRecordHit(float minZ, float maxZ);
+void _glsPolygonStipple(const unsigned char *mask);
+void _glsGetPolygonStipple(unsigned char *mask);
+void _glsLineStipple(int factor, unsigned short pattern);
+void _glsEdgeFlag(unsigned char flag);
+void _glsIndexf(float c);
+void _glsClearIndex(float c);
+void _glsIndexMask(unsigned int mask);
+void _glsPixelMapfv(unsigned int map, int mapsize, const float *values);
+void _glsGetPixelMapfv(unsigned int map, float *values);
+void _glsPixelTransferf(unsigned int pname, float param);
+void _glsApplyPixelTransferRGBA(unsigned char *rgba, int count);
+void _glsClearAccum(float r, float g, float b, float a);
+void _glsAccum(unsigned int op, float value);
+
+void _glsMap1d(unsigned int target, double u1, double u2, int stride, int order, const double *points);
+void _glsMap2d(unsigned int target, double u1, double u2, int ustride, int uorder, double v1, double v2, int vstride, int vorder, const double *points);
+void _glsGetMapiv(unsigned int target, unsigned int query, int *v);
+void _glsPixelMapuiv(unsigned int map, int mapsize, const unsigned int *values);
+void _glsPixelMapusv(unsigned int map, int mapsize, const unsigned short *values);
+void _glsGetPixelMapuiv(unsigned int map, unsigned int *values);
+void _glsGetPixelMapusv(unsigned int map, unsigned short *values);
+void _glsPixelTransferi(unsigned int pname, int param);
+void _glsPrioritizeTextures(int n, const unsigned int *textures, const float *priorities);
+
+void _glsFinish(void);
+void _glsFlush(void);
+unsigned char _glsIsTexture(unsigned int texture);
+void _glsGetPointerv(unsigned int pname, void **params);
+void _glsEdgeFlagPointer(int stride, const void *pointer);
+void _glsColorTableEXT(unsigned int target, unsigned int internalformat, int width, unsigned int format, unsigned int type, const void *table);
+void _glsColorSubTableEXT(unsigned int target, int start, int count, unsigned int format, unsigned int type, const void *data);
+void _glsGetColorTableEXT(unsigned int target, unsigned int format, unsigned int type, void *data);
+void _glsGetColorTableParameterivEXT(unsigned int target, unsigned int pname, int *params);
+void _glsGetColorTableParameterfvEXT(unsigned int target, unsigned int pname, float *params);
+void _glsResizeBuffersMESA(void);
+
+/* ===== Device lifetime =====
+ *
+ * g_glState is process-global and outlives any single GL context, so the two
+ * moments where the D3D9 device changes underneath it have to be told about.
+ *
+ * _glsReleaseDeviceLosableResources: called immediately before
+ * IDirect3DDevice9::Reset.  Releases only what a reset destroys and what has a
+ * re-creation path; managed textures and shader objects are deliberately kept.
+ *
+ * _glsReleaseAllDeviceResources: called once at real process shutdown, just
+ * before the device is released.  Releases everything.
+ */
+void _glsReleaseDeviceLosableResources(IDirect3DDevice9 *pDev);
+void _glsReleaseAllDeviceResources(IDirect3DDevice9 *pDev);
 
 #ifdef __cplusplus
 }

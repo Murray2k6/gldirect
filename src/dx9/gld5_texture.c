@@ -40,6 +40,11 @@
 #include "gldirect5.h"
 #include "mesa_compat.h"
 
+/* Texture-format capability probe.  It describes the adapter rather than
+ * any one pipeline, so this legacy path uses the same accessor the GL46
+ * path does. */
+#include "gl46/context_manager.h"
+
 /* D3DX removed — all texture ops use pure D3D9 API */
 
 // TODO: Mesa includes removed - replaced by mesa_compat.h shim
@@ -769,6 +774,19 @@ HRESULT _gldDrawPixels(
 	float				ScaleWidth, ScaleHeight;
 	float				fPixelCenterY; // An adjustment for sampling textures from their pixel center
 
+	// Confirm the device can create this format before asking it to, so a
+	// failing CreateTexture is never issued here either — see
+	// _gldAllocateTexture for why one failed call cannot simply be retried.
+	// There is no substitute to offer: this path needs A8R8G8B8 to hold the
+	// image it is about to build.
+	if (gldGetD3D46() != NULL &&
+	    !gldIsTextureFormatSupported46(D3DFMT_A8R8G8B8, FALSE))
+	{
+		gldLogPrintf(GLDLOG_WARN,
+			"DrawPixels: D3DFMT_A8R8G8B8 unsupported by device - image not drawn");
+		return E_FAIL;
+	}
+
 	// Create a texture to hold image — pure D3D9, no D3DX
 	hr = IDirect3DDevice9_CreateTexture(
 		gld->pDev,
@@ -1445,6 +1463,19 @@ void gld_Bitmap_DX9(
 // Texture functions
 //---------------------------------------------------------------------------
 
+// Does this destination surface format carry an alpha channel?  Decides
+// which universal format a substitution has to use, so alpha data is never
+// silently dropped.
+static BOOL _gldD3DFormatHasAlpha(
+	D3DFORMAT fmt)
+{
+	switch (fmt) {
+	case D3DFMT_A8R8G8B8: case D3DFMT_A8:       case D3DFMT_A8L8:
+	case D3DFMT_A4R4G4B4: case D3DFMT_A1R5G5B5: return TRUE;
+	default:                                    return FALSE;
+	}
+}
+
 void _gldAllocateTexture(
 	GLcontext *ctx,
 	struct gl_texture_object *tObj,
@@ -1476,10 +1507,47 @@ void _gldAllocateTexture(
 	}
 
 	d3dFormat = _gldGLFormatToD3DFormat(texImage->IntFormat);
+
+	// Confirm the device can create this format before asking it to.  This
+	// replaces the create-then-retry-with-A8R8G8B8 fallback that used to
+	// live below: on some d3d9.dll implementations a single failed
+	// CreateTexture leaves the device in a state where every later
+	// CreateTexture fails as well, the retry included, so a reactive
+	// fallback cannot recover.
+	//
+	// The capability cache lives with the GL46 IDirect3D9.  When that
+	// interface does not exist this pipeline is running without the GL46
+	// backend and there is nothing to ask, so the requested format is used
+	// unchanged rather than treating "cannot ask" as "unsupported".
+	if (gldGetD3D46() != NULL &&
+	    !gldIsTextureFormatSupported46(d3dFormat, FALSE))
+	{
+		D3DFORMAT fallback = _gldD3DFormatHasAlpha(d3dFormat) ?
+			D3DFMT_A8R8G8B8 : D3DFMT_X8R8G8B8;
+
+		gldLogPrintf(GLDLOG_WARN,
+			"AllocateTexture: D3DFMT=%d unsupported by device - falling back to D3DFMT=%d",
+			(int)d3dFormat, (int)fallback);
+
+		if (fallback == d3dFormat ||
+		    !gldIsTextureFormatSupported46(fallback, FALSE))
+		{
+			gldLogPrintf(GLDLOG_WARN,
+				"AllocateTexture: fallback D3DFMT=%d also unsupported - texture left without data",
+				(int)fallback);
+			tObj->DriverData = NULL;
+			return;
+		}
+
+		d3dFormat = fallback;
+	}
+
 	// Pure D3D9: IDirect3DDevice9_CreateTexture replaces D3DXCreateTexture.
 	// When mipmaps are requested, use 0 (full chain) instead of D3DX_DEFAULT.
 	{
 		UINT mipLevels = (glb.bUseMipmaps) ? 0 : 1;
+		// The FAILED(hr) path stays as the safety net for non-format
+		// runtime failures such as running out of video memory.
 		HRESULT hr = IDirect3DDevice9_CreateTexture(
 			gld->pDev,
 			texImage->Width,
@@ -1491,21 +1559,10 @@ void _gldAllocateTexture(
 			&pTex,
 			NULL);
 		if (FAILED(hr)) {
-			// If the requested format isn't supported, fall back to A8R8G8B8
-			if (d3dFormat != D3DFMT_A8R8G8B8) {
-				hr = IDirect3DDevice9_CreateTexture(
-					gld->pDev,
-					texImage->Width,
-					texImage->Height,
-					mipLevels,
-					0,
-					D3DFMT_A8R8G8B8,
-					D3DPOOL_MANAGED,
-					&pTex,
-					NULL);
-			}
-			if (FAILED(hr))
-				pTex = NULL;
+			gldLogPrintf(GLDLOG_WARN,
+				"AllocateTexture: CreateTexture FAILED hr=0x%08X %dx%d fmt=%d",
+				hr, (int)texImage->Width, (int)texImage->Height, (int)d3dFormat);
+			pTex = NULL;
 		}
 	}
 	tObj->DriverData = pTex;

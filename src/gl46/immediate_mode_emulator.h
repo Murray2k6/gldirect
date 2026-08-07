@@ -280,34 +280,6 @@ void gldImScalef(float x, float y, float z);
  */
 void gldImTranslatef(float x, float y, float z);
 
-/* ===================================================================
- * Legacy lighting/material stubs (Task 17.2)
- * =================================================================== */
-
-/*
- * Set a light parameter.
- * Forwards to Fixed_Function_Emulator state.
- *
- * Parameters:
- *   light — GL_LIGHT0 through GL_LIGHT7
- *   pname — parameter name (GL_AMBIENT, GL_DIFFUSE, GL_SPECULAR,
- *           GL_POSITION, etc.)
- *   params — pointer to parameter value(s).
- */
-void gldImLightfv(GLenum light, GLenum pname, const float *params);
-
-/*
- * Set a material parameter.
- * Forwards to Fixed_Function_Emulator state.
- *
- * Parameters:
- *   face  — GL_FRONT, GL_BACK, or GL_FRONT_AND_BACK
- *   pname — parameter name (GL_AMBIENT, GL_DIFFUSE, GL_SPECULAR,
- *           GL_EMISSION, GL_SHININESS, etc.)
- *   params — pointer to parameter value(s).
- */
-void gldImMaterialfv(GLenum face, GLenum pname, const float *params);
-
 #ifdef  __cplusplus
 }
 #endif

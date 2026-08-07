@@ -7,7 +7,7 @@
 *
 *  DSA pattern: save current binding → bind named object → call regular func → restore
 *
-*  Also includes NV_half_float vertex weight stubs and AMD query extensions.
+*  Also includes the AMD batched-query extension.
 *********************************************************************************/
 
 #include <windows.h>
@@ -24,7 +24,6 @@ typedef int GLsizei;
 typedef unsigned int GLuint;
 typedef float GLfloat;
 typedef void GLvoid;
-typedef unsigned short GLhalfNV;
 typedef long long GLint64;
 typedef unsigned long long GLuint64;
 typedef signed long long GLsizeiptr;
@@ -60,7 +59,7 @@ typedef void   (APIENTRY *PFN_glBindFramebuffer)(GLenum, GLuint);
 typedef void   (APIENTRY *PFN_glGetIntegerv)(GLenum, GLint*);
 typedef void   (APIENTRY *PFN_glFramebufferTexture)(GLenum, GLenum, GLuint, GLint);
 typedef void   (APIENTRY *PFN_glFramebufferTextureLayer)(GLenum, GLenum, GLuint, GLint, GLint);
-typedef void   (APIENTRY *PFN_glFramebufferTextureFaceARB)(GLenum, GLenum, GLuint, GLint, GLenum);
+typedef void   (APIENTRY *PFN_glFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
 
 /* Renderbuffer */
 typedef void   (APIENTRY *PFN_glBindRenderbuffer)(GLenum, GLuint);
@@ -80,6 +79,7 @@ static PFN_glBindFramebuffer  _pfnBindFramebuffer  = NULL;
 static PFN_glGetIntegerv      _pfnGetIntegerv      = NULL;
 static PFN_glFramebufferTexture _pfnFramebufferTexture = NULL;
 static PFN_glFramebufferTextureLayer _pfnFramebufferTextureLayer = NULL;
+static PFN_glFramebufferTexture2D _pfnFramebufferTexture2D = NULL;
 static PFN_glBindRenderbuffer _pfnBindRenderbuffer = NULL;
 static PFN_glRenderbufferStorageMultisample _pfnRenderbufferStorageMultisample = NULL;
 static PFN_glBindTexture      _pfnBindTexture      = NULL;
@@ -95,6 +95,7 @@ static void _ensureResolved(void)
     _pfnGetIntegerv      = (PFN_glGetIntegerv)_resolveGL("glGetIntegerv");
     _pfnFramebufferTexture = (PFN_glFramebufferTexture)_resolveGL("glFramebufferTexture");
     _pfnFramebufferTextureLayer = (PFN_glFramebufferTextureLayer)_resolveGL("glFramebufferTextureLayer");
+    _pfnFramebufferTexture2D = (PFN_glFramebufferTexture2D)_resolveGL("glFramebufferTexture2D");
     _pfnBindRenderbuffer = (PFN_glBindRenderbuffer)_resolveGL("glBindRenderbuffer");
     _pfnRenderbufferStorageMultisample = (PFN_glRenderbufferStorageMultisample)_resolveGL("glRenderbufferStorageMultisample");
     _pfnBindTexture      = (PFN_glBindTexture)_resolveGL("glBindTexture");
@@ -144,19 +145,14 @@ void APIENTRY glNamedFramebufferTextureLayerEXT(GLuint framebuffer, GLenum attac
 void APIENTRY glNamedFramebufferTextureFaceEXT(GLuint framebuffer, GLenum attachment,
     GLuint texture, GLint level, GLenum face)
 {
-    /*
-     * FramebufferTextureFace is from EXT_geometry_shader4 / NV_geometry_program4.
-     * Mesa doesn't expose it, but the DSA version is queried by id Tech 5.
-     * Implement as FramebufferTexture (ignoring face) — correct for non-cubemap,
-     * and for cubemap the layer-based approach is preferred anyway.
-     */
+    /* Bind-call-restore using the exact cube-map face target. */
     GLint savedFBO = 0;
     _ensureResolved();
-    if (!_pfnBindFramebuffer || !_pfnGetIntegerv || !_pfnFramebufferTexture) return;
+    if (!_pfnBindFramebuffer || !_pfnGetIntegerv || !_pfnFramebufferTexture2D) return;
 
     _pfnGetIntegerv(GL_FRAMEBUFFER_BINDING, &savedFBO);
     _pfnBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-    _pfnFramebufferTexture(GL_FRAMEBUFFER, attachment, texture, level);
+    _pfnFramebufferTexture2D(GL_FRAMEBUFFER, attachment, face, texture, level);
     _pfnBindFramebuffer(GL_FRAMEBUFFER, (GLuint)savedFBO);
 }
 
@@ -322,38 +318,6 @@ void APIENTRY glGetNamedProgramLocalParameterIuivEXT(GLuint program, GLenum targ
 }
 
 /*===========================================================================
- * NV_explicit_multisample — Texture/MultiTex Renderbuffer
- *
- * These attach a renderbuffer to a texture for multisample resolve.
- * Mesa doesn't support NV_explicit_multisample, but id Tech 5 queries these.
- * Implement as no-ops that don't crash — the engine falls back to other paths.
- *===========================================================================*/
-
-void APIENTRY glTextureRenderbufferEXT(GLuint texture, GLenum target, GLuint renderbuffer)
-{
-    /*
-     * NV_explicit_multisample: TexRenderbufferNV with DSA.
-     * Binds a renderbuffer's storage to a texture for multisample texel fetch.
-     * Mesa doesn't support this — the engine will use a fallback path.
-     * We do nothing but don't crash.
-     */
-    (void)texture;
-    (void)target;
-    (void)renderbuffer;
-}
-
-void APIENTRY glMultiTexRenderbufferEXT(GLenum texunit, GLenum target, GLuint renderbuffer)
-{
-    /*
-     * NV_explicit_multisample: MultiTex variant.
-     * Same as above but addressed by texture unit instead of texture name.
-     */
-    (void)texunit;
-    (void)target;
-    (void)renderbuffer;
-}
-
-/*===========================================================================
  * AMD_multi_draw_indirect query extension
  *
  * glGetMultiQueryObjectuivAMD — batch query of multiple query objects.
@@ -378,26 +342,4 @@ void APIENTRY glGetMultiQueryObjectuivAMD(GLuint id, GLuint count, GLenum pname,
         GLuint *dest = (GLuint*)((unsigned char*)params + i * stride);
         _pfnGetQueryObjectuiv(id + i, pname, dest);
     }
-}
-
-/*===========================================================================
- * NV_half_float — Vertex Weight
- *
- * glVertexWeighthNV / glVertexWeighthvNV — set vertex weight using half float.
- * Part of NV_half_float + EXT_vertex_weighting.
- * Mesa doesn't support vertex weighting. These are legacy NVIDIA extensions.
- * Implement as no-ops — no modern game actually uses vertex weighting for
- * rendering, but id Tech 5 queries the function pointers.
- *===========================================================================*/
-
-void APIENTRY glVertexWeighthNV(GLhalfNV weight)
-{
-    /* NV_half_float vertex weight — no-op, vertex weighting is legacy NVIDIA */
-    (void)weight;
-}
-
-void APIENTRY glVertexWeighthvNV(const GLhalfNV *weight)
-{
-    /* NV_half_float vertex weight vector — no-op */
-    (void)weight;
 }

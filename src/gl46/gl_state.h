@@ -43,32 +43,61 @@ extern "C" {
 #define GLS_MAX_MATRIX_STACK    32
 #define GLS_MAX_LIGHTS          8
 #define GLS_MAX_CLIP_PLANES     6
+#define GLS_MAX_IMAGE_UNITS     8
+#define GLS_MAX_BUFFER_BINDINGS 16
+#define GLS_MAX_STAGE_VARYINGS  8
 
 /* ===== Texture object ===== */
 typedef struct {
     GLuint_t            id;
     GLenum_t            target;         /* GL_TEXTURE_2D, GL_TEXTURE_CUBE_MAP, etc. */
     GLint_t             width, height, depth;
+    GLint_t             samples;
+    GLboolean_t         fixedSampleLocations;
     GLenum_t            internalFormat;
     GLenum_t            minFilter, magFilter;
     GLenum_t            wrapS, wrapT, wrapR;
     IDirect3DTexture9   *pTex;          /* D3D9 texture (NULL until data uploaded) */
     IDirect3DCubeTexture9 *pCubeTex;
+    IDirect3DVolumeTexture9 *pVolTex;   /* GL_TEXTURE_3D storage */
+    GLuint_t            bufferObject;  /* GL_TEXTURE_BUFFER source buffer */
+    GLintptr_t          bufferOffset;  /* first byte exposed by TexBufferRange */
+    GLsizeiptr_t        bufferSize;    /* zero means the complete buffer */
     void                *pixelData;     /* CPU-side copy for readback */
     GLsizei_t           pixelDataSize;
     BOOL                allocated;
 } GLS_Texture;
+
+typedef struct {
+    GLuint_t            texture;
+    GLint_t             level;
+    GLboolean_t         layered;
+    GLint_t             layer;
+    GLenum_t            access;
+    GLenum_t            format;
+} GLS_ImageBinding;
+
+typedef struct {
+    GLuint_t            buffer;
+    GLintptr_t          offset;
+    GLsizeiptr_t        size;
+} GLS_IndexedBufferBinding;
 
 /* ===== Buffer object ===== */
 typedef struct {
     GLuint_t            id;
     GLenum_t            target;         /* GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER, etc. */
     GLenum_t            usage;
+    GLbitfield_t        storageFlags;
+    BOOL                immutable;
     void                *data;          /* CPU-side buffer data */
     GLsizeiptr_t        size;
     IDirect3DVertexBuffer9 *pVB;
     IDirect3DIndexBuffer9  *pIB;
     BOOL                mapped;
+    GLintptr_t          mapOffset;
+    GLsizeiptr_t        mapLength;
+    GLbitfield_t        mapAccess;
     BOOL                allocated;
 } GLS_Buffer;
 
@@ -84,12 +113,25 @@ typedef struct {
     BOOL                integer;        /* set via VertexAttribIPointer */
     float               defaultValue[4]; /* default attrib value (x,y,z,w) */
     GLuint_t            divisor;        /* instanced rendering divisor */
+    GLuint_t            bindingIndex;   /* GL 4.3 vertex binding slot */
+    GLuint_t            relativeOffset; /* byte offset inside that slot */
 } GLS_VertexAttrib;
+
+/* GL 4.3 split vertex-format/buffer binding model.  D3D9 exposes the same
+ * concept as vertex streams, while the wrapper's CPU assembly path consumes
+ * it by resolving each attribute to buffer + offset + stride before a draw. */
+typedef struct {
+    GLuint_t            buffer;
+    GLintptr_t          offset;
+    GLsizei_t           stride;
+    GLuint_t            divisor;
+} GLS_VertexBinding;
 
 /* ===== VAO ===== */
 typedef struct {
     GLuint_t            id;
     GLS_VertexAttrib    attribs[GLS_MAX_VERTEX_ATTRIBS];
+    GLS_VertexBinding   bindings[GLS_MAX_VERTEX_ATTRIBS];
     GLuint_t            elementBuffer;  /* GL_ELEMENT_ARRAY_BUFFER binding */
     BOOL                allocated;
 } GLS_VAO;
@@ -120,6 +162,36 @@ typedef struct {
     BOOL                allocated;
 } GLS_RBO;
 
+/* ===== ARB assembly program (ARB_vertex_program / ARB_fragment_program) =====
+ *
+ * Hung off GLS_Shader rather than living in a pool of its own: ARB programs
+ * share the shader ID space (glGenProgramsARB hands out shader IDs), and a
+ * second pool would mean a second, colliding ID space.  It is allocated on
+ * demand because only a handful of the 1024 shader slots are ever ARB
+ * programs, and the two 96-entry parameter arrays are too large to give every
+ * slot unconditionally.
+ */
+#define GLS_MAX_PROGRAM_PARAMS 96
+
+typedef struct {
+    IDirect3DVertexShader9  *pVS;       /* one of the two, per program target */
+    IDirect3DPixelShader9   *pPS;
+
+    /* Constant registers the translated program's uniform arrays landed on,
+     * discovered by reflecting the compiled bytecode's constant table.
+     * -1 means the program does not read that array at all. */
+    int                 envBaseReg,   envRegCount;
+    int                 localBaseReg, localRegCount;
+    int                 stateBaseReg, stateRegCount;
+
+    float               envParams[GLS_MAX_PROGRAM_PARAMS][4];
+    float               localParams[GLS_MAX_PROGRAM_PARAMS][4];
+
+    BOOL                usesStateMatrices;
+    BOOL                usesStateLight;
+    BOOL                usesStateFog;
+} GLS_ARBProgram;
+
 /* ===== Shader ===== */
 typedef struct {
     GLuint_t            id;
@@ -127,6 +199,7 @@ typedef struct {
     char                *source;
     BOOL                compiled;
     BOOL                allocated;
+    GLS_ARBProgram      *arb;           /* non-NULL once glProgramStringARB ran */
 } GLS_Shader;
 
 /* ===== Uniform storage ===== */
@@ -146,6 +219,25 @@ typedef struct {
     BOOL                set;
 } GLS_AttribBinding;
 
+typedef struct {
+    char                name[64];
+    GLint_t             components;
+    GLint_t             location;
+    BOOL                isFlat;
+    BOOL                isInteger;
+    BOOL                isUnsigned;
+} GLS_StageVarying;
+
+typedef struct {
+    char                name[64];
+    GLenum_t            type;
+    GLint_t             components;
+    GLint_t             arraySize;
+    GLint_t             offset;
+    GLint_t             bytes;
+    GLint_t             userIndex;
+} GLS_CaptureField;
+
 /* ===== Resolved uniform =====
  *
  * One GL uniform name and the D3D9 constant registers it landed on.  The
@@ -162,13 +254,43 @@ typedef struct {
     int                 registerSet;    /* GLSL_RS_* */
 } GLS_ResolvedUniform;
 
+/* ===== Synthesized texture-dimension uniform =====
+ *
+ * The GLSL->HLSL transpiler lowers texelFetch/textureSize onto tex2Dlod plus a
+ * "_glsl_texdim_<sampler>" uniform holding (width, height, 1/width, 1/height):
+ * SM3 has neither integer texel addressing nor a runtime size query, but both
+ * fall out of that one constant.  Nothing in GL sets it, so the draw path has
+ * to, which means knowing which constant register it landed on and which
+ * sampler's texture it describes.  Both come from the reflected constant table
+ * when the program links.
+ */
+#define GLS_MAX_TEXDIM  8
+typedef struct {
+    int                 vsRegister;     /* register of _glsl_texdim_<name>, -1 if absent */
+    int                 psRegister;
+    int                 samplerPsRegister;  /* the sampler's own register = D3D9 stage */
+} GLS_TexDimBinding;
+
+/* ===== Active vertex attribute (glGetActiveAttrib) ===== */
+typedef struct {
+    char                name[64];
+    GLenum_t            type;           /* GL_FLOAT_VEC4 etc. */
+    GLint_t             size;           /* array elements, 1 for a scalar */
+} GLS_ActiveAttrib;
+
 /* ===== Program ===== */
 typedef struct {
     GLuint_t            id;
     GLuint_t            vertShader;
     GLuint_t            fragShader;
+    GLuint_t            geomShader;
+    GLuint_t            tessControlShader;
+    GLuint_t            tessEvalShader;
+    GLuint_t            computeShader;
     BOOL                linked;
     BOOL                validated;
+    BOOL                separable;
+    BOOL                binaryRetrievable;
     BOOL                allocated;
     GLS_Uniform         uniforms[GLS_MAX_UNIFORMS];
     int                 uniformCount;
@@ -180,6 +302,31 @@ typedef struct {
     IDirect3DPixelShader9  *pPS;
     GLS_ResolvedUniform resolved[GLS_MAX_UNIFORMS];
     int                 resolvedCount;
+
+    /* Synthesized _glsl_texdim_* uniforms this program's shaders declare.
+     * Empty for every program that does not use texelFetch/textureSize, which
+     * is what keeps the per-draw cost at a single count check. */
+    GLS_TexDimBinding   texDim[GLS_MAX_TEXDIM];
+    int                 texDimCount;
+    int                 viewportRegister; /* synthesized VS clip/viewport adjustment */
+
+    /* Vertex attribute names.  These do not survive into D3D9 bytecode,
+     * so they are captured from the GLSL source when the program links;
+     * glGetActiveAttrib has no other source for them. */
+    GLS_ActiveAttrib    activeAttribs[GLS_MAX_ATTRIB_BINDINGS];
+    int                 activeAttribCount;
+    BOOL                softwareGraphicsStages;
+    BOOL                softwareVertexExecution;
+    BOOL                softwareFragmentExecution;
+    GLS_StageVarying    stageVaryings[GLS_MAX_STAGE_VARYINGS];
+    int                 stageVaryingCount;
+    int                 stageCaptureWords;
+    GLS_CaptureField    captureFields[2 + GLS_MAX_STAGE_VARYINGS + GLS_MAX_VERTEX_ATTRIBS];
+    int                 captureFieldCount;
+    int                 captureStride;
+    GLenum_t            transformFeedbackMode;
+    int                 transformFeedbackCount;
+    char                transformFeedbackVaryings[GLS_MAX_VERTEX_ATTRIBS][64];
     char                infoLog[512];
 } GLS_Program;
 
@@ -196,12 +343,63 @@ typedef struct {
     BOOL                allocated;
 } GLS_Sampler;
 
+/* ===== Texture environment (fixed-function combiners) =====
+ *
+ * One per texture unit.  These drive D3D9's texture stage states, which are
+ * the direct analogue of GL's texture environment: GL_COMBINE's source and
+ * operand triples map onto D3DTSS_COLORARG1/2/0 and their alpha counterparts.
+ */
+typedef struct {
+    GLenum_t            mode;               /* MODULATE/REPLACE/DECAL/BLEND/ADD/COMBINE */
+    float               envColor[4];
+    GLenum_t            combineRGB, combineAlpha;
+    GLenum_t            srcRGB[3], srcAlpha[3];
+    GLenum_t            operandRGB[3], operandAlpha[3];
+    float               rgbScale, alphaScale;
+    float               lodBias;
+} GLS_TexEnv;
+
+/* ===== Evaluators (GL_MAP1_* / GL_MAP2_*) =====
+ *
+ * GL requires support for order 8; 16 is carried here so ordinary patch data
+ * fits without a heap allocation per map.
+ */
+#define GLS_MAX_EVAL_ORDER  16
+#define GLS_NUM_MAP_TARGETS 9       /* VERTEX_3/4, INDEX, COLOR_4, NORMAL, TEXTURE_COORD_1..4 */
+
+typedef struct {
+    BOOL                defined;
+    BOOL                enabled;
+    float               u1, u2;
+    int                 order;
+    int                 components;
+    float               points[GLS_MAX_EVAL_ORDER * 4];
+} GLS_Map1;
+
+typedef struct {
+    BOOL                defined;
+    BOOL                enabled;
+    float               u1, u2, v1, v2;
+    int                 uorder, vorder;
+    int                 components;
+    float               points[GLS_MAX_EVAL_ORDER * GLS_MAX_EVAL_ORDER * 4];
+} GLS_Map2;
+
+/* ===== Selection / feedback ===== */
+#define GLS_MAX_NAME_STACK  64
+
+/* ===== Pixel transfer maps ===== */
+#define GLS_NUM_PIXEL_MAPS  10
+#define GLS_MAX_PIXEL_MAP   256
+
 /* ===== Query ===== */
 typedef struct {
     GLuint_t            id;
     GLenum_t            target;
     BOOL                active;
     GLuint_t            result;
+    BOOL                resultReady;    /* result holds a value read back from D3D */
+    IDirect3DQuery9     *pQuery;        /* NULL when the target has no D3D9 analogue */
     BOOL                allocated;
 } GLS_Query;
 
@@ -289,15 +487,38 @@ typedef struct {
     /* Current bindings */
     GLuint_t            boundTexture2D[GLS_MAX_TEX_UNITS];
     GLuint_t            boundTextureCube[GLS_MAX_TEX_UNITS];
+    /* GL_TEXTURE_3D has its own binding point; GL_TEXTURE_1D shares the 2D one
+     * because a 1D texture is stored here as a 2D texture one row high. */
+    GLuint_t            boundTexture3D[GLS_MAX_TEX_UNITS];
+    GLuint_t            boundTextureBuffer[GLS_MAX_TEX_UNITS];
     GLuint_t            boundArrayBuffer;
     GLuint_t            boundElementBuffer;
+    GLuint_t            boundTextureBufferObject;
     GLuint_t            boundPixelPackBuffer;
     GLuint_t            boundPixelUnpackBuffer;
     GLuint_t            boundVAO;
-    GLuint_t            boundFBO;
+    /* GL_READ_FRAMEBUFFER and GL_DRAW_FRAMEBUFFER have been separate
+     * bindings since GL 3.0; glBlitFramebuffer is meaningless without
+     * the distinction. */
+    GLuint_t            boundReadFBO;
+    GLuint_t            boundDrawFBO;
     GLuint_t            boundRBO;
     GLuint_t            boundProgram;
+    GLuint_t            boundProgramPipeline;
+    GLuint_t            pipelineActiveProgram;
+    GLuint_t            pipelineVertexProgram;
+    GLuint_t            pipelineFragmentProgram;
+    GLuint_t            pipelineComputeProgram;
     GLenum_t            activeTexUnit;  /* GL_TEXTURE0 + n */
+
+    /* ARB assembly programs.  Kept apart from boundProgram: the two ARB
+     * targets bind and enable independently of each other and of
+     * glUseProgram, and GLS_Shader / GLS_Program are separate ID spaces whose
+     * numbers can collide. */
+    GLuint_t            boundVertexProgramARB;
+    GLuint_t            boundFragmentProgramARB;
+    BOOL                enableVertexProgramARB;
+    BOOL                enableFragmentProgramARB;
 
     /* Which GL texture unit each D3D9 sampler stage should read.
      * Set by glUniform1i on a sampler uniform; identity until then. */
@@ -327,6 +548,82 @@ typedef struct {
     float               polygonOffsetFactor, polygonOffsetUnits;
     float               lineWidth;
     float               pointSize;
+    float               fogCoord;       /* glFogCoord* value; see _glsFogCoordf */
+
+    /* ---- Fixed-function texture environment ---- */
+    GLS_TexEnv          texEnv[GLS_MAX_TEX_UNITS];
+
+    /* ---- Raster position (glRasterPos / glWindowPos / glBitmap) ---- */
+    float               rasterPos[4];       /* window coords x,y,z,w */
+    float               rasterColor[4];
+    float               rasterTexCoord[4];
+    float               rasterIndex;
+    GLboolean_t         rasterPosValid;
+    float               pixelZoomX, pixelZoomY;
+
+    /* ---- Evaluators ---- */
+    GLS_Map1            map1[GLS_NUM_MAP_TARGETS];
+    GLS_Map2            map2[GLS_NUM_MAP_TARGETS];
+    int                 mapGrid1n;
+    float               mapGrid1u1, mapGrid1u2;
+    int                 mapGrid2un, mapGrid2vn;
+    float               mapGrid2u1, mapGrid2u2, mapGrid2v1, mapGrid2v2;
+    GLboolean_t         autoNormal;
+
+    /* ---- Selection and feedback ---- */
+    GLenum_t            renderMode;
+    unsigned int        *selectBuffer;
+    GLsizei_t           selectBufferSize;
+    GLsizei_t           selectIndex;        /* write cursor into selectBuffer */
+    unsigned int        nameStack[GLS_MAX_NAME_STACK];
+    int                 nameStackDepth;
+    GLboolean_t         selectHitPending;
+    unsigned int        selectHitMinZ, selectHitMaxZ;
+    GLsizei_t           selectHitRecord;    /* index of the open hit's name count */
+    int                 selectHits;
+    float               *feedbackBuffer;
+    GLsizei_t           feedbackBufferSize;
+    GLsizei_t           feedbackIndex;
+    GLenum_t            feedbackType;
+    GLboolean_t         feedbackOverflow;
+
+    /* ---- Accumulation buffer ---- */
+    float               accumClear[4];
+    float               *accumBuffer;
+    int                 accumWidth, accumHeight;
+
+    /* ---- Pixel transfer ---- */
+    float               pixelMap[GLS_NUM_PIXEL_MAPS][GLS_MAX_PIXEL_MAP];
+    int                 pixelMapSize[GLS_NUM_PIXEL_MAPS];
+    float               redScale, greenScale, blueScale, alphaScale, depthScale;
+    float               redBias, greenBias, blueBias, alphaBias, depthBias;
+    float               indexShift, indexOffset;
+    GLboolean_t         mapColorFlag, mapStencilFlag;
+
+    /* ---- Stipple ---- */
+    unsigned char       polygonStipple[128];
+    int                 lineStippleFactor;
+    unsigned short      lineStipplePattern;
+
+    /* ---- Colour index mode ---- */
+    float               currentIndex;
+    float               clearIndexValue;
+    unsigned int        indexWriteMask;
+
+    /* ---- Edge flags ---- */
+    GLboolean_t         edgeFlag;
+
+    /* ---- Secondary (specular) colour ---- */
+    float               secondaryColor[3];
+    GLboolean_t         secondaryColorUsed;
+
+    /* ---- Multisample coverage ---- */
+    float               sampleCoverageValue;
+    GLboolean_t         sampleCoverageInvert;
+    float               minSampleShading;
+
+    /* ---- Conditional render ---- */
+    GLboolean_t         conditionalRenderSkip;
     GLenum_t            alphaFunc;
     float               alphaRef;
     GLenum_t            stencilFunc;
@@ -341,6 +638,9 @@ typedef struct {
     unsigned int        stencilBackMask;
     GLenum_t            stencilBackFail, stencilBackZFail, stencilBackZPass;
     unsigned int        stencilBackWriteMask;
+    /* glActiveStencilFaceEXT: which face the single-face glStencilFunc /
+     * glStencilOp write to.  GL_FRONT unless a program says otherwise. */
+    GLenum_t            activeStencilFace;
 
     int                 scissorX, scissorY, scissorW, scissorH;
     int                 viewportX, viewportY, viewportW, viewportH;
@@ -356,16 +656,36 @@ typedef struct {
     /* Transform feedback */
     BOOL                transformFeedbackActive;
     GLenum_t            transformFeedbackMode;
+    GLsizeiptr_t        transformFeedbackWriteOffset[GLS_MAX_BUFFER_BINDINGS];
 
     /* Buffer binding points (UBO, TFB, etc.) */
     GLuint_t            boundUniformBuffer;
     GLuint_t            boundCopyReadBuffer;
     GLuint_t            boundCopyWriteBuffer;
     GLuint_t            boundTransformFeedbackBuffer;
+    GLuint_t            boundShaderStorageBuffer;
+    GLuint_t            boundAtomicCounterBuffer;
+    GLuint_t            boundDrawIndirectBuffer;
+    GLuint_t            boundDispatchIndirectBuffer;
+    GLuint_t            boundParameterBuffer;
+    GLS_IndexedBufferBinding uniformBindings[GLS_MAX_BUFFER_BINDINGS];
+    GLS_IndexedBufferBinding transformFeedbackBindings[GLS_MAX_BUFFER_BINDINGS];
+    GLS_IndexedBufferBinding shaderStorageBindings[GLS_MAX_BUFFER_BINDINGS];
+    GLS_IndexedBufferBinding atomicCounterBindings[GLS_MAX_BUFFER_BINDINGS];
+    GLS_ImageBinding    imageBindings[GLS_MAX_IMAGE_UNITS];
 
     /* Primitive restart */
     GLuint_t            primitiveRestartIndex;
     BOOL                enablePrimitiveRestart;
+
+    /* Tessellation state is consumed by the software patch-expansion layer. */
+    GLint_t             patchVertices;
+    float               patchDefaultOuter[4];
+    float               patchDefaultInner[2];
+
+    /* Base-instance is exposed to the shader-lowering layer while an
+     * instanced draw is expanded into ordinary D3D9 draws. */
+    GLuint_t            currentBaseInstance;
 
     /* Sync */
     GLuint_t            nextSyncId;
@@ -390,6 +710,8 @@ typedef struct {
     BOOL                enableCullFace;
     BOOL                enableScissorTest;
     BOOL                enableStencilTest;
+    BOOL                enableRasterizerDiscard;
+    BOOL                enableStencilTestTwoSide; /* GL_STENCIL_TEST_TWO_SIDE_EXT */
     BOOL                enableAlphaTest;
     BOOL                enableFog;
     BOOL                enableLighting;
@@ -412,6 +734,17 @@ typedef struct {
     GLS_Material        materialBack;
     float               lightModelAmbient[4];
     BOOL                lightModelTwoSide;
+
+    /* Texture coordinate generation, per unit, per coordinate (S,T,R,Q) */
+    GLenum_t            texGenMode[GLS_MAX_TEX_UNITS][4];
+    BOOL                texGenEnabled[GLS_MAX_TEX_UNITS][4];
+    float               texGenObjectPlane[GLS_MAX_TEX_UNITS][4][4];
+    float               texGenEyePlane[GLS_MAX_TEX_UNITS][4][4];
+
+    /* Compiled vertex arrays (GL_EXT_compiled_vertex_array) */
+    GLint_t             lockedArrayFirst;
+    GLsizei_t           lockedArrayCount;
+    BOOL                arraysLocked;
 
     /* Fog */
     GLenum_t            fogMode;

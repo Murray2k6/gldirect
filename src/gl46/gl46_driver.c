@@ -54,7 +54,9 @@
 #include "gl46/coordinate_adapter.h"
 #include "gl46/fixed_function_emulator.h"
 #include "gl46/gl_modern_stubs.h"
+#include "gl46/gl_generated_stubs.h"
 #include "gl46/gl_state.h"
+#include "gl46/gl_impl.h"
 
 //---------------------------------------------------------------------------
 // gldGetDXErrorString_GL46
@@ -304,6 +306,7 @@ BOOL gldSwapBuffers_GL46(
 
 	{
 		HRESULT hr;
+		BOOL bWasReset = FALSE;
 
 		// End the current scene
 		IDirect3DDevice9_EndScene(pDev);
@@ -316,22 +319,39 @@ BOOL gldSwapBuffers_GL46(
 			hr = IDirect3DDevice9_TestCooperativeLevel(pDev);
 			if (hr == D3DERR_DEVICENOTRESET) {
 				D3DPRESENT_PARAMETERS d3dpp;
-				D3DDISPLAYMODE d3ddm;
-				IDirect3DDevice9_GetDisplayMode(pDev, 0, &d3ddm);
-				ZeroMemory(&d3dpp, sizeof(d3dpp));
-				d3dpp.Windowed = TRUE;
-				d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-				d3dpp.BackBufferFormat = d3ddm.Format;
-				d3dpp.BackBufferCount = 1;
-				d3dpp.EnableAutoDepthStencil = TRUE;
-				d3dpp.AutoDepthStencilFormat = D3DFMT_D24S8;
-				d3dpp.hDeviceWindow = hWnd ? hWnd : (ctx ? ctx->hWnd : NULL);
-				IDirect3DDevice9_Reset(pDev, &d3dpp);
+				HWND hResetWnd = hWnd ? hWnd : (ctx ? ctx->hWnd : NULL);
+
+				// Same parameters the device was created with.  The block
+				// that used to live here never set BackBufferWidth/Height at
+				// all and asked for an auto depth-stencil the device was not
+				// created with, so a recovered device could come back a
+				// different shape than the one the game is drawing into.
+				gldBuildPresentParams46(hResetWnd, &d3dpp);
+
+				gldDiagLog("GL46: device-lost Reset hWnd=%p -> backbuffer %ux%u",
+					(void*)hResetWnd, d3dpp.BackBufferWidth, d3dpp.BackBufferHeight);
+
+				// Reset refuses to run while anything it destroys is alive.
+				_glsReleaseDeviceLosableResources(pDev);
+
+				hr = IDirect3DDevice9_Reset(pDev, &d3dpp);
+				if (FAILED(hr))
+					gldLogPrintf(GLDLOG_ERROR,
+						"GL46: device-lost Reset failed (0x%08X)", hr);
+				else
+					bWasReset = TRUE;
 			}
 		}
 
 		// Begin a new scene for the next frame
 		IDirect3DDevice9_BeginScene(pDev);
+
+		// A Reset clears render and transform state, so re-apply the defaults
+		// the backend assumes — but only when one actually happened.  Doing it
+		// unconditionally would overwrite, every single frame, whatever state
+		// the application's GL calls had put on the device.
+		if (bWasReset)
+			gldApplyDefaultDeviceState46(pDev);
 
 		return TRUE;
 	}
@@ -342,26 +362,80 @@ BOOL gldSwapBuffers_GL46(
 // gldGetProcAddress_GL46
 //
 // Return function pointers for GL/WGL extensions. Since we're a DX9 wrapper
-// emulating OpenGL, we provide stub implementations for WGL extensions that
+// emulating OpenGL, we provide local implementations for WGL extensions that
 // apps use to negotiate context versions and query capabilities.
 //---------------------------------------------------------------------------
 
-// WGL extension stubs
+// WGL extensions implemented by the direct D3D9 backend.
+
+#define GLD_WGL_EXTENSIONS \
+	"WGL_ARB_create_context WGL_ARB_create_context_profile " \
+	"WGL_ARB_extensions_string WGL_EXT_extensions_string " \
+	"WGL_ARB_pixel_format WGL_EXT_pixel_format"
 
 static const char *WINAPI _wglGetExtensionsStringARB(HDC hDC)
 {
-	return "WGL_ARB_create_context WGL_ARB_create_context_profile "
-	       "WGL_ARB_extensions_string WGL_EXT_extensions_string "
-	       "WGL_ARB_pixel_format WGL_ARB_multisample "
-	       "WGL_ARB_pbuffer WGL_EXT_swap_control";
+	return GLD_WGL_EXTENSIONS;
 }
 
 static const char *WINAPI _wglGetExtensionsStringEXT(void)
 {
-	return "WGL_ARB_create_context WGL_ARB_create_context_profile "
-	       "WGL_ARB_extensions_string WGL_EXT_extensions_string "
-	       "WGL_ARB_pixel_format WGL_ARB_multisample "
-	       "WGL_ARB_pbuffer WGL_EXT_swap_control";
+	return GLD_WGL_EXTENSIONS;
+}
+
+/*
+ * WGL_ARB_pixel_format / WGL_EXT_pixel_format. Both extensions share the
+ * token values and entry point signatures, so the ARB and EXT names are
+ * aliases of one implementation in the pixel format provider. The indices
+ * these return are the wrapper's own pixel format indices, the same ones
+ * wglChoosePixelFormat / wglDescribePixelFormat use.
+ */
+
+static BOOL WINAPI _wglChoosePixelFormatARB(HDC hDC, const int *piAttribIList,
+                                            const FLOAT *pfAttribFList,
+                                            UINT nMaxFormats, int *piFormats,
+                                            UINT *nNumFormats)
+{
+	extern BOOL gldValidate(void);
+
+	if (!gldValidate()) {
+		gldLogMessage(GLDLOG_ERROR,
+			"GL46: wglChoosePixelFormatARB: gldValidate failed\n");
+		return FALSE;
+	}
+
+	return gldChoosePixelFormatARB46(hDC, piAttribIList, pfAttribFList,
+	                                 nMaxFormats, piFormats, nNumFormats);
+}
+
+static BOOL WINAPI _wglGetPixelFormatAttribivARB(HDC hDC, int iPixelFormat,
+                                                 int iLayerPlane,
+                                                 UINT nAttributes,
+                                                 const int *piAttributes,
+                                                 int *piValues)
+{
+	extern BOOL gldValidate(void);
+
+	if (!gldValidate())
+		return FALSE;
+
+	return gldGetPixelFormatAttribivARB46(hDC, iPixelFormat, iLayerPlane,
+	                                      nAttributes, piAttributes, piValues);
+}
+
+static BOOL WINAPI _wglGetPixelFormatAttribfvARB(HDC hDC, int iPixelFormat,
+                                                 int iLayerPlane,
+                                                 UINT nAttributes,
+                                                 const int *piAttributes,
+                                                 FLOAT *pfValues)
+{
+	extern BOOL gldValidate(void);
+
+	if (!gldValidate())
+		return FALSE;
+
+	return gldGetPixelFormatAttribfvARB46(hDC, iPixelFormat, iLayerPlane,
+	                                      nAttributes, piAttributes, pfValues);
 }
 
 static HGLRC WINAPI _wglCreateContextAttribsARB(HDC hDC, HGLRC hShareContext, const int *attribList)
@@ -468,95 +542,6 @@ static HGLRC WINAPI _wglCreateContextAttribsARB(HDC hDC, HGLRC hShareContext, co
 	return hglrc;
 }
 
-static BOOL WINAPI _wglChoosePixelFormatARB(HDC hDC, const int *piAttribIList,
-	const FLOAT *pfAttribFList, UINT nMaxFormats, int *piFormats, UINT *nNumFormats)
-{
-	// Return pixel format 1 as a default match
-	if (piFormats && nMaxFormats > 0) {
-		piFormats[0] = 1;
-		if (nNumFormats) *nNumFormats = 1;
-		return TRUE;
-	}
-	if (nNumFormats) *nNumFormats = 0;
-	return TRUE;
-}
-
-static BOOL WINAPI _wglGetPixelFormatAttribivARB(HDC hDC, int iPixelFormat,
-	int iLayerPlane, UINT nAttributes, const int *piAttributes, int *piValues)
-{
-	UINT i;
-	for (i = 0; i < nAttributes; i++) {
-		// Return reasonable defaults for common attributes
-		piValues[i] = 0;
-	}
-	return TRUE;
-}
-
-// Pbuffer stubs — Dolphin queries these but doesn't strictly need them
-typedef void* HPBUFFERARB;
-
-static HPBUFFERARB WINAPI _wglCreatePbufferARB(HDC hDC, int iPixelFormat,
-	int iWidth, int iHeight, const int *piAttribList)
-{
-	return NULL;
-}
-
-static HDC WINAPI _wglGetPbufferDCARB(HPBUFFERARB hPbuffer)
-{
-	return NULL;
-}
-
-static int WINAPI _wglReleasePbufferDCARB(HPBUFFERARB hPbuffer, HDC hDC)
-{
-	return 0;
-}
-
-static BOOL WINAPI _wglDestroyPbufferARB(HPBUFFERARB hPbuffer)
-{
-	return FALSE;
-}
-
-static BOOL WINAPI _wglQueryPbufferARB(HPBUFFERARB hPbuffer, int iAttribute, int *piValue)
-{
-	if (piValue) *piValue = 0;
-	return TRUE;
-}
-
-static BOOL WINAPI _wglGetPixelFormatAttribfvARB(HDC hDC, int iPixelFormat,
-	int iLayerPlane, UINT nAttributes, const int *piAttributes, FLOAT *pfValues)
-{
-	UINT i;
-	for (i = 0; i < nAttributes; i++)
-		if (pfValues) pfValues[i] = 0.0f;
-	return TRUE;
-}
-
-static BOOL WINAPI _wglBindTexImageARB(HPBUFFERARB hPbuffer, int iBuffer)
-{
-	return TRUE;
-}
-
-static BOOL WINAPI _wglReleaseTexImageARB(HPBUFFERARB hPbuffer, int iBuffer)
-{
-	return TRUE;
-}
-
-static BOOL WINAPI _wglSetPbufferAttribARB(HPBUFFERARB hPbuffer, const int *piAttribList)
-{
-	return TRUE;
-}
-
-static BOOL WINAPI _wglSwapIntervalEXT(int interval)
-{
-	// TODO: Could map to D3D presentation interval
-	return TRUE;
-}
-
-static int WINAPI _wglGetSwapIntervalEXT(void)
-{
-	return 0;
-}
-
 // Lookup table for extension functions
 typedef struct {
 	const char *name;
@@ -564,160 +549,20 @@ typedef struct {
 } GLD_procEntry;
 
 static const GLD_procEntry gl46ProcTable[] = {
-	{ "wglGetExtensionsStringARB",    (PROC)_wglGetExtensionsStringARB },
-	{ "wglGetExtensionsStringEXT",    (PROC)_wglGetExtensionsStringEXT },
-	{ "wglCreateContextAttribsARB",   (PROC)_wglCreateContextAttribsARB },
-	{ "wglChoosePixelFormatARB",      (PROC)_wglChoosePixelFormatARB },
-	{ "wglGetPixelFormatAttribivARB", (PROC)_wglGetPixelFormatAttribivARB },
-	{ "wglSwapIntervalEXT",           (PROC)_wglSwapIntervalEXT },
-	{ "wglGetSwapIntervalEXT",        (PROC)_wglGetSwapIntervalEXT },
-	{ "wglCreatePbufferARB",          (PROC)_wglCreatePbufferARB },
-	{ "wglGetPbufferDCARB",           (PROC)_wglGetPbufferDCARB },
-	{ "wglReleasePbufferDCARB",       (PROC)_wglReleasePbufferDCARB },
-	{ "wglDestroyPbufferARB",         (PROC)_wglDestroyPbufferARB },
-	{ "wglQueryPbufferARB",           (PROC)_wglQueryPbufferARB },
-	{ "wglGetPixelFormatAttribfvARB", (PROC)_wglGetPixelFormatAttribfvARB },
-	{ "wglBindTexImageARB",           (PROC)_wglBindTexImageARB },
-	{ "wglReleaseTexImageARB",        (PROC)_wglReleaseTexImageARB },
-	{ "wglSetPbufferAttribARB",       (PROC)_wglSetPbufferAttribARB },
+	{ "wglGetExtensionsStringARB",     (PROC)_wglGetExtensionsStringARB },
+	{ "wglGetExtensionsStringEXT",     (PROC)_wglGetExtensionsStringEXT },
+	{ "wglCreateContextAttribsARB",    (PROC)_wglCreateContextAttribsARB },
+	{ "wglChoosePixelFormatARB",       (PROC)_wglChoosePixelFormatARB },
+	{ "wglChoosePixelFormatEXT",       (PROC)_wglChoosePixelFormatARB },
+	{ "wglGetPixelFormatAttribivARB",  (PROC)_wglGetPixelFormatAttribivARB },
+	{ "wglGetPixelFormatAttribivEXT",  (PROC)_wglGetPixelFormatAttribivARB },
+	{ "wglGetPixelFormatAttribfvARB",  (PROC)_wglGetPixelFormatAttribfvARB },
+	{ "wglGetPixelFormatAttribfvEXT",  (PROC)_wglGetPixelFormatAttribfvARB },
 	{ NULL, NULL }
 };
 
-// (no generic no-op — every function must be in the table with correct signature)
-
-// Typed __stdcall no-ops for every argument count (0-16 DWORD-sized args).
-// On x86, __stdcall requires the callee to pop N*4 bytes.
-// On x64, there's only one calling convention so these all work.
-static int APIENTRY _stub_noop_0(void) { return 0; }
-static int APIENTRY _stub_noop_1(int a) { (void)a; return 0; }
-static int APIENTRY _stub_noop_2(int a, int b) { (void)a;(void)b; return 0; }
-static int APIENTRY _stub_noop_3(int a, int b, int c) { (void)a;(void)b;(void)c; return 0; }
-static int APIENTRY _stub_noop_4(int a, int b, int c, int d) { (void)a;(void)b;(void)c;(void)d; return 0; }
-static int APIENTRY _stub_noop_5(int a, int b, int c, int d, int e) { (void)a;(void)b;(void)c;(void)d;(void)e; return 0; }
-static int APIENTRY _stub_noop_6(int a, int b, int c, int d, int e, int f) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return 0; }
-static int APIENTRY _stub_noop_7(int a, int b, int c, int d, int e, int f, int g) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g; return 0; }
-static int APIENTRY _stub_noop_8(int a, int b, int c, int d, int e, int f, int g, int h) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h; return 0; }
-static int APIENTRY _stub_noop_9(int a, int b, int c, int d, int e, int f, int g, int h, int i) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i; return 0; }
-static int APIENTRY _stub_noop_10(int a, int b, int c, int d, int e, int f, int g, int h, int i, int j) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j; return 0; }
-static int APIENTRY _stub_noop_11(int a, int b, int c, int d, int e, int f, int g, int h, int i, int j, int k) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k; return 0; }
-static int APIENTRY _stub_noop_12(int a, int b, int c, int d, int e, int f, int g, int h, int i, int j, int k, int l) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l; return 0; }
-
-typedef struct { const char *prefix; int argCount; } GLS_FuncArgCount;
-
-/* Map GL function name prefixes/patterns to argument counts for the generic no-op */
-static int _glsGuessArgCount(const char *name)
-{
-	/* Functions with known arg counts based on name patterns */
-	/* 0 args */
-	if (strstr(name, "glEnd") == name && strlen(name) <= 12) return 0;
-	if (strcmp(name, "glFlush") == 0 || strcmp(name, "glFinish") == 0) return 0;
-	if (strcmp(name, "glGetError") == 0) return 0;
-	if (strcmp(name, "glPopDebugGroup") == 0) return 0;
-	if (strcmp(name, "glReleaseShaderCompiler") == 0) return 0;
-	if (strcmp(name, "glGetGraphicsResetStatus") == 0) return 0;
-	if (strcmp(name, "glMemoryBarrierByRegion") == 0) return 0;
-	if (strcmp(name, "glTextureBarrier") == 0) return 0;
-
-	/* 1 arg */
-	if (strstr(name, "glIs") == name) return 1; /* glIsQuery, glIsSync, etc */
-	if (strstr(name, "glDelete") == name && strstr(name, "Sync")) return 1;
-	if (strstr(name, "glEnable") == name && !strstr(name, "Array") && !strstr(name, "Attrib")) return 1;
-	if (strstr(name, "glDisable") == name && !strstr(name, "Array") && !strstr(name, "Attrib")) return 1;
-	if (strcmp(name, "glClampColor") == 0) return 2;
-	if (strcmp(name, "glClearDepthf") == 0) return 1;
-	if (strcmp(name, "glDepthRangef") == 0) return 2;
-	if (strcmp(name, "glGenerateTextureMipmap") == 0) return 1;
-	if (strcmp(name, "glBindTextureUnit") == 0) return 2;
-
-	/* 2 args */
-	if (strstr(name, "glGen") == name || strstr(name, "glCreate") == name) return 2;
-	if (strstr(name, "glDelete") == name) return 2;
-	if (strstr(name, "glBind") == name) return 2;
-	if (strstr(name, "glUniform1") == name) return 2;
-	if (strstr(name, "glVertexAttrib1") == name) return 2;
-	if (strstr(name, "glMultiTexCoord1") == name) return 2;
-	if (strstr(name, "glSecondaryColor3") == name) return 3;
-	if (strstr(name, "glWindowPos2") == name) return 2;
-	if (strstr(name, "glWindowPos3") == name) return 3;
-
-	/* 3 args */
-	if (strstr(name, "glUniform2") == name) return 3;
-	if (strstr(name, "glVertexAttrib2") == name) return 3;
-	if (strstr(name, "glMultiTexCoord2") == name) return 3;
-	if (strstr(name, "glGet") == name && strstr(name, "iv")) return 3;
-	if (strstr(name, "glGet") == name && strstr(name, "fv")) return 3;
-	if (strstr(name, "glSampler") == name) return 3;
-	if (strstr(name, "glTexParameter") == name) return 3;
-	if (strstr(name, "glTexStorage1D") == name) return 4;
-	if (strstr(name, "glShaderBinary") == name) return 5;
-	if (strstr(name, "glProgramBinary") == name) return 4;
-	if (strstr(name, "glProgramParameteri") == name) return 3;
-
-	/* 4 args */
-	if (strstr(name, "glUniform3") == name) return 4;
-	if (strstr(name, "glVertexAttrib3") == name) return 4;
-	if (strstr(name, "glMultiTexCoord3") == name) return 4;
-	if (strstr(name, "glScissorIndexed") == name) return 5;
-	if (strstr(name, "glViewportIndexedf") == name && !strstr(name, "fv")) return 5;
-	if (strstr(name, "glUniformMatrix") == name) return 4;
-	if (strstr(name, "glFramebuffer") == name) return 5;
-	if (strstr(name, "glInvalidate") == name) return 3;
-
-	/* 5 args */
-	if (strstr(name, "glUniform4") == name) return 5;
-	if (strstr(name, "glVertexAttrib4") == name) return 5;
-	if (strstr(name, "glMultiTexCoord4") == name) return 5;
-	if (strstr(name, "glTexStorage2D") == name) return 5;
-	if (strstr(name, "glCopyImageSubData") == name) return 11;
-	if (strstr(name, "glVertexAttribI") == name) return 5;
-	if (strstr(name, "glVertexAttribFormat") == name) return 5;
-	if (strstr(name, "glVertexArray") == name) return 5;
-
-	/* 6+ args */
-	if (strstr(name, "glTexStorage3D") == name) return 6;
-	if (strstr(name, "glDrawElements") == name) return 5;
-	if (strstr(name, "glDrawArrays") == name) return 4;
-	if (strstr(name, "glDebugMessage") == name) return 6;
-	if (strstr(name, "glPushDebugGroup") == name) return 4;
-	if (strstr(name, "glObjectLabel") == name) return 4;
-	if (strstr(name, "glReadnPixels") == name) return 8;
-	if (strstr(name, "glTextureSubImage") == name) return 11;
-	if (strstr(name, "glTextureStorage") == name) return 5;
-	if (strstr(name, "glNamedBuffer") == name) return 4;
-	if (strstr(name, "glNamedFramebuffer") == name) return 4;
-	if (strstr(name, "glNamedRenderbuffer") == name) return 5;
-	if (strstr(name, "glCompressedTexture") == name) return 9;
-	if (strstr(name, "glCopyTexture") == name) return 9;
-	if (strstr(name, "glBlitNamed") == name) return 12;
-	if (strstr(name, "glClearNamed") == name) return 4;
-	if (strstr(name, "glTransformFeedback") == name) return 3;
-	if (strstr(name, "glGetQuery") == name) return 4;
-	if (strstr(name, "glMap") == name) return 4;
-	if (strstr(name, "glFlushMapped") == name) return 3;
-	if (strstr(name, "glDepthRange") == name) return 3;
-
-	/* Default: 4 args covers most GL functions */
-	return 4;
-}
-
-static PROC _glsGetTypedNoop(int argCount)
-{
-	switch (argCount) {
-	case 0:  return (PROC)_stub_noop_0;
-	case 1:  return (PROC)_stub_noop_1;
-	case 2:  return (PROC)_stub_noop_2;
-	case 3:  return (PROC)_stub_noop_3;
-	case 4:  return (PROC)_stub_noop_4;
-	case 5:  return (PROC)_stub_noop_5;
-	case 6:  return (PROC)_stub_noop_6;
-	case 7:  return (PROC)_stub_noop_7;
-	case 8:  return (PROC)_stub_noop_8;
-	case 9:  return (PROC)_stub_noop_9;
-	case 10: return (PROC)_stub_noop_10;
-	case 11: return (PROC)_stub_noop_11;
-	default: return (PROC)_stub_noop_12;
-	}
-}
+/* There is intentionally no generic fallback. Every supported GL name has an
+ * exact-signature entry, and every unknown name must resolve to NULL. */
 
 PROC gldGetProcAddress_GL46(
 	LPCSTR a)
@@ -739,6 +584,15 @@ PROC gldGetProcAddress_GL46(
 			return g_modernGL[i].proc;
 	}
 
+	// Check the generated table: every remaining GL 1.0-4.6 name, core and
+	// extension alias, with the exact signature the Khronos registry gives it.
+	// Scanned after g_modernGL so a hand-written implementation always wins
+	// over the generated one for the same name.
+	for (i = 0; g_generatedGL[i].name != NULL; i++) {
+		if (strcmp(a, g_generatedGL[i].name) == 0)
+			return g_generatedGL[i].proc;
+	}
+
 	// For GL functions that are exported from the DLL, return their address
 	// via GetProcAddress on our own module
 	{
@@ -752,13 +606,10 @@ PROC gldGetProcAddress_GL46(
 		}
 	}
 
-	// Unknown function — return a typed no-op with the correct arg count
-	// so __stdcall stack cleanup is correct on x86.
+	/* WGL requires NULL for an unsupported name. A callable no-op makes games
+	 * believe a capability exists and commonly fails much later in rendering. */
 	gldDiagLog("wglGetProcAddress: \"%s\" -> UNMAPPED", a ? a : "(null)");
-	{
-		int argCount = _glsGuessArgCount(a);
-		return _glsGetTypedNoop(argCount);
-	}
+	return NULL;
 }
 
 //---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -436,7 +436,10 @@
     <ClCompile Include="src\gld_log.c" />
     <ClCompile Include="src\gld_pf.c" />
     <ClCompile Include="src\gld_wgl.c" />
+    <ClCompile Include="src\gld_crash.c" />
+    <ClCompile Include="src\gld_diag.c" />
     <ClCompile Include="src\mesa_proxy.c" />
+    <ClCompile Include="src\gl_mesa_forward.c" />
     <ClCompile Include="src\gl_ext_dsa.c" />
     <ClCompile Include="src\glad\src\gl.c" />
     <ClCompile Include="src\glad\src\wgl.c" />
@@ -455,12 +458,15 @@
     <ClCompile Include="src\gl46\display_list_emulator.c" />
     <ClCompile Include="src\gl46\swap_chain.c" />
     <ClCompile Include="src\gl46\pixel_format_provider.c" />
-    <ClCompile Include="src\gl46\dx9_dispatch.c" />
     <ClCompile Include="src\gl46\gl46_driver.c" />
     <ClCompile Include="src\gl46\gl_state.c" />
+    <ClCompile Include="src\gl46\advanced_emulation.c" />
+    <ClCompile Include="src\gl46\compute_emulator.c" />
     <ClCompile Include="src\gl46\gl_impl.c" />
     <ClCompile Include="src\gl46\gl_dx9_compat.c" />
     <ClCompile Include="src\gl46\glsl_to_hlsl.c" />
+    <ClCompile Include="src\gl46\arb_asm_translator.c" />
+    <ClCompile Include="src\gl46\gl_legacy_impl.c" />
     <!-- Mesa source files — Mesa provides the OpenGL state machine, D3D9 is the renderer -->
     <ClCompile Include="mesa\src\mesa\array_cache\ac_context.c" />
     <ClCompile Include="mesa\src\mesa\array_cache\ac_import.c" />
@@ -567,12 +573,15 @@
     <ClInclude Include="src\gl46\display_list_emulator.h" />
     <ClInclude Include="src\gl46\swap_chain.h" />
     <ClInclude Include="src\gl46\pixel_format_provider.h" />
-    <ClInclude Include="src\gl46\dx9_dispatch.h" />
     <ClInclude Include="src\gl46\gl46_driver.h" />
     <ClInclude Include="src\gl46\gl_state.h" />
+    <ClInclude Include="src\gl46\advanced_emulation.h" />
+    <ClInclude Include="src\gl46\compute_emulator.h" />
+    <ClInclude Include="src\gl46\gl_generated_stubs.h" />
     <ClInclude Include="src\gl46\gl_impl.h" />
     <ClInclude Include="src\gl46\gl_dx9_compat.h" />
     <ClInclude Include="src\gl46\glsl_to_hlsl.h" />
+    <ClInclude Include="src\gl46\arb_asm_translator.h" />
     <ClInclude Include="src\mesa_compat.h" />
     <ClInclude Include="src\mesa_proxy.h" />
     <ClInclude Include="src\dll_main.h" />
@@ -585,4 +594,9 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
+  <Target Name="CopyGLDirectRuntimeConfiguration" AfterTargets="Build">
+    <Copy SourceFiles="$(ProjectDir)gldirect.ini"
+          DestinationFiles="$(OutDir)gldirect.ini"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>

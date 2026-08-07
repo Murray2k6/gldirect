@@ -144,6 +144,7 @@ typedef struct {
 
 	// Shared driver vars:
 	BOOL				bAllocated;
+	int					nRefCount;		// Creates deduplicated onto this slot; the slot is only torn down when this reaches zero
     BOOL				bFullscreen;	// Is this a fullscreen context?
     BOOL				bSceneStarted;	// Has a lpDev->BeginScene been issued?
     BOOL				bCanRender;		// Flag: states whether rendering is OK

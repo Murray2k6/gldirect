@@ -67,6 +67,9 @@ typedef struct {
 extern "C" {
 #endif
 
+/* Release the Mesa-to-D3D9 presentation resources before device shutdown. */
+void gldShutdownMesaPresenter(void);
+
 BOOL	gldWglResizeBuffers(GLD_ctx *ctx, BOOL bDefaultDriver);
 
 #ifdef  __cplusplus

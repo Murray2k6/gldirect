@@ -41,6 +41,7 @@
 #include "gld_diag.h"
 #include "mesa_compat.h"
 #include "gl46/context_manager.h"
+#include "gl46/compute_emulator.h"
 
 void gldExitDriver(void);
 BOOL gldValidate();
@@ -312,6 +313,9 @@ void gldDeleteContextState()
 	for (i=0; i<GLD_MAX_CONTEXTS; i++) {
 		if (ctxlist[i].bAllocated == TRUE) {
 			gldLogPrintf(GLDLOG_WARN, "** Context %i not deleted - cleaning up.", (i+1));
+			// This is the last sweep, so an outstanding logical reference must
+			// not keep the slot alive - force the full teardown.
+			ctxlist[i].nRefCount = 1;
 			gldDeleteContext((HGLRC)(INT_PTR)(i+1));
 		}
 	}
@@ -430,6 +434,10 @@ static LRESULT __stdcall gldWndProc(
         bQuit = TRUE;
 		if (lpCtx && lpCtx->bAllocated) {
 			gldLogPrintf(GLDLOG_WARN, "WM_DESTROY detected for HWND=%X, HDC=%X, HGLRC=%d", hwnd, lpCtx->hDC, i+1);
+			// The window itself is gone, so no outstanding logical reference
+			// can still be honoured - tear the slot down as this path always
+			// has, rather than leaving it stranded on a dead HWND.
+			lpCtx->nRefCount = 1;
 			gldDeleteContext((HGLRC)(INT_PTR)(i+1));
 		}
 		break;
@@ -789,18 +797,23 @@ HGLRC gldCreateContext(
 	if (!bContextReady)
 		return NULL;
 
-	gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContext for HDC=%X, ThreadId=%X", a, dwThreadId);
+	gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContext for HDC=%p, ThreadId=%X", (void*)(INT_PTR)a, dwThreadId);
 
 	// Check if a context already exists for this HDC or window.
 	// Apps like Dolphin may call wglCreateContext repeatedly on the same HDC;
 	// return the existing context to prevent an infinite create loop.
+	// Each create that lands here takes a reference, so the matching delete
+	// only tears the slot down once every create has been paired off - the
+	// "dummy context to query wglCreateContextAttribsARB, then delete the
+	// dummy" idiom must not destroy the context the app is still using.
 	{
 		HWND hWndCheck = WindowFromDC(a);
 		for (i=0; i<GLD_MAX_CONTEXTS; i++) {
 			if (ctxlist[i].bAllocated &&
 				(ctxlist[i].hDC == a || (hWndCheck && ctxlist[i].hWnd == hWndCheck))) {
 				hGLRC = (HGLRC)(INT_PTR)(i+1);
-				gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContext: reusing existing HGLRC=%d for HDC=%X", (int)(INT_PTR)hGLRC, a);
+				ctxlist[i].nRefCount++;
+				gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContext: reusing existing HGLRC=%d for HDC=%p, %d reference(s)", (int)(INT_PTR)hGLRC, (void*)(INT_PTR)a, ctxlist[i].nRefCount);
 				return hGLRC;
 			}
 		}
@@ -830,6 +843,7 @@ HGLRC gldCreateContext(
 	// even though only one context is ever used by the app, so keep it clean. (DaveM)
 	ZeroMemory(lpCtx, sizeof(GLD_ctx));
 	lpCtx->bAllocated = TRUE;
+	lpCtx->nRefCount = 1;
 	// Flag that buffers need creating on next wglMakeCurrent call.
 	lpCtx->bHasBeenCurrent = FALSE;
 	lpCtx->lpPF = (GLD_pixelFormat *)lpPF;	// cache pixel format
@@ -919,15 +933,18 @@ HGLRC gldCreateContextLazy(
 	DWORD				dwThreadId = GetCurrentThreadId();
 	HWND				hWndCheck;
 
-	gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContextLazy for HDC=%X, ThreadId=%X", a, dwThreadId);
+	gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContextLazy for HDC=%p, ThreadId=%X", (void*)(INT_PTR)a, dwThreadId);
 
-	// Check if a context already exists for this HDC or window
+	// Check if a context already exists for this HDC or window.
+	// As in gldCreateContext, a deduplicated create takes a reference so the
+	// matching delete does not tear down a slot the app is still using.
 	hWndCheck = WindowFromDC(a);
 	for (i=0; i<GLD_MAX_CONTEXTS; i++) {
 		if (ctxlist[i].bAllocated &&
 			(ctxlist[i].hDC == a || (hWndCheck && ctxlist[i].hWnd == hWndCheck))) {
 			hGLRC = (HGLRC)(INT_PTR)(i+1);
-			gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContextLazy: reusing existing HGLRC=%d", (int)(INT_PTR)hGLRC);
+			ctxlist[i].nRefCount++;
+			gldLogPrintf(GLDLOG_SYSTEM, "gldCreateContextLazy: reusing existing HGLRC=%d, %d reference(s)", (int)(INT_PTR)hGLRC, ctxlist[i].nRefCount);
 			return hGLRC;
 		}
 	}
@@ -950,6 +967,7 @@ HGLRC gldCreateContextLazy(
 	lpCtx = gldGetContextAddress(hGLRC);
 	ZeroMemory(lpCtx, sizeof(GLD_ctx));
 	lpCtx->bAllocated = TRUE;
+	lpCtx->nRefCount = 1;
 	lpCtx->bHasBeenCurrent = FALSE;
 	lpCtx->lpPF = (GLD_pixelFormat *)lpPF;
 	lpCtx->bCanRender = FALSE;
@@ -1144,6 +1162,7 @@ BOOL gldDeleteContext(
 	HGLRC a)
 {
 	GLD_ctx* lpCtx;
+	int i;
 	DWORD dwThreadId = GetCurrentThreadId();
     char argstr[256];
 
@@ -1166,6 +1185,15 @@ BOOL gldDeleteContext(
 		gldLogPrintf(GLDLOG_WARN, "Tried to delete unallocated context HGLRC=%d", (int)(INT_PTR)a);
 //		return FALSE;
 		return TRUE; // HACK: Shuts up "WebLab Viewer Pro". KeithH
+	}
+
+	// If more than one create was deduplicated onto this slot, this delete
+	// only retires one of them. Tearing the slot down now would pull the
+	// context out from under whoever still holds a reference to it.
+	if (lpCtx->nRefCount > 1) {
+		lpCtx->nRefCount--;
+		gldLogPrintf(GLDLOG_SYSTEM, "gldDeleteContext: HGLRC=%d kept alive, %d reference(s) left", (int)(INT_PTR)a, lpCtx->nRefCount);
+		return TRUE;
 	}
 
 	// Make sure context is de-activated
@@ -1210,6 +1238,7 @@ __except(EXCEPTION_EXECUTE_HANDLER) {
 		lpCtx->lpfnWndProc = (LONG_PTR)NULL;
 		}
 
+	lpCtx->nRefCount = 0;
 	lpCtx->bAllocated = FALSE; // This context is now free for use
 
 #ifdef GLD_THREADS
@@ -1217,6 +1246,22 @@ __except(EXCEPTION_EXECUTE_HANDLER) {
 	if (glb.bMultiThreaded)
 		LeaveCriticalSection(&CriticalSection);
 #endif
+
+	/* Tear the private software-stage context down while no Windows loader
+	 * lock is held.  Deferring its window/context destruction and FreeLibrary
+	 * until DLL_PROCESS_DETACH deadlocks Mesa's DLL chain during process exit.
+	 * It is shared, so retain it until the last public context is gone. */
+	for (i = 0; i < GLD_MAX_CONTEXTS; ++i) {
+		if (ctxlist[i].bAllocated)
+			break;
+	}
+	if (i == GLD_MAX_CONTEXTS) {
+		gldComputeEmulatorShutdown();
+		/* D3D9 drivers and interception layers may load or join worker DLLs
+		 * while their device is released.  Doing that from DLL_PROCESS_DETACH
+		 * holds the Windows loader lock and deadlocks process exit. */
+		gldShutdownContext46();
+	}
 
 	return TRUE;
 }

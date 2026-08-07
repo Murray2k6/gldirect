@@ -269,6 +269,55 @@ static D3DFORMAT _glFormatToD3D(int internalformat)
     }
 }
 
+/* Does this destination surface format carry an alpha channel?  Decides
+ * which universal format a substitution has to use. */
+static BOOL _compatFormatHasAlpha(D3DFORMAT fmt)
+{
+    switch (fmt) {
+    case D3DFMT_A8R8G8B8: case D3DFMT_A8:       case D3DFMT_A8L8:
+    case D3DFMT_A4R4G4B4: case D3DFMT_A1R5G5B5: return TRUE;
+    default:                                    return FALSE;
+    }
+}
+
+/*
+ * Pick a D3DFORMAT the device has confirmed it can create.
+ *
+ * This replaces the create-then-retry-on-failure fallback this file used
+ * to do.  On some d3d9.dll implementations a single failed CreateTexture
+ * leaves the device in a state where every later CreateTexture fails as
+ * well, including the A8R8G8B8 retry itself, so the format is confirmed
+ * before the first call is made.  gldIsTextureFormatSupported46 asks the
+ * device that gldCompatInit was handed — the same one used here.
+ *
+ * Uncompressed formats only; gldCompatCompressedTexImage2D gates instead
+ * of substituting, because DXT blocks cannot be reinterpreted as raw ARGB.
+ *
+ * Returns D3DFMT_UNKNOWN when nothing is creatable.
+ */
+static D3DFORMAT _compatResolveTextureFormat(D3DFORMAT wanted)
+{
+    D3DFORMAT fallback;
+
+    if (gldIsTextureFormatSupported46(wanted, FALSE))
+        return wanted;
+
+    fallback = _compatFormatHasAlpha(wanted) ? D3DFMT_A8R8G8B8 : D3DFMT_X8R8G8B8;
+
+    gldLogPrintf(GLDLOG_WARN,
+        "GLCompat: TexImage2D D3DFMT=%d unsupported by device - falling back to D3DFMT=%d",
+        (int)wanted, (int)fallback);
+
+    if (fallback == wanted || !gldIsTextureFormatSupported46(fallback, FALSE)) {
+        gldLogPrintf(GLDLOG_WARN,
+            "GLCompat: TexImage2D fallback D3DFMT=%d also unsupported - no creatable format",
+            (int)fallback);
+        return D3DFMT_UNKNOWN;
+    }
+
+    return fallback;
+}
+
 /*---------------------------------------------------------------------------
  * Pixel conversion: GL source format -> D3D9 ARGB
  *---------------------------------------------------------------------------*/
@@ -757,13 +806,26 @@ void gldCompatTexImage2D(unsigned int target, int level, int internalformat,
     ct = _allocTexture(g_boundTexture);
     if (!ct) return;
 
+    /* Resolve to a confirmed-creatable format before creating anything. */
+    d3dFmt = _compatResolveTextureFormat(d3dFmt);
+    if (d3dFmt == D3DFMT_UNKNOWN) {
+        gldLogPrintf(GLDLOG_WARN,
+            "GLCompat: TexImage2D no creatable format for int=0x%X (tex=%u) - texture left without data",
+            internalformat, g_boundTexture);
+        ct->pTex = NULL;
+        return;
+    }
+
+    /* The FAILED(hr) path below stays as the safety net for non-format
+     * runtime failures such as running out of video memory. */
     hr = IDirect3DDevice9_CreateTexture(g_pDev, width, height, 1,
         0, d3dFmt, D3DPOOL_MANAGED, &ct->pTex, NULL);
     if (FAILED(hr)) {
-        d3dFmt = D3DFMT_A8R8G8B8;
-        hr = IDirect3DDevice9_CreateTexture(g_pDev, width, height, 1,
-            0, d3dFmt, D3DPOOL_MANAGED, &ct->pTex, NULL);
-        if (FAILED(hr)) { ct->pTex = NULL; return; }
+        gldLogPrintf(GLDLOG_WARN,
+            "GLCompat: TexImage2D CreateTexture FAILED hr=0x%08X %dx%d fmt=%d",
+            hr, width, height, (int)d3dFmt);
+        ct->pTex = NULL;
+        return;
     }
     ct->width = width;
     ct->height = height;
@@ -801,6 +863,17 @@ void gldCompatCompressedTexImage2D(unsigned int target, int level,
     d3dFmt = _glFormatToD3D(internalformat);
     ct = _allocTexture(g_boundTexture);
     if (!ct) return;
+
+    /* Supported-or-skip, never substitute: DXT blocks cannot be
+     * reinterpreted as raw ARGB without a decompressor this wrapper does
+     * not have, so the texture is left with no D3D resource. */
+    if (!gldIsTextureFormatSupported46(d3dFmt, FALSE)) {
+        gldLogPrintf(GLDLOG_WARN,
+            "GLCompat: CompressedTexImage2D D3DFMT=%d (tex=%u) unsupported by device; no software decompressor - texture left without data",
+            (int)d3dFmt, g_boundTexture);
+        ct->pTex = NULL;
+        return;
+    }
 
     hr = IDirect3DDevice9_CreateTexture(g_pDev, width, height, 1,
         0, d3dFmt, D3DPOOL_MANAGED, &ct->pTex, NULL);

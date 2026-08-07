@@ -1,10 +1,10 @@
 /*********************************************************************************
 *
-*  gl_modern_stubs.h - No-op stubs for GL 2.0+ functions
+*  gl_modern_stubs.h - exactly-typed GL 2.0+ dispatch adapters
 *
 *  Apps query these via wglGetProcAddress. Returning a non-NULL function pointer
-*  tells the app the function is "supported". The actual DX9 translation will
-*  replace these stubs as each function is implemented.
+*  tells the app the function is supported, so every adapter below must route
+*  to translator state, a D3D9 operation, or an explicit emulation layer.
 *
 *  Covers: GL 2.0, 2.1, 3.0, 3.1, 3.2, 3.3, 4.0-4.6 core functions.
 *
@@ -16,6 +16,8 @@
 #include <windows.h>
 #include <glad/gl.h>
 #include "gl_impl.h"
+#include "advanced_emulation.h"
+#include "gld_diag.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,7 +33,7 @@ static void    APIENTRY _stub_glGetShaderInfoLog(GLuint shader, GLsizei bufSize,
 static GLuint  APIENTRY _stub_glCreateProgram(void) { return _glsCreateProgram(); }
 static void    APIENTRY _stub_glDeleteProgram(GLuint program) { _glsDeleteProgram(program); }
 static void    APIENTRY _stub_glAttachShader(GLuint program, GLuint shader) { _glsAttachShader(program, shader); }
-static void    APIENTRY _stub_glDetachShader(GLuint program, GLuint shader) { (void)program; (void)shader; }
+static void    APIENTRY _stub_glDetachShader(GLuint program, GLuint shader) { _glsDetachShader(program, shader); }
 static void    APIENTRY _stub_glLinkProgram(GLuint program) { _glsLinkProgram(program); }
 static void    APIENTRY _stub_glUseProgram(GLuint program) { _glsUseProgram(program); }
 static void    APIENTRY _stub_glGetProgramiv(GLuint program, GLenum pname, GLint *params) { _glsGetProgramiv(program, pname, params); }
@@ -42,8 +44,8 @@ static GLboolean APIENTRY _stub_glIsProgram(GLuint program) { return _glsIsProgr
 static GLint   APIENTRY _stub_glGetUniformLocation(GLuint program, const GLchar *name) { return _glsGetUniformLocation(program, name); }
 static GLint   APIENTRY _stub_glGetAttribLocation(GLuint program, const GLchar *name) { return _glsGetAttribLocation(program, name); }
 static void    APIENTRY _stub_glBindAttribLocation(GLuint program, GLuint index, const GLchar *name) { _glsBindAttribLocation(program, index, name); }
-static void    APIENTRY _stub_glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) { if(length) *length=0; }
-static void    APIENTRY _stub_glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) { if(length) *length=0; }
+static void    APIENTRY _stub_glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) { _glsGetActiveUniform(program, index, bufSize, length, size, type, name); }
+static void    APIENTRY _stub_glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size, GLenum *type, GLchar *name) { _glsGetActiveAttrib(program, index, bufSize, length, size, type, name); }
 
 /* ===== GL 2.0 — Uniforms ===== */
 static void APIENTRY _stub_glUniform1i(GLint loc, GLint v0) { _glsUniform1i(loc, v0); }
@@ -91,14 +93,14 @@ static void    APIENTRY _stub_glBufferData(GLenum target, GLsizeiptr size, const
 static void    APIENTRY _stub_glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data) { _glsBufferSubData(target, offset, size, data); }
 static void*   APIENTRY _stub_glMapBuffer(GLenum target, GLenum access) { return _glsMapBuffer(target, access); }
 static GLboolean APIENTRY _stub_glUnmapBuffer(GLenum target) { return _glsUnmapBuffer(target); }
-static GLboolean APIENTRY _stub_glIsBuffer(GLuint buffer) { return GL_FALSE; }
-static void    APIENTRY _stub_glGetBufferParameteriv(GLenum target, GLenum pname, GLint *params) { if(params) *params=0; }
+static GLboolean APIENTRY _stub_glIsBuffer(GLuint buffer) { return _glsIsBuffer(buffer); }
+static void    APIENTRY _stub_glGetBufferParameteriv(GLenum target, GLenum pname, GLint *params) { _glsGetBufferParameteriv(target, pname, params); }
 
 /* ===== GL 3.0 — VAO ===== */
 static void    APIENTRY _stub_glGenVertexArrays(GLsizei n, GLuint *arrays) { _glsGenVertexArrays(n, arrays); }
 static void    APIENTRY _stub_glDeleteVertexArrays(GLsizei n, const GLuint *arrays) { _glsDeleteVertexArrays(n, arrays); }
 static void    APIENTRY _stub_glBindVertexArray(GLuint array) { _glsBindVertexArray(array); }
-static GLboolean APIENTRY _stub_glIsVertexArray(GLuint array) { return GL_FALSE; }
+static GLboolean APIENTRY _stub_glIsVertexArray(GLuint array) { return _glsIsVertexArray(array); }
 
 /* ===== GL 3.0 — FBO ===== */
 static void    APIENTRY _stub_glGenFramebuffers(GLsizei n, GLuint *framebuffers) { _glsGenFramebuffers(n, framebuffers); }
@@ -111,7 +113,7 @@ static void    APIENTRY _stub_glFramebufferTexture3D(GLenum target, GLenum attac
 static void    APIENTRY _stub_glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) { _glsFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer); }
 static void    APIENTRY _stub_glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLenum pname, GLint *params) {
     GLS_State *s = glsGetState();
-    GLS_FBO *fbo = glsFindFBO(s->boundFBO);
+    GLS_FBO *fbo = glsFindFBO(s->boundDrawFBO);
     GLuint objectName = 0;
     GLenum objectType = GL_NONE;
     GLint level = 0;
@@ -195,12 +197,12 @@ static void    APIENTRY _stub_glGenQueries(GLsizei n, GLuint *ids) { _glsGenQuer
 static void    APIENTRY _stub_glDeleteQueries(GLsizei n, const GLuint *ids) { _glsDeleteQueries(n, ids); }
 static void    APIENTRY _stub_glBeginQuery(GLenum target, GLuint id) { _glsBeginQuery(target, id); }
 static void    APIENTRY _stub_glEndQuery(GLenum target) { _glsEndQuery(target); }
-static void    APIENTRY _stub_glGetQueryiv(GLenum target, GLenum pname, GLint *params) { if(params) *params=0; }
-static void    APIENTRY _stub_glGetQueryObjectiv(GLuint id, GLenum pname, GLint *params) { if(params) *params=0; }
-static void    APIENTRY _stub_glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint *params) { if(params) *params=0; }
+static void    APIENTRY _stub_glGetQueryiv(GLenum target, GLenum pname, GLint *params) { _glsGetQueryiv(target, pname, params); }
+static void    APIENTRY _stub_glGetQueryObjectiv(GLuint id, GLenum pname, GLint *params) { _glsGetQueryObjectiv(id, pname, params); }
+static void    APIENTRY _stub_glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint *params) { _glsGetQueryObjectuiv(id, pname, params); }
 
 /* ===== GL 3.1 — UBO / TBO / CopyBuffer / DrawInstanced ===== */
-static GLuint  APIENTRY _stub_glGetUniformBlockIndex(GLuint program, const GLchar *name) { return 0xFFFFFFFF; }
+static GLuint  APIENTRY _stub_glGetUniformBlockIndex(GLuint program, const GLchar *name) { return gldAdvGetUniformBlockIndex(program, name); }
 static void    APIENTRY _stub_glUniformBlockBinding(GLuint program, GLuint blockIndex, GLuint blockBinding) { _glsUniformBlockBinding(program, blockIndex, blockBinding); }
 static void    APIENTRY _stub_glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) { _glsDrawArraysInstanced(mode, first, count, instancecount); }
 static void    APIENTRY _stub_glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount) { _glsDrawElementsInstanced(mode, count, type, indices, instancecount); }
@@ -213,9 +215,9 @@ static GLsync  APIENTRY _stub_glFenceSync(GLenum condition, GLbitfield flags) { 
 static void    APIENTRY _stub_glDeleteSync(GLsync sync) { _glsDeleteSync(sync); }
 static GLenum  APIENTRY _stub_glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) { return _glsClientWaitSync(sync, flags, timeout); }
 static void    APIENTRY _stub_glWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) { _glsWaitSync(sync, flags, timeout); }
-static void    APIENTRY _stub_glGetInteger64v(GLenum pname, GLint64 *data) { if(data) *data=0; }
+static void    APIENTRY _stub_glGetInteger64v(GLenum pname, GLint64 *data) { GLint v=0; _glsGetIntegerv(pname, &v); if(data) *data=(GLint64)v; }
 static void    APIENTRY _stub_glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) { _glsFramebufferTexture(target, attachment, texture, level); }
-static void    APIENTRY _stub_glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64 *params) { if(params) *params=0; }
+static void    APIENTRY _stub_glGetBufferParameteri64v(GLenum target, GLenum pname, GLint64 *params) { GLint v=0; _glsGetBufferParameteriv(target, pname, &v); if(params) *params=(GLint64)v; }
 static void    APIENTRY _stub_glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLboolean fixedsamplelocations) { _glsTexImage2DMultisample(target, samples, internalformat, width, height, fixedsamplelocations); }
 static void    APIENTRY _stub_glTexImage3DMultisample(GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLboolean fixedsamplelocations) { _glsTexImage3DMultisample(target, samples, internalformat, width, height, depth, fixedsamplelocations); }
 static void    APIENTRY _stub_glGetMultisamplefv(GLenum pname, GLuint index, GLfloat *val) {
@@ -241,8 +243,8 @@ static void    APIENTRY _stub_glSamplerParameterf(GLuint sampler, GLenum pname, 
 static void    APIENTRY _stub_glSamplerParameteriv(GLuint sampler, GLenum pname, const GLint *param) { _glsSamplerParameteriv(sampler, pname, param); }
 static void    APIENTRY _stub_glSamplerParameterfv(GLuint sampler, GLenum pname, const GLfloat *param) { _glsSamplerParameterfv(sampler, pname, param); }
 static void    APIENTRY _stub_glQueryCounter(GLuint id, GLenum target) { _glsQueryCounter(id, target); }
-static void    APIENTRY _stub_glGetQueryObjecti64v(GLuint id, GLenum pname, GLint64 *params) { if(params) *params=0; }
-static void    APIENTRY _stub_glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64 *params) { if(params) *params=0; }
+static void    APIENTRY _stub_glGetQueryObjecti64v(GLuint id, GLenum pname, GLint64 *params) { _glsGetQueryObjecti64v(id, pname, (__int64*)params); }
+static void    APIENTRY _stub_glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64 *params) { _glsGetQueryObjectui64v(id, pname, (unsigned __int64*)params); }
 static void    APIENTRY _stub_glVertexAttribDivisor(GLuint index, GLuint divisor) { _glsVertexAttribDivisor(index, divisor); }
 
 /* ===== GL 4.x — Commonly queried ===== */
@@ -256,8 +258,8 @@ static void    APIENTRY _stub_glTexStorage3D(GLenum target, GLsizei levels, GLen
 static void    APIENTRY _stub_glBindImageTexture(GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer, GLenum access, GLenum format) { _glsBindImageTexture(unit, texture, level, layered, layer, access, format); }
 static void    APIENTRY _stub_glDispatchCompute(GLuint x, GLuint y, GLuint z) { _glsDispatchCompute(x, y, z); }
 static void    APIENTRY _stub_glDebugMessageCallback(void *callback, const void *userParam) { _glsDebugMessageCallback(callback, userParam); }
-static void    APIENTRY _stub_glDebugMessageControl(GLenum source, GLenum type, GLenum severity, GLsizei count, const GLuint *ids, GLboolean enabled) { _glsDebugMessageControl(source, type, severity, count, ids, enabled); }
-static void    APIENTRY _stub_glObjectLabel(GLenum identifier, GLuint name, GLsizei length, const GLchar *label) { _glsObjectLabel(identifier, name, length, label); }
+static void    APIENTRY _stub_glDebugMessageControl(GLenum source, GLenum type, GLenum severity, GLsizei count, const GLuint *ids, GLboolean enabled) { gldAdvDebugMessageControl(source, type, severity, count, ids, enabled); }
+static void    APIENTRY _stub_glObjectLabel(GLenum identifier, GLuint name, GLsizei length, const GLchar *label) { gldAdvObjectLabel(identifier, name, length, label); }
 static void    APIENTRY _stub_glClipControl(GLenum origin, GLenum depth) { _glsClipControl(origin, depth); }
 static void    APIENTRY _stub_glTextureBarrier(void) { _glsTextureBarrier(); }
 
@@ -285,9 +287,9 @@ static void    APIENTRY _stub_glFogCoordd(GLdouble coord) { _glsFogCoordd(coord)
 static void    APIENTRY _stub_glFogCoorddv(const GLdouble *coord) { _glsFogCoorddv(coord); }
 static void    APIENTRY _stub_glFogCoordPointer(GLenum type, GLsizei stride, const void *pointer) { _glsFogCoordPointer(type, stride, pointer); }
 static void    APIENTRY _stub_glSecondaryColor3f(GLfloat r, GLfloat g, GLfloat b) { _glsSecondaryColor3f(r, g, b); }
-static void    APIENTRY _stub_glSecondaryColor3fv(const GLfloat *v) { _glsSecondaryColor3fv(v); }
-static void    APIENTRY _stub_glSecondaryColor3ub(GLubyte r, GLubyte g, GLubyte b) { _glsSecondaryColor3ub(r, g, b); }
-static void    APIENTRY _stub_glSecondaryColor3ubv(const GLubyte *v) { _glsSecondaryColor3ubv(v); }
+static void    APIENTRY _stub_glSecondaryColor3fv(const GLfloat *v) { if (v) _glsSecondaryColor3f(v[0], v[1], v[2]); }
+static void    APIENTRY _stub_glSecondaryColor3ub(GLubyte r, GLubyte g, GLubyte b) { _glsSecondaryColor3f((float)r/255.0f, (float)g/255.0f, (float)b/255.0f); }
+static void    APIENTRY _stub_glSecondaryColor3ubv(const GLubyte *v) { if (v) _glsSecondaryColor3f((float)v[0]/255.0f, (float)v[1]/255.0f, (float)v[2]/255.0f); }
 static void    APIENTRY _stub_glSecondaryColorPointer(GLint size, GLenum type, GLsizei stride, const void *pointer) { _glsSecondaryColorPointer(size, type, stride, pointer); }
 static void    APIENTRY _stub_glMultiDrawArrays(GLenum mode, const GLint *first, const GLsizei *count, GLsizei drawcount) { _glsMultiDrawArrays(mode, first, count, drawcount); }
 static void    APIENTRY _stub_glMultiDrawElements(GLenum mode, const GLsizei *count, GLenum type, const void *const*indices, GLsizei drawcount) { _glsMultiDrawElements(mode, count, type, indices, drawcount); }
@@ -296,7 +298,7 @@ static void    APIENTRY _stub_glPointParameterfv(GLenum pname, const GLfloat *pa
 static void    APIENTRY _stub_glPointParameteri(GLenum pname, GLint param) { _glsPointParameteri(pname, param); }
 static void    APIENTRY _stub_glPointParameteriv(GLenum pname, const GLint *params) { _glsPointParameteriv(pname, params); }
 static void    APIENTRY _stub_glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void *data) { _glsGetBufferSubData(target, offset, size, data); }
-static void    APIENTRY _stub_glGetBufferPointerv(GLenum target, GLenum pname, void **params) { if(params) *params=NULL; }
+static void    APIENTRY _stub_glGetBufferPointerv(GLenum target, GLenum pname, void **params) { _glsGetBufferPointerv(target, pname, params); }
 static void    APIENTRY _stub_glActiveTexture(GLenum texture) { _glsActiveTexture(texture); }
 static void    APIENTRY _stub_glBlendEquation(GLenum mode) { _glsBlendEquation(mode); }
 static void    APIENTRY _stub_glBlendColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) { _glsBlendColor(r, g, b, a); }
@@ -304,6 +306,11 @@ static void    APIENTRY _stub_glBlendColor(GLfloat r, GLfloat g, GLfloat b, GLfl
 /* ARB program wrappers with correct signatures */
 static void    APIENTRY _stub_glGenProgramsARB(GLenum target, GLsizei n, GLuint *programs) { (void)target; _glsGenProgramsARB(n, programs); }
 static void    APIENTRY _stub_glGenProgramsARB2(GLsizei n, GLuint *programs) { _glsGenProgramsARB(n, programs); }
+/* ARB_vertex_program spells this glDeleteProgramsARB(GLsizei, const GLuint *) —
+ * no target, exactly like glGenProgramsARB.  The table below binds the matching
+ * two-argument form; a three-argument stub would pop 12 bytes of a caller's
+ * 8-byte push on x86 __stdcall. */
+static void    APIENTRY _stub_glDeleteProgramsARB(GLsizei n, const GLuint *programs) { _glsDeleteProgramsARB(n, programs); }
 static void    APIENTRY _stub_glBindProgramARB(GLenum target, GLuint program) { _glsBindProgramARB(target, program); }
 static void    APIENTRY _stub_glProgramStringARB(GLenum target, GLenum format, GLsizei len, const void *string) { _glsProgramStringARB(target, format, len, string); }
 static void    APIENTRY _stub_glProgramEnvParameter4fvARB(GLenum target, GLuint index, const GLfloat *params) { _glsProgramEnvParameter4fvARB(target, index, params); }
@@ -311,19 +318,15 @@ static void    APIENTRY _stub_glProgramLocalParameter4fvARB(GLenum target, GLuin
 /*
  * Entry points that MUST be listed in the proc table below.
  *
- * Anything not in the table and not exported falls back to a typed no-op
- * whose argument count _glsGuessArgCount only guesses.  These are all cases
- * where the guess is wrong, and on x86 __stdcall the callee pops the
- * arguments, so a wrong count corrupts the caller's stack and crashes.
- * glUnlockArraysEXT was the worst: 0 arguments guessed as 4, popping 16
- * bytes that were never pushed.  id Tech 4 games (Quake 4, Wolfenstein)
- * call it every frame because GL_EXT_compiled_vertex_array is advertised.
+ * Anything not in this table, the generated exact-signature table, or the DLL
+ * exports is unsupported and resolves to NULL. These legacy aliases remain
+ * explicit because id Tech 4 games query and call them every frame.
  */
 
 /* GL_EXT_compiled_vertex_array — a caching hint with no D3D9 equivalent;
  * correct to ignore, but it must be ignored with the right stack cleanup. */
-static void    APIENTRY _stub_glLockArraysEXT(GLint first, GLsizei count) { (void)first; (void)count; }
-static void    APIENTRY _stub_glUnlockArraysEXT(void) { }
+static void    APIENTRY _stub_glLockArraysEXT(GLint first, GLsizei count) { _glsLockArraysEXT(first, count); }
+static void    APIENTRY _stub_glUnlockArraysEXT(void) { _glsUnlockArraysEXT(); }
 
 /* Scalar forms of the ARB program parameter entry points (6 and 10 slots). */
 static void    APIENTRY _stub_glProgramEnvParameter4fARB(GLenum target, GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w)
@@ -350,8 +353,8 @@ static void    APIENTRY _stub_glMultiDrawElementsEXT(GLenum mode, const GLsizei 
 
 /* GL_EXT_fog_coord / GL_EXT_secondary_color / GL_ARB_point_parameters. */
 static void    APIENTRY _stub_glFogCoordfEXT(GLfloat coord) { _glsFogCoordf(coord); }
-static void    APIENTRY _stub_glFogCoordPointerEXT(GLenum type, GLsizei stride, const void *pointer) { (void)type; (void)stride; (void)pointer; }
-static void    APIENTRY _stub_glSecondaryColor3fvEXT(const GLfloat *v) { _glsSecondaryColor3fv(v); }
+static void    APIENTRY _stub_glFogCoordPointerEXT(GLenum type, GLsizei stride, const void *pointer) { _glsFogCoordPointer(type, stride, pointer); }
+static void    APIENTRY _stub_glSecondaryColor3fvEXT(const GLfloat *v) { if (v) _glsSecondaryColor3f(v[0], v[1], v[2]); }
 static void    APIENTRY _stub_glPointParameterfEXT(GLenum pname, GLfloat param) { _glsPointParameterf(pname, param); }
 static void    APIENTRY _stub_glPointParameterfvEXT(GLenum pname, const GLfloat *params) { _glsPointParameterfv(pname, params); }
 
@@ -360,6 +363,47 @@ static void    APIENTRY _stub_glGetObjectParameterivARB(GLuint obj, GLenum pname
 static void    APIENTRY _stub_glGetInfoLogARB(GLuint obj, GLsizei maxLength, GLsizei *length, GLchar *infoLog) { _glsGetInfoLogARB(obj, maxLength, length, infoLog); }
 static void    APIENTRY _stub_glMultiTexCoord2fARB(GLenum target, GLfloat s, GLfloat t) { _glsMultiTexCoord2fARB(target, s, t); }
 static void    APIENTRY _stub_glMultiTexCoord2fvARB(GLenum target, const GLfloat *v) { _glsMultiTexCoord2fvARB(target, v); }
+
+/*
+ * Core glMultiTexCoord* (GL 1.3).  opengl32.def exports only the ARB-suffixed
+ * spellings, matching Microsoft's own opengl32.dll, so the core names are
+ * reachable through wglGetProcAddress alone and have to be listed here — an
+ * unlisted name resolves to the generic argument-discarding fallback in
+ * gl46_driver.c instead.  Every arity and type funnels into the same
+ * _gls* functions the ARB spellings use.
+ */
+static void    APIENTRY _stub_glMultiTexCoord1d(GLenum target, GLdouble s) { _glsMultiTexCoord1fARB(target, (GLfloat)s); }
+static void    APIENTRY _stub_glMultiTexCoord1dv(GLenum target, const GLdouble *v) { if (v) _glsMultiTexCoord1fARB(target, (GLfloat)v[0]); }
+static void    APIENTRY _stub_glMultiTexCoord1f(GLenum target, GLfloat s) { _glsMultiTexCoord1fARB(target, (GLfloat)s); }
+static void    APIENTRY _stub_glMultiTexCoord1fv(GLenum target, const GLfloat *v) { if (v) _glsMultiTexCoord1fARB(target, (GLfloat)v[0]); }
+static void    APIENTRY _stub_glMultiTexCoord1i(GLenum target, GLint s) { _glsMultiTexCoord1fARB(target, (GLfloat)s); }
+static void    APIENTRY _stub_glMultiTexCoord1iv(GLenum target, const GLint *v) { if (v) _glsMultiTexCoord1fARB(target, (GLfloat)v[0]); }
+static void    APIENTRY _stub_glMultiTexCoord1s(GLenum target, GLshort s) { _glsMultiTexCoord1fARB(target, (GLfloat)s); }
+static void    APIENTRY _stub_glMultiTexCoord1sv(GLenum target, const GLshort *v) { if (v) _glsMultiTexCoord1fARB(target, (GLfloat)v[0]); }
+static void    APIENTRY _stub_glMultiTexCoord2d(GLenum target, GLdouble s, GLdouble t) { _glsMultiTexCoord2fARB(target, (GLfloat)s, (GLfloat)t); }
+static void    APIENTRY _stub_glMultiTexCoord2dv(GLenum target, const GLdouble *v) { if (v) _glsMultiTexCoord2fARB(target, (GLfloat)v[0], (GLfloat)v[1]); }
+static void    APIENTRY _stub_glMultiTexCoord2f(GLenum target, GLfloat s, GLfloat t) { _glsMultiTexCoord2fARB(target, (GLfloat)s, (GLfloat)t); }
+static void    APIENTRY _stub_glMultiTexCoord2fv(GLenum target, const GLfloat *v) { if (v) _glsMultiTexCoord2fARB(target, (GLfloat)v[0], (GLfloat)v[1]); }
+static void    APIENTRY _stub_glMultiTexCoord2i(GLenum target, GLint s, GLint t) { _glsMultiTexCoord2fARB(target, (GLfloat)s, (GLfloat)t); }
+static void    APIENTRY _stub_glMultiTexCoord2iv(GLenum target, const GLint *v) { if (v) _glsMultiTexCoord2fARB(target, (GLfloat)v[0], (GLfloat)v[1]); }
+static void    APIENTRY _stub_glMultiTexCoord2s(GLenum target, GLshort s, GLshort t) { _glsMultiTexCoord2fARB(target, (GLfloat)s, (GLfloat)t); }
+static void    APIENTRY _stub_glMultiTexCoord2sv(GLenum target, const GLshort *v) { if (v) _glsMultiTexCoord2fARB(target, (GLfloat)v[0], (GLfloat)v[1]); }
+static void    APIENTRY _stub_glMultiTexCoord3d(GLenum target, GLdouble s, GLdouble t, GLdouble r) { _glsMultiTexCoord3fARB(target, (GLfloat)s, (GLfloat)t, (GLfloat)r); }
+static void    APIENTRY _stub_glMultiTexCoord3dv(GLenum target, const GLdouble *v) { if (v) _glsMultiTexCoord3fARB(target, (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2]); }
+static void    APIENTRY _stub_glMultiTexCoord3f(GLenum target, GLfloat s, GLfloat t, GLfloat r) { _glsMultiTexCoord3fARB(target, (GLfloat)s, (GLfloat)t, (GLfloat)r); }
+static void    APIENTRY _stub_glMultiTexCoord3fv(GLenum target, const GLfloat *v) { if (v) _glsMultiTexCoord3fARB(target, (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2]); }
+static void    APIENTRY _stub_glMultiTexCoord3i(GLenum target, GLint s, GLint t, GLint r) { _glsMultiTexCoord3fARB(target, (GLfloat)s, (GLfloat)t, (GLfloat)r); }
+static void    APIENTRY _stub_glMultiTexCoord3iv(GLenum target, const GLint *v) { if (v) _glsMultiTexCoord3fARB(target, (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2]); }
+static void    APIENTRY _stub_glMultiTexCoord3s(GLenum target, GLshort s, GLshort t, GLshort r) { _glsMultiTexCoord3fARB(target, (GLfloat)s, (GLfloat)t, (GLfloat)r); }
+static void    APIENTRY _stub_glMultiTexCoord3sv(GLenum target, const GLshort *v) { if (v) _glsMultiTexCoord3fARB(target, (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2]); }
+static void    APIENTRY _stub_glMultiTexCoord4d(GLenum target, GLdouble s, GLdouble t, GLdouble r, GLdouble q) { _glsMultiTexCoord4fARB(target, (GLfloat)s, (GLfloat)t, (GLfloat)r, (GLfloat)q); }
+static void    APIENTRY _stub_glMultiTexCoord4dv(GLenum target, const GLdouble *v) { if (v) _glsMultiTexCoord4fARB(target, (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], (GLfloat)v[3]); }
+static void    APIENTRY _stub_glMultiTexCoord4f(GLenum target, GLfloat s, GLfloat t, GLfloat r, GLfloat q) { _glsMultiTexCoord4fARB(target, (GLfloat)s, (GLfloat)t, (GLfloat)r, (GLfloat)q); }
+static void    APIENTRY _stub_glMultiTexCoord4fv(GLenum target, const GLfloat *v) { if (v) _glsMultiTexCoord4fARB(target, (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], (GLfloat)v[3]); }
+static void    APIENTRY _stub_glMultiTexCoord4i(GLenum target, GLint s, GLint t, GLint r, GLint q) { _glsMultiTexCoord4fARB(target, (GLfloat)s, (GLfloat)t, (GLfloat)r, (GLfloat)q); }
+static void    APIENTRY _stub_glMultiTexCoord4iv(GLenum target, const GLint *v) { if (v) _glsMultiTexCoord4fARB(target, (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], (GLfloat)v[3]); }
+static void    APIENTRY _stub_glMultiTexCoord4s(GLenum target, GLshort s, GLshort t, GLshort r, GLshort q) { _glsMultiTexCoord4fARB(target, (GLfloat)s, (GLfloat)t, (GLfloat)r, (GLfloat)q); }
+static void    APIENTRY _stub_glMultiTexCoord4sv(GLenum target, const GLshort *v) { if (v) _glsMultiTexCoord4fARB(target, (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], (GLfloat)v[3]); }
 static void    APIENTRY _stub_glActiveStencilFaceEXT(GLenum face) { _glsActiveStencilFaceEXT(face); }
 
 /* ===== Master proc table ===== */
@@ -601,6 +645,7 @@ static const GLD_modernProcEntry g_modernGL[] = {
     { "glDisableVertexAttribArrayARB", (PROC)_stub_glDisableVertexAttribArray },
     /* ARB vertex/fragment program (assembly shaders) */
     { "glGenProgramsARB",           (PROC)_stub_glGenProgramsARB2 },
+    { "glDeleteProgramsARB",        (PROC)_stub_glDeleteProgramsARB },
     { "glBindProgramARB",           (PROC)_stub_glBindProgramARB },
     { "glProgramStringARB",         (PROC)_stub_glProgramStringARB },
     { "glProgramEnvParameter4fvARB",(PROC)_stub_glProgramEnvParameter4fvARB },
@@ -620,6 +665,62 @@ static const GLD_modernProcEntry g_modernGL[] = {
     /* ARB multitexture */
     { "glMultiTexCoord2fARB",       (PROC)_stub_glMultiTexCoord2fARB },
     { "glMultiTexCoord2fvARB",      (PROC)_stub_glMultiTexCoord2fvARB },
+    { "glMultiTexCoord1d",          (PROC)_stub_glMultiTexCoord1d },
+    { "glMultiTexCoord1dv",         (PROC)_stub_glMultiTexCoord1dv },
+    { "glMultiTexCoord1f",          (PROC)_stub_glMultiTexCoord1f },
+    { "glMultiTexCoord1fv",         (PROC)_stub_glMultiTexCoord1fv },
+    { "glMultiTexCoord1i",          (PROC)_stub_glMultiTexCoord1i },
+    { "glMultiTexCoord1iv",         (PROC)_stub_glMultiTexCoord1iv },
+    { "glMultiTexCoord1s",          (PROC)_stub_glMultiTexCoord1s },
+    { "glMultiTexCoord1sv",         (PROC)_stub_glMultiTexCoord1sv },
+    { "glMultiTexCoord2d",          (PROC)_stub_glMultiTexCoord2d },
+    { "glMultiTexCoord2dv",         (PROC)_stub_glMultiTexCoord2dv },
+    { "glMultiTexCoord2f",          (PROC)_stub_glMultiTexCoord2f },
+    { "glMultiTexCoord2fv",         (PROC)_stub_glMultiTexCoord2fv },
+    { "glMultiTexCoord2i",          (PROC)_stub_glMultiTexCoord2i },
+    { "glMultiTexCoord2iv",         (PROC)_stub_glMultiTexCoord2iv },
+    { "glMultiTexCoord2s",          (PROC)_stub_glMultiTexCoord2s },
+    { "glMultiTexCoord2sv",         (PROC)_stub_glMultiTexCoord2sv },
+    { "glMultiTexCoord3d",          (PROC)_stub_glMultiTexCoord3d },
+    { "glMultiTexCoord3dv",         (PROC)_stub_glMultiTexCoord3dv },
+    { "glMultiTexCoord3f",          (PROC)_stub_glMultiTexCoord3f },
+    { "glMultiTexCoord3fv",         (PROC)_stub_glMultiTexCoord3fv },
+    { "glMultiTexCoord3i",          (PROC)_stub_glMultiTexCoord3i },
+    { "glMultiTexCoord3iv",         (PROC)_stub_glMultiTexCoord3iv },
+    { "glMultiTexCoord3s",          (PROC)_stub_glMultiTexCoord3s },
+    { "glMultiTexCoord3sv",         (PROC)_stub_glMultiTexCoord3sv },
+    { "glMultiTexCoord4d",          (PROC)_stub_glMultiTexCoord4d },
+    { "glMultiTexCoord4dv",         (PROC)_stub_glMultiTexCoord4dv },
+    { "glMultiTexCoord4f",          (PROC)_stub_glMultiTexCoord4f },
+    { "glMultiTexCoord4fv",         (PROC)_stub_glMultiTexCoord4fv },
+    { "glMultiTexCoord4i",          (PROC)_stub_glMultiTexCoord4i },
+    { "glMultiTexCoord4iv",         (PROC)_stub_glMultiTexCoord4iv },
+    { "glMultiTexCoord4s",          (PROC)_stub_glMultiTexCoord4s },
+    { "glMultiTexCoord4sv",         (PROC)_stub_glMultiTexCoord4sv },
+    { "glMultiTexCoord1dARB",       (PROC)_stub_glMultiTexCoord1d },
+    { "glMultiTexCoord1dvARB",      (PROC)_stub_glMultiTexCoord1dv },
+    { "glMultiTexCoord1fARB",       (PROC)_stub_glMultiTexCoord1f },
+    { "glMultiTexCoord1fvARB",      (PROC)_stub_glMultiTexCoord1fv },
+    { "glMultiTexCoord1iARB",       (PROC)_stub_glMultiTexCoord1i },
+    { "glMultiTexCoord1ivARB",      (PROC)_stub_glMultiTexCoord1iv },
+    { "glMultiTexCoord1sARB",       (PROC)_stub_glMultiTexCoord1s },
+    { "glMultiTexCoord1svARB",      (PROC)_stub_glMultiTexCoord1sv },
+    { "glMultiTexCoord3dARB",       (PROC)_stub_glMultiTexCoord3d },
+    { "glMultiTexCoord3dvARB",      (PROC)_stub_glMultiTexCoord3dv },
+    { "glMultiTexCoord3fARB",       (PROC)_stub_glMultiTexCoord3f },
+    { "glMultiTexCoord3fvARB",      (PROC)_stub_glMultiTexCoord3fv },
+    { "glMultiTexCoord3iARB",       (PROC)_stub_glMultiTexCoord3i },
+    { "glMultiTexCoord3ivARB",      (PROC)_stub_glMultiTexCoord3iv },
+    { "glMultiTexCoord3sARB",       (PROC)_stub_glMultiTexCoord3s },
+    { "glMultiTexCoord3svARB",      (PROC)_stub_glMultiTexCoord3sv },
+    { "glMultiTexCoord4dARB",       (PROC)_stub_glMultiTexCoord4d },
+    { "glMultiTexCoord4dvARB",      (PROC)_stub_glMultiTexCoord4dv },
+    { "glMultiTexCoord4fARB",       (PROC)_stub_glMultiTexCoord4f },
+    { "glMultiTexCoord4fvARB",      (PROC)_stub_glMultiTexCoord4fv },
+    { "glMultiTexCoord4iARB",       (PROC)_stub_glMultiTexCoord4i },
+    { "glMultiTexCoord4ivARB",      (PROC)_stub_glMultiTexCoord4iv },
+    { "glMultiTexCoord4sARB",       (PROC)_stub_glMultiTexCoord4s },
+    { "glMultiTexCoord4svARB",      (PROC)_stub_glMultiTexCoord4sv },
     { "glActiveTextureARB",         (PROC)_stub_glActiveTexture },
     { "glClientActiveTextureARB",   (PROC)_stub_glClientActiveTexture },
     /* ARB texture compression */
@@ -630,9 +731,7 @@ static const GLD_modernProcEntry g_modernGL[] = {
     { "glBlendEquationEXT",         (PROC)_stub_glBlendEquation },
     { "glActiveStencilFaceEXT",     (PROC)_stub_glActiveStencilFaceEXT },
 
-    /* Entry points whose arity _glsGuessArgCount gets wrong — see the note
-     * above the stubs.  Without these the typed-no-op fallback corrupts the
-     * x86 __stdcall stack and crashes id Tech 4 titles. */
+    /* Legacy aliases with explicit exact-ABI adapters. */
     { "glLockArraysEXT",            (PROC)_stub_glLockArraysEXT },
     { "glUnlockArraysEXT",          (PROC)_stub_glUnlockArraysEXT },
     { "glProgramEnvParameter4fARB", (PROC)_stub_glProgramEnvParameter4fARB },

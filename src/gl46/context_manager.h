@@ -68,6 +68,28 @@ BOOL gldInitContext46(void);
 void gldShutdownContext46(void);
 
 /*
+ * Build the presentation parameters this backend presents with.
+ *
+ * One implementation for all three callers — first device creation, context
+ * reuse (which resets the device) and the device-lost reset in
+ * gldSwapBuffers_GL46 — so a reset can never present with a different shape
+ * than the device was created with.  The back buffer takes hWnd's client size,
+ * falling back to the adapter's current display mode when there is no window or
+ * it has no area yet.
+ *
+ * *out is zeroed first, so it is safe to inspect even when D3D9 has not been
+ * initialised and nothing could be filled in.
+ */
+void gldBuildPresentParams46(HWND hWnd, D3DPRESENT_PARAMETERS *out);
+
+/*
+ * Apply the render and transform state this backend assumes at the start of a
+ * frame.  A reset clears device state the same way a fresh device would need it
+ * set, so both paths call this.  NULL pDev is a no-op.
+ */
+void gldApplyDefaultDeviceState46(IDirect3DDevice9 *pDev);
+
+/*
  * Create a D3D9 device for the GL46 context.
  *
  * Parameters:
@@ -125,6 +147,21 @@ IDirect3D9* gldGetD3D46(void);
  * for draw calls so Remix can intercept geometry for path tracing.
  */
 BOOL gldIsRemixDetected(void);
+
+/*
+ * Ask the device whether a texture of this D3DFORMAT can actually be
+ * created — as a cube map when cubeMap is TRUE, otherwise as a 2D texture.
+ *
+ * Answered by IDirect3D9::CheckDeviceFormat against whatever d3d9.dll the
+ * game directory supplied (Usage = 0, D3DPOOL-independent), and cached per
+ * format for the life of the process.  Callers must use this before
+ * CreateTexture/CreateCubeTexture instead of creating and reacting to a
+ * failure.
+ *
+ * Returns FALSE when D3D9 has not been initialised, i.e. when there is
+ * nothing to ask.
+ */
+BOOL gldIsTextureFormatSupported46(D3DFORMAT fmt, BOOL cubeMap);
 
 #ifdef  __cplusplus
 }

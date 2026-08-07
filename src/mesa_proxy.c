@@ -13,14 +13,26 @@ BOOL mesaProxyInit(void)
     char dllPath[MAX_PATH];
     char modulePath[MAX_PATH];
     char *lastSlash;
+    HMODULE selfModule = NULL;
+    DWORD moduleLength;
 
     if (g_mesaProxy.initialized)
         return TRUE;
 
     gldDiagLog("mesaProxyInit: starting");
 
-    /* Build path to mesa_gl.dll in the same directory as our DLL */
-    GetModuleFileName(NULL, modulePath, MAX_PATH);
+    /* Locate Mesa beside this wrapper DLL, not beside the executable. */
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)(const void *)&mesaProxyInit, &selfModule)) {
+        selfModule = NULL;
+    }
+    moduleLength = GetModuleFileNameA(selfModule, modulePath, MAX_PATH);
+    if (moduleLength == 0 || moduleLength >= MAX_PATH) {
+        gldDiagLog("mesaProxyInit: cannot resolve wrapper directory, error=%lu",
+                   (unsigned long)GetLastError());
+        return FALSE;
+    }
     lastSlash = strrchr(modulePath, '\\');
     if (lastSlash) {
         *(lastSlash + 1) = '\0';
@@ -31,6 +43,25 @@ BOOL mesaProxyInit(void)
     }
 
     gldDiagLog("mesaProxyInit: loading %s", dllPath);
+
+    /* This Mesa build exposes the complete 4.6 core/GLSL 4.60 path when the
+     * version override is requested (its legacy compatibility context remains
+     * capped at 4.5). Respect explicit application/user values. */
+    {
+        char value[32];
+        SetLastError(ERROR_SUCCESS);
+        if (GetEnvironmentVariableA("MESA_GL_VERSION_OVERRIDE", value,
+                                    sizeof(value)) == 0 &&
+            GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+            SetEnvironmentVariableA("MESA_GL_VERSION_OVERRIDE", "4.6");
+        }
+        SetLastError(ERROR_SUCCESS);
+        if (GetEnvironmentVariableA("MESA_GLSL_VERSION_OVERRIDE", value,
+                                    sizeof(value)) == 0 &&
+            GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+            SetEnvironmentVariableA("MESA_GLSL_VERSION_OVERRIDE", "460");
+        }
+    }
 
     /* Load Mesa's DLL */
     g_mesaProxy.hMesaDLL = LoadLibraryA(dllPath);
@@ -73,15 +104,23 @@ BOOL mesaProxyInit(void)
     g_mesaProxy.initialized = TRUE;
     gldDiagLog("mesaProxyInit: WGL functions loaded, initialized=TRUE");
 
-    /* No temp context needed. Mesa 26 llvmpipe exports all GL functions
-     * directly from the DLL — GetProcAddress(hMesaDLL, "glFuncName") works
-     * without a current context. mesaProxyGetProcAddress uses this as its
-     * primary lookup path. The previous run confirmed all 700+ functions
-     * resolve to "-> Mesa" without any context.
+    /* No temp context is created here, because Mesa's wglSetPixelFormat calls
+     * Windows SetPixelFormat internally, which routes back to our own export
+     * of that name and recurses until the stack is gone.
      *
-     * Temp context creation crashes because Mesa's wglSetPixelFormat
-     * internally calls Windows SetPixelFormat which routes back to our
-     * DLL export, causing infinite recursion. */
+     * That has a consequence worth stating plainly, because an earlier comment
+     * here claimed the opposite. Mesa's opengl32.dll exports only the legacy
+     * GL 1.1 entry points - the same set Microsoft's opengl32.dll exports.
+     * Measured against this build (Mesa 26.0.5 llvmpipe), a GetProcAddress on
+     * the module resolved 0 of 16 sampled functions spanning GL 1.2 through
+     * 4.6; all 16 resolved through wglGetProcAddress, and only once a Mesa
+     * context was current. So mesaProxyGetProcAddress must try
+     * wglGetProcAddress first, as it does, and callers must accept that
+     * anything above GL 1.1 returns NULL until a Mesa context has been made
+     * current. Resolving a function pointer early and caching it is therefore
+     * unsafe for anything above 1.1.
+     *
+     * Note also that this Mesa reports "4.5 (Compatibility Profile)", not 4.6. */
 
     gldDiagLog("mesaProxyInit: complete");
     return TRUE;
@@ -106,20 +145,7 @@ void mesaProxyShutdown(void)
 extern void APIENTRY glNamedFramebufferTextureEXT(unsigned int, unsigned int, unsigned int, int);
 extern void APIENTRY glNamedFramebufferTextureLayerEXT(unsigned int, unsigned int, unsigned int, int, int);
 extern void APIENTRY glNamedFramebufferTextureFaceEXT(unsigned int, unsigned int, unsigned int, int, unsigned int);
-extern void APIENTRY glNamedRenderbufferStorageMultisampleCoverageEXT(unsigned int, int, int, unsigned int, int, int);
-extern void APIENTRY glNamedProgramLocalParameterI4iEXT(unsigned int, unsigned int, unsigned int, int, int, int, int);
-extern void APIENTRY glNamedProgramLocalParameterI4ivEXT(unsigned int, unsigned int, unsigned int, const int*);
-extern void APIENTRY glNamedProgramLocalParametersI4ivEXT(unsigned int, unsigned int, unsigned int, int, const int*);
-extern void APIENTRY glNamedProgramLocalParameterI4uiEXT(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int);
-extern void APIENTRY glNamedProgramLocalParameterI4uivEXT(unsigned int, unsigned int, unsigned int, const unsigned int*);
-extern void APIENTRY glNamedProgramLocalParametersI4uivEXT(unsigned int, unsigned int, unsigned int, int, const unsigned int*);
-extern void APIENTRY glGetNamedProgramLocalParameterIivEXT(unsigned int, unsigned int, unsigned int, int*);
-extern void APIENTRY glGetNamedProgramLocalParameterIuivEXT(unsigned int, unsigned int, unsigned int, unsigned int*);
-extern void APIENTRY glTextureRenderbufferEXT(unsigned int, unsigned int, unsigned int);
-extern void APIENTRY glMultiTexRenderbufferEXT(unsigned int, unsigned int, unsigned int);
 extern void APIENTRY glGetMultiQueryObjectuivAMD(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int*);
-extern void APIENTRY glVertexWeighthNV(unsigned short);
-extern void APIENTRY glVertexWeighthvNV(const unsigned short*);
 
 typedef struct { const char *name; PROC proc; } _MesaExtEntry;
 
@@ -127,20 +153,7 @@ static const _MesaExtEntry _mesaExtTable[] = {
     { "glNamedFramebufferTextureEXT",                     (PROC)glNamedFramebufferTextureEXT },
     { "glNamedFramebufferTextureLayerEXT",                (PROC)glNamedFramebufferTextureLayerEXT },
     { "glNamedFramebufferTextureFaceEXT",                 (PROC)glNamedFramebufferTextureFaceEXT },
-    { "glNamedRenderbufferStorageMultisampleCoverageEXT", (PROC)glNamedRenderbufferStorageMultisampleCoverageEXT },
-    { "glNamedProgramLocalParameterI4iEXT",               (PROC)glNamedProgramLocalParameterI4iEXT },
-    { "glNamedProgramLocalParameterI4ivEXT",              (PROC)glNamedProgramLocalParameterI4ivEXT },
-    { "glNamedProgramLocalParametersI4ivEXT",             (PROC)glNamedProgramLocalParametersI4ivEXT },
-    { "glNamedProgramLocalParameterI4uiEXT",              (PROC)glNamedProgramLocalParameterI4uiEXT },
-    { "glNamedProgramLocalParameterI4uivEXT",             (PROC)glNamedProgramLocalParameterI4uivEXT },
-    { "glNamedProgramLocalParametersI4uivEXT",            (PROC)glNamedProgramLocalParametersI4uivEXT },
-    { "glGetNamedProgramLocalParameterIivEXT",            (PROC)glGetNamedProgramLocalParameterIivEXT },
-    { "glGetNamedProgramLocalParameterIuivEXT",           (PROC)glGetNamedProgramLocalParameterIuivEXT },
-    { "glTextureRenderbufferEXT",                         (PROC)glTextureRenderbufferEXT },
-    { "glMultiTexRenderbufferEXT",                        (PROC)glMultiTexRenderbufferEXT },
     { "glGetMultiQueryObjectuivAMD",                      (PROC)glGetMultiQueryObjectuivAMD },
-    { "glVertexWeighthNV",                                (PROC)glVertexWeighthNV },
-    { "glVertexWeighthvNV",                               (PROC)glVertexWeighthvNV },
     { NULL, NULL }
 };
 
@@ -155,23 +168,15 @@ PROC mesaProxyGetProcAddress(LPCSTR name)
     if (!g_mesaProxy.initialized)
         return NULL;
 
-    /* Override glGetString, glGetStringi, glGetError to return GLDirect's implementations */
-    if (strcmp(name, "glGetString") == 0 || strcmp(name, "glGetStringi") == 0 || strcmp(name, "glGetError") == 0) {
-        static HMODULE hSelf = NULL;
-        if (!hSelf) hSelf = GetModuleHandleA("opengl32.dll");
-        if (hSelf) {
-            p = GetProcAddress(hSelf, name);
-            if (p) {
-                gldDiagLog("mesaProxyGetProcAddress: \"%s\" -> GLDirect (overriding Mesa)", name);
-                return p;
-            }
-        }
-    }
-
     /* First try Mesa's wglGetProcAddress (for GL extensions, needs current context) */
     if (g_mesaProxy.wglGetProcAddress) {
         p = g_mesaProxy.wglGetProcAddress(name);
-        if (p) return p;
+        /* The Win32 WGL contract permits the four small integer sentinels and
+         * -1 for core names.  They are failure values, not callable entry
+         * points; returning -1 here previously produced an access violation
+         * as soon as a forwarded core call was made while Mesa was current. */
+        if (p && p != (PROC)1 && p != (PROC)2 && p != (PROC)3 && p != (PROC)-1)
+            return p;
     }
 
     /* Then try GetProcAddress on Mesa DLL (for core GL functions) */
@@ -185,17 +190,7 @@ PROC mesaProxyGetProcAddress(LPCSTR name)
             return _mesaExtTable[i].proc;
     }
 
-    /* Finally try our own DLL — gl_mesa_forward.c exports all GL functions
-     * which forward to Mesa. This catches core GL 1.3+ functions like
-     * glMultiTexCoord2f that Mesa doesn't export via wglGetProcAddress. */
-    {
-        static HMODULE hSelf = NULL;
-        if (!hSelf) hSelf = GetModuleHandleA("opengl32.dll");
-        if (hSelf) {
-            p = GetProcAddress(hSelf, name);
-            if (p) return p;
-        }
-    }
-
+    /* Do not resolve back to this wrapper's forwarding thunk: that turns a
+     * genuinely missing Mesa symbol into unbounded recursion. */
     return NULL;
 }

@@ -36,6 +36,8 @@
 #include "gld_log.h"
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <stdint.h>
 
 /*---------------------- Static module state ----------------------*/
 
@@ -72,7 +74,7 @@ static int sFindListSlot(GLuint listId)
         int idx = (start + i) % GLD_DL_MAX_LISTS;
         if (s_lists[idx].inUse && s_lists[idx].listId == listId)
             return idx;
-        if (!s_lists[idx].inUse && s_lists[idx].listId == 0)
+        if (FALSE && !s_lists[idx].inUse && s_lists[idx].listId == 0)
             return -1;  /* Empty slot — list doesn't exist */
     }
     return -1;
@@ -103,10 +105,13 @@ static int sAllocListSlot(GLuint listId)
  */
 static void sFreeListSlot(int slot)
 {
+    int i;
     if (slot < 0 || slot >= GLD_DL_MAX_LISTS)
         return;
 
     if (s_lists[slot].commands) {
+        for (i = 0; i < s_lists[slot].cmdCount; ++i)
+            free(s_lists[slot].commands[i].argData);
         free(s_lists[slot].commands);
         s_lists[slot].commands = NULL;
     }
@@ -130,13 +135,10 @@ static BOOL sEnsureCommandCapacity(int slot)
         return TRUE;
 
     newCapacity = dl->cmdCapacity == 0 ? 64 : dl->cmdCapacity * 2;
-    if (newCapacity > GLD_DL_MAX_COMMANDS)
-        newCapacity = GLD_DL_MAX_COMMANDS;
-
-    if (dl->cmdCount >= GLD_DL_MAX_COMMANDS) {
+    if (newCapacity <= dl->cmdCapacity ||
+        (size_t)newCapacity > SIZE_MAX / sizeof(GLD_dlCommand)) {
         gldLogPrintf(GLDLOG_ERROR,
-            "Display list %u: command buffer full (%d commands)",
-            dl->listId, GLD_DL_MAX_COMMANDS);
+            "Display list %u: command count overflow", dl->listId);
         return FALSE;
     }
 
@@ -190,7 +192,10 @@ void gldNewList46(GLuint listId, GLenum mode)
 
     /* If replacing an existing list, free old commands */
     if (s_lists[slot].inUse && s_lists[slot].listId == listId) {
+        int i;
         if (s_lists[slot].commands) {
+            for (i = 0; i < s_lists[slot].cmdCount; ++i)
+                free(s_lists[slot].commands[i].argData);
             free(s_lists[slot].commands);
             s_lists[slot].commands = NULL;
         }
@@ -357,10 +362,9 @@ BOOL gldDLRecordCommand(GLD_dlCommandFunc func,
     if (!func)
         return FALSE;
 
-    if (argSize < 0 || argSize > GLD_DL_MAX_ARG_SIZE) {
+    if (argSize < 0) {
         gldLogPrintf(GLDLOG_ERROR,
-            "gldDLRecordCommand: argSize %d exceeds max %d",
-            argSize, GLD_DL_MAX_ARG_SIZE);
+            "gldDLRecordCommand: negative argSize %d", argSize);
         return FALSE;
     }
 
@@ -368,13 +372,20 @@ BOOL gldDLRecordCommand(GLD_dlCommandFunc func,
         return FALSE;
 
     cmd = &s_lists[s_recordingSlot].commands[s_lists[s_recordingSlot].cmdCount];
+    memset(cmd, 0, sizeof(*cmd));
     cmd->func = func;
     cmd->argSize = argSize;
 
-    if (argData && argSize > 0)
+    if (argData && argSize > 0) {
+        cmd->argData = (unsigned char *)malloc((size_t)argSize);
+        if (!cmd->argData) {
+            memset(cmd, 0, sizeof(*cmd));
+            return FALSE;
+        }
         memcpy(cmd->argData, argData, (size_t)argSize);
-    else
+    } else {
         cmd->argSize = 0;
+    }
 
     s_lists[s_recordingSlot].cmdCount++;
     return TRUE;

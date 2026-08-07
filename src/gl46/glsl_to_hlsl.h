@@ -47,6 +47,21 @@ extern "C" {
 /* Initialize the transpiler — loads d3dcompiler_47.dll */
 BOOL glslTranspilerInit(void);
 
+/* Record the live device's shader-model capabilities.
+ *
+ * D3D9's CreateVertexShader/CreatePixelShader reject bytecode above the
+ * version the device reports, so the caps are a hard ceiling on which
+ * D3DCompile profile is worth targeting.  They are pushed in here rather than
+ * pulled from context_manager.c because this module is deliberately linkable
+ * on its own — the offline transpiler harness builds it with no device and no
+ * context manager at all, and a pull-based design would break that.
+ *
+ * pCaps == NULL clears the cache back to "unknown", which means "assume the
+ * historical vs_3_0/ps_3_0 ceiling" — i.e. exactly the behaviour that predates
+ * this call existing.  That is also the harness's hook for simulating a
+ * lower-capability device without one being present. */
+void glslSetDeviceCaps(const D3DCAPS9 *pCaps);
+
 /* Transpile GLSL to HLSL and compile to D3D9 shader bytecode.
  * shaderType: 0 = vertex shader, 1 = pixel/fragment shader
  * glslSource: null-terminated GLSL source code
@@ -94,6 +109,61 @@ typedef struct {
  * Returns the number of entries written to `out`. */
 int glslReflectConstants(const void *bytecode, DWORD size,
                          glslUniformMap *out, int maxOut);
+
+/* Enumerate the uniforms *declared* in GLSL source, whether or not the HLSL
+ * compiler kept them.
+ *
+ * glslReflectConstants can only report what survived optimisation: D3DCompile
+ * strips any uniform that cannot affect the output, so it never reaches the
+ * constant table and glGetUniformLocation would answer -1 for a name the
+ * application can plainly see in the shader it just supplied.  Engines that
+ * look up a fixed set of parameters after linking treat that -1 as a failed
+ * link - id Tech 5 reports it as "No address" and refuses the program - so a
+ * declared uniform has to keep a location even when it is inactive.
+ *
+ * Entries come back with registerIndex == -1, meaning "no register assigned".
+ * Uploads to such a uniform are accepted and discarded, which is exactly what
+ * GL does with an inactive uniform.
+ *
+ * Returns the number of entries written to `out`. */
+int glslReflectDeclaredUniforms(const char *glslSource,
+                                glslUniformMap *out, int maxOut);
+
+/*---------------------- Attribute reflection ----------------------*/
+
+#define GLSL_MAX_ATTRIB_INFO    16
+
+typedef struct {
+    char name[GLSL_UNIFORM_NAME_LEN];
+    int  glType;            /* GL_FLOAT_VEC4 etc. */
+    int  arraySize;         /* 1 unless the declaration is an array */
+} glslAttribInfo;
+
+/* List a vertex shader's input attributes.
+ *
+ * Attribute names do not survive into D3D9 bytecode — the CTAB constant table
+ * only describes uniforms — so glGetActiveAttrib has no way to recover them
+ * after compilation.  They are read straight from the GLSL source instead.
+ *
+ * Returns the number of entries written to `out`. */
+int glslReflectAttributes(const char *glslSource, glslAttribInfo *out, int maxOut);
+
+typedef struct {
+    char name[GLSL_UNIFORM_NAME_LEN];
+    int  glType;
+    int  components;
+    int  location;
+    int  arraySize;
+    BOOL isFlat;
+    BOOL isInteger;
+    BOOL isUnsigned;
+} glslVaryingInfo;
+
+/* List the user varyings entering a fragment shader (shaderType=1) or leaving
+ * a vertex shader (shaderType=0), including the component layout required to
+ * unpack software-stage transform feedback. */
+int glslReflectVaryings(const char *glslSource, int shaderType,
+                        glslVaryingInfo *out, int maxOut);
 
 /* Shut down — unload d3dcompiler */
 void glslTranspilerShutdown(void);

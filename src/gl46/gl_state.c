@@ -3,6 +3,8 @@
 *********************************************************************************/
 
 #include "gl_state.h"
+#include "gl_impl.h"
+#include "advanced_emulation.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -101,6 +103,33 @@ void glsInitState(void)
 
     memset(s, 0, sizeof(GLS_State));
 
+    /* Claim the state as initialized here, not at the end.
+     *
+     * glsGetState() calls this function whenever the flag is clear, and the
+     * default-setting helpers below - _glsInitTexEnvDefaults() and anything
+     * added beside it - call glsGetState() to reach the state they are
+     * filling in. With the flag still clear at that point the two call each
+     * other forever and the driver dies of stack exhaustion during
+     * CreatePrivateGlobals, before a single GL call is made.
+     *
+     * The memset above has already made every field valid, so a re-entrant
+     * glsGetState can safely be handed the struct mid-initialization; it sees
+     * zeroes rather than final defaults, and the helper that asked for it is
+     * the one about to write those defaults anyway. */
+    s->initialized = TRUE;
+
+    /* VAO name 0 is the compatibility-profile default vertex array object.
+     * It always exists - it is not "no VAO bound". Marking it allocated here
+     * is what lets glsFindVAO(0) hand back real storage, so an application
+     * that never calls glBindVertexArray (the GL 2.x / ARB_vertex_program
+     * usage pattern) still has its glVertexAttribPointer /
+     * glEnableVertexAttribArray / glVertexAttrib{1..4}f state recorded
+     * somewhere instead of being silently dropped. */
+    s->vaos[0].id = 0;
+    s->vaos[0].allocated = TRUE;
+    for (i = 0; i < GLS_MAX_VERTEX_ATTRIBS; ++i)
+        s->vaos[0].attribs[i].defaultValue[3] = 1.0f;
+
     /* ID counters start at 1 (0 is reserved/default) */
     s->nextTexId = 1;
     s->nextBufId = 1;
@@ -149,6 +178,14 @@ void glsInitState(void)
     s->stencilZFail = 0x1E00;
     s->stencilZPass = 0x1E00;
     s->stencilWriteMask = 0xFFFFFFFF;
+    s->stencilBackFunc = s->stencilFunc;
+    s->stencilBackRef = s->stencilRef;
+    s->stencilBackMask = s->stencilMask;
+    s->stencilBackFail = s->stencilFail;
+    s->stencilBackZFail = s->stencilZFail;
+    s->stencilBackZPass = s->stencilZPass;
+    s->stencilBackWriteMask = s->stencilWriteMask;
+    s->activeStencilFace = 0x0404;  /* GL_FRONT, the EXT_stencil_two_side default */
 
     /* Matrix stacks */
     s->matrixMode = 0x1700; /* GL_MODELVIEW */
@@ -184,8 +221,39 @@ void glsInitState(void)
     /* Active texture unit */
     s->activeTexUnit = 0x84C0; /* GL_TEXTURE0 */
 
+    /* Fixed-function texture environment.  These stage states are what RTX
+     * Remix reads to identify materials, so they must match GL's documented
+     * defaults from the first draw rather than whatever D3D9 happened to
+     * leave set. */
+    _glsInitTexEnvDefaults();
+
+    /* Raster position and pixel transfer defaults. */
+    s->rasterPos[3]  = 1.0f;
+    s->pixelZoomX    = 1.0f;
+    s->pixelZoomY    = 1.0f;
+    s->redScale = s->greenScale = s->blueScale = s->alphaScale = 1.0f;
+    s->depthScale    = 1.0f;
+    s->renderMode    = 0x1C00;   /* GL_RENDER */
+    s->edgeFlag      = 1;        /* GL_TRUE   */
+    s->indexWriteMask = 0xFFFFFFFFu;
+    s->lineStipplePattern = 0xFFFF;
+    s->lineStippleFactor  = 1;
+    s->sampleCoverageValue = 1.0f;
+    s->minSampleShading = 0.0f;
+    s->patchVertices = 3;
+    s->patchDefaultOuter[0] = 1.0f;
+    s->patchDefaultOuter[1] = 1.0f;
+    s->patchDefaultOuter[2] = 1.0f;
+    s->patchDefaultOuter[3] = 1.0f;
+    s->patchDefaultInner[0] = 1.0f;
+    s->patchDefaultInner[1] = 1.0f;
+    s->clipOrigin = 0x8CA1;       /* GL_LOWER_LEFT */
+    s->clipDepthMode = 0x935E;    /* GL_NEGATIVE_ONE_TO_ONE */
+    s->provokingVertexMode = 0x8E4E; /* GL_LAST_VERTEX_CONVENTION */
+    memset(s->polygonStipple, 0xFF, sizeof(s->polygonStipple));
+
     s->lastError = 0; /* GL_NO_ERROR */
-    s->initialized = TRUE;
+    gldAdvReset();
 }
 
 /* ===== Object lookup helpers ===== */
@@ -204,9 +272,14 @@ GLS_Buffer* glsFindBuffer(GLuint_t id)
     return &g_glState.buffers[id];
 }
 
+/* Note the deliberate absence of an "id == 0" rejection that the other
+ * glsFind* helpers have: VAO 0 is a real, always-allocated object (see
+ * glsInitState), not a reserved sentinel. Callers that need GL's "name 0 is
+ * not a valid user object" behaviour - glIsVertexArray, glDeleteVertexArrays -
+ * check for 0 themselves before coming here. */
 GLS_VAO* glsFindVAO(GLuint_t id)
 {
-    if (id == 0 || id >= GLS_MAX_VAOS) return NULL;
+    if (id >= GLS_MAX_VAOS) return NULL;
     if (!g_glState.vaos[id].allocated) return NULL;
     return &g_glState.vaos[id];
 }

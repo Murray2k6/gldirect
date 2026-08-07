@@ -51,23 +51,13 @@
 /*
  * Maximum number of display lists that can be active simultaneously.
  */
-#define GLD_DL_MAX_LISTS        1024
+#define GLD_DL_MAX_LISTS        16384
 
 /*
  * Maximum number of commands per display list.
  */
-#define GLD_DL_MAX_COMMANDS     4096
-
-/*
- * Maximum nesting depth for display list calls (glCallList within a list).
- */
+/* Maximum nesting depth for display list calls (glCallList within a list). */
 #define GLD_DL_MAX_NESTING      64
-
-/*
- * Maximum size of argument data per command (bytes).
- * Covers up to 16 floats (a 4x4 matrix) plus some extra.
- */
-#define GLD_DL_MAX_ARG_SIZE     128
 
 /*
  * Legacy display list mode constants (removed from core profile headers).
@@ -97,7 +87,7 @@ typedef void (*GLD_dlCommandFunc)(const void *argData);
 typedef struct {
     GLD_dlCommandFunc   func;
     int                 argSize;
-    unsigned char       argData[GLD_DL_MAX_ARG_SIZE];
+    unsigned char      *argData;
 } GLD_dlCommand;
 
 /*

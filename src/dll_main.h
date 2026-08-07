@@ -55,6 +55,10 @@ extern "C" {
 extern BOOL bInitialized;
 
 BOOL gldInitDriver(void);
+
+/* gld_crash.c - vectored fault recorder, installed at DLL_PROCESS_ATTACH */
+void gldCrashHandlerInstall(void);
+void gldCrashHandlerRemove(void);
 void gldExitDriver(void);
 
 #ifdef  __cplusplus

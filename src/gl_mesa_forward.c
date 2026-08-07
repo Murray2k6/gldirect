@@ -10,31 +10,48 @@
 
 #include <windows.h>
 #include "mesa_proxy.h"
+#include "gld_diag.h"
 #include "gl46/gl_dx9_compat.h"
 
-/* Helper: get a GL function pointer from Mesa, cache it */
+/*
+ * The public OpenGL ABI dispatches to one of two complete context owners:
+ * Mesa when the compatibility backend was selected, or the private
+ * direct_gl* implementation when GLDirect owns the context. Mixing calls
+ * between the two state machines is invalid, so this decision is made before
+ * resolving or invoking a function.
+ */
+#define GLD_DIRECT_NAME_INNER(name) direct_##name
+#define GLD_DIRECT_NAME(name) GLD_DIRECT_NAME_INNER(name)
+
 #define MESA_FORWARD_VOID(name, params, args) \
     typedef void (APIENTRY *PFN_##name) params; \
     static PFN_##name pfn_##name = NULL; \
+    void APIENTRY GLD_DIRECT_NAME(name) params; \
     void APIENTRY name params { \
-        if (!pfn_##name) { \
-            if (!g_mesaProxy.initialized) mesaProxyInit(); \
-            pfn_##name = (PFN_##name)mesaProxyGetProcAddress(#name); \
-            if (!pfn_##name) pfn_##name = (PFN_##name)GetProcAddress(g_mesaProxy.hMesaDLL, #name); \
+        if (!g_mesaProxy.initialized) { \
+            GLD_DIRECT_NAME(name) args; \
+            return; \
         } \
-        if (pfn_##name) pfn_##name args; \
+        if (!pfn_##name) \
+            pfn_##name = (PFN_##name)mesaProxyGetProcAddress(#name); \
+        if (pfn_##name) { \
+            pfn_##name args; \
+            return; \
+        } \
+        gldDiagLog("MesaProxy: required entry point %s is unavailable", #name); \
     }
 
 #define MESA_FORWARD_RET(rettype, name, params, args) \
     typedef rettype (APIENTRY *PFN_##name) params; \
     static PFN_##name pfn_##name = NULL; \
+    rettype APIENTRY GLD_DIRECT_NAME(name) params; \
     rettype APIENTRY name params { \
-        if (!pfn_##name) { \
-            if (!g_mesaProxy.initialized) mesaProxyInit(); \
+        if (!g_mesaProxy.initialized) \
+            return GLD_DIRECT_NAME(name) args; \
+        if (!pfn_##name) \
             pfn_##name = (PFN_##name)mesaProxyGetProcAddress(#name); \
-            if (!pfn_##name) pfn_##name = (PFN_##name)GetProcAddress(g_mesaProxy.hMesaDLL, #name); \
-        } \
         if (pfn_##name) return pfn_##name args; \
+        gldDiagLog("MesaProxy: required entry point %s is unavailable", #name); \
         return (rettype)0; \
     }
 
@@ -42,14 +59,20 @@
 #define MESA_FORWARD_VOID_HOOK(name, params, args, hookCall) \
     typedef void (APIENTRY *PFN_##name) params; \
     static PFN_##name pfn_##name = NULL; \
+    void APIENTRY GLD_DIRECT_NAME(name) params; \
     void APIENTRY name params { \
-        if (!pfn_##name) { \
-            if (!g_mesaProxy.initialized) mesaProxyInit(); \
-            pfn_##name = (PFN_##name)mesaProxyGetProcAddress(#name); \
-            if (!pfn_##name) pfn_##name = (PFN_##name)GetProcAddress(g_mesaProxy.hMesaDLL, #name); \
+        if (!g_mesaProxy.initialized) { \
+            GLD_DIRECT_NAME(name) args; \
+            return; \
         } \
-        if (pfn_##name) pfn_##name args; \
-        hookCall; \
+        if (!pfn_##name) \
+            pfn_##name = (PFN_##name)mesaProxyGetProcAddress(#name); \
+        if (pfn_##name) { \
+            pfn_##name args; \
+            if (gldCompatIsActive()) { hookCall; } \
+            return; \
+        } \
+        gldDiagLog("MesaProxy: required entry point %s is unavailable", #name); \
     }
 
 /* Suppress warnings */
@@ -175,7 +198,17 @@ MESA_FORWARD_VOID(glFrustum, (GLdouble l, GLdouble r, GLdouble b, GLdouble t, GL
 MESA_FORWARD_VOID(glGenTextures, (GLsizei n, GLuint *t), (n,t))
 MESA_FORWARD_VOID(glGetBooleanv, (GLenum pname, GLboolean *p), (pname,p))
 MESA_FORWARD_VOID(glGetDoublev, (GLenum pname, GLdouble *p), (pname,p))
-MESA_FORWARD_RET(GLenum, glGetError, (void), ())
+typedef GLenum (APIENTRY *PFN_glGetError)(void);
+GLenum APIENTRY direct_glGetError(void);
+GLenum APIENTRY glGetError(void)
+{
+    static PFN_glGetError mesaGetError = NULL;
+    if (!g_mesaProxy.initialized)
+        return direct_glGetError();
+    if (!mesaGetError)
+        mesaGetError = (PFN_glGetError)mesaProxyGetProcAddress("glGetError");
+    return mesaGetError ? mesaGetError() : 0;
+}
 MESA_FORWARD_VOID(glGetFloatv, (GLenum pname, GLfloat *p), (pname,p))
 MESA_FORWARD_VOID(glGetIntegerv, (GLenum pname, GLint *p), (pname,p))
 MESA_FORWARD_VOID(glGetClipPlane, (GLenum p, GLdouble *eq), (p,eq))
@@ -192,17 +225,31 @@ MESA_FORWARD_VOID(glGetPixelMapusv, (GLenum m, GLushort *v), (m,v))
 MESA_FORWARD_VOID(glGetPointerv, (GLenum p, GLvoid **v), (p,v))
 MESA_FORWARD_VOID(glGetPolygonStipple, (GLubyte *m), (m))
 
-/* glGetString - MUST use GLDirect's implementation for valid GL strings */
+/* glGetString reports the renderer that actually owns the current context. */
 const GLubyte * APIENTRY glGetString(GLenum name) {
-    extern const GLubyte* _gldGetStringGeneric(void *ctx, GLenum name);
-    return _gldGetStringGeneric(NULL, name);
+    typedef const GLubyte *(APIENTRY *PFN_glGetString)(GLenum);
+    static PFN_glGetString mesaGetString = NULL;
+    extern const GLubyte *APIENTRY direct_glGetString(GLenum name);
+
+    if (!g_mesaProxy.initialized)
+        return direct_glGetString(name);
+    if (!mesaGetString)
+        mesaGetString = (PFN_glGetString)mesaProxyGetProcAddress("glGetString");
+    return mesaGetString ? mesaGetString(name) : NULL;
 }
 
-/* glGetStringi - MUST use GLDirect's implementation */
+/* glGetStringi is not a Win32 OpenGL 1.1 export, but keeping the symbol here
+ * makes direct calls and diagnostic tooling behave consistently. */
 const GLubyte * APIENTRY glGetStringi(GLenum name, GLuint index) {
-    extern const GLubyte* _gldGetStringGeneric(void *ctx, GLenum name);
-    (void)index; /* index is for extension strings, we return single extensions string */
-    return _gldGetStringGeneric(NULL, name);
+    typedef const GLubyte *(APIENTRY *PFN_glGetStringi)(GLenum, GLuint);
+    static PFN_glGetStringi mesaGetStringi = NULL;
+    extern const GLubyte *_gldGetStringiGeneric(GLenum name, GLuint index);
+
+    if (!g_mesaProxy.initialized)
+        return _gldGetStringiGeneric(name, index);
+    if (!mesaGetStringi)
+        mesaGetStringi = (PFN_glGetStringi)mesaProxyGetProcAddress("glGetStringi");
+    return mesaGetStringi ? mesaGetStringi(name, index) : NULL;
 }
 
 MESA_FORWARD_VOID(glGetTexEnvfv, (GLenum t, GLenum p, GLfloat *v), (t,p,v))
@@ -588,4 +635,3 @@ MESA_FORWARD_VOID(glMultiTexCoord4iARB, (GLenum target, GLint s, GLint t, GLint 
 MESA_FORWARD_VOID(glMultiTexCoord4ivARB, (GLenum target, const GLint *v), (target,v))
 MESA_FORWARD_VOID(glMultiTexCoord4sARB, (GLenum target, GLshort s, GLshort t, GLshort r, GLshort q), (target,s,t,r,q))
 MESA_FORWARD_VOID(glMultiTexCoord4svARB, (GLenum target, const GLshort *v), (target,v))
-

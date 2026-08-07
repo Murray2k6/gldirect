@@ -113,6 +113,57 @@ int gldDescribePixelFormat46(HDC hDC, int format, UINT size,
  */
 int gldGetPixelFormatCount46(void);
 
+/*
+ * WGL_ARB_pixel_format / WGL_EXT_pixel_format implementation.
+ *
+ * These operate on the same 1-based format indices as
+ * gldChoosePixelFormat46() and gldDescribePixelFormat46(), so a format
+ * chosen through the ARB path can be handed straight to SetPixelFormat().
+ */
+
+/*
+ * Attribute-driven pixel format selection.
+ *
+ * piAttribIList is a zero-terminated list of attribute/value pairs;
+ * pfAttribFList is the (optional) float pair list.  Matching follows the
+ * ARB rules — exact match for boolean/enum attributes, "at least" for
+ * sizes — with the matches returned best-first.
+ *
+ * Attributes this backend cannot honour (multisampling, stereo, pbuffer
+ * and bitmap targets, accumulation and aux buffers, single-buffered and
+ * colour-index formats) are relaxed rather than failing the call, so an
+ * application that treats an empty result as fatal still gets a usable
+ * format.  Attribute *queries* always report what the format really
+ * provides.
+ *
+ * Returns:
+ *   TRUE with *nNumFormats set to the number of indices written into
+ *   piFormats, FALSE only on invalid arguments.
+ */
+BOOL gldChoosePixelFormatARB46(HDC hDC, const int *piAttribIList,
+                               const FLOAT *pfAttribFList, UINT nMaxFormats,
+                               int *piFormats, UINT *nNumFormats);
+
+/*
+ * Query WGL_* attributes of a pixel format as integers.
+ *
+ * iPixelFormat is 1-based; it is ignored for
+ * WGL_NUMBER_PIXEL_FORMATS_ARB.  Only the main plane
+ * (iLayerPlane == 0) is supported.
+ *
+ * Returns TRUE on success, FALSE on invalid arguments.
+ */
+BOOL gldGetPixelFormatAttribivARB46(HDC hDC, int iPixelFormat, int iLayerPlane,
+                                    UINT nAttributes, const int *piAttributes,
+                                    int *piValues);
+
+/*
+ * Float form of gldGetPixelFormatAttribivARB46().
+ */
+BOOL gldGetPixelFormatAttribfvARB46(HDC hDC, int iPixelFormat, int iLayerPlane,
+                                    UINT nAttributes, const int *piAttributes,
+                                    FLOAT *pfValues);
+
 #ifdef  __cplusplus
 }
 #endif

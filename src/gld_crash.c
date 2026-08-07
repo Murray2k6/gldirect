@@ -24,6 +24,11 @@
 
 static PVOID  g_hVeh = NULL;
 
+/* The unhandled-exception filter this DLL displaced at install time.  It has
+ * to go back on the way out: leaving ours in place after the module is gone
+ * points the process at freed memory. */
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = NULL;
+
 /*
  * Faults already reported, keyed by address.
  *
@@ -572,11 +577,22 @@ void gldCrashHandlerInstall(void)
         return;
     /* First in the chain, so an engine handler installed later cannot preempt it. */
     g_hVeh = AddVectoredExceptionHandler(1, _gldVectoredHandler);
-    SetUnhandledExceptionFilter(_gldUnhandledFilter);
+    g_prevFilter = SetUnhandledExceptionFilter(_gldUnhandledFilter);
 }
 
 void gldCrashHandlerRemove(void)
 {
+    /*
+     * Both registrations point at code inside this module.  Once it is
+     * unloaded, a vectored handler left behind is called by ntdll on the very
+     * next exception raised anywhere in the process - and jumps into freed
+     * memory.  That is the access violation seen in Wolfenstein: execution at
+     * an uncommitted address in the DLL range, reached through ntdll's
+     * exception dispatch, on a nearly empty stack.
+     */
+    SetUnhandledExceptionFilter(g_prevFilter);
+    g_prevFilter = NULL;
+
     if (g_hVeh) {
         RemoveVectoredExceptionHandler(g_hVeh);
         g_hVeh = NULL;

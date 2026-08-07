@@ -879,6 +879,16 @@ int WINAPI DllMain(
 
 	case DLL_PROCESS_DETACH:
 		/*
+		 * Before anything else, and on both detach paths.  The vectored
+		 * exception handler and the unhandled-exception filter both point
+		 * into this module; gldCrashHandlerRemove() existed to take them
+		 * down and was never called from anywhere. An unload therefore left
+		 * ntdll holding a handler address inside a module that is no longer
+		 * mapped, and the next exception in the process jumped into it.
+		 */
+		gldCrashHandlerRemove();
+
+		/*
 		 * pvReserved is non-NULL when the process is exiting, and NULL when
 		 * the DLL is being unloaded by FreeLibrary while the process runs on.
 		 *

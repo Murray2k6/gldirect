@@ -662,11 +662,20 @@ int APIENTRY _GLD_WGL_EXPORT(ChoosePixelFormat)(
 				bestIndex = i;
 				continue;
 			}
-		} else if ((ppfd->cDepthBits > ppfdBest.cDepthBits &&
+		} else if (((ppfd->cDepthBits > ppfdBest.cDepthBits &&
 			ppfdCandidate.cDepthBits > ppfdBest.cDepthBits) ||
 			(ppfd->cDepthBits <= ppfdCandidate.cDepthBits &&
 			ppfdCandidate.cDepthBits < ppfdBest.cDepthBits))
+			&& ppfdCandidate.cStencilBits >= ppfdBest.cStencilBits)
 		{
+			/* The stencil condition is the important half.  The rule above
+			 * walks toward the smallest depth buffer that still satisfies
+			 * the request, and Wolfenstein asks for 16-bit depth: it walked
+			 * from a 24-bit depth with 8-bit stencil down to a 16-bit depth
+			 * with none, and the device was built from that.  Trading the
+			 * stencil away for a smaller depth buffer is never what the
+			 * caller meant, and id Tech shadow volumes cannot run without
+			 * one. */
 			ppfdBest = ppfdCandidate;
 			bestIndex = i;
 			continue;

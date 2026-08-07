@@ -6610,6 +6610,170 @@ void _glsProgramLocalParameter4fvARB(unsigned int target, unsigned int index, co
     _glsSetARBParam(target, index, params, FALSE);
 }
 
+/*
+ * ARB_vertex_program / ARB_fragment_program queries.
+ *
+ * The extension string advertises both, and id Tech 4 reads back the
+ * parameters it sets and inspects the program object after supplying its
+ * string.  Only the setters existed, so every one of these reported UNMAPPED
+ * while the extension claimed to be present.
+ */
+
+/* Resolve the program object bound to an ARB program target. */
+static GLS_Shader *_glsARBBoundProgram(unsigned int target)
+{
+    GLS_State *s = glsGetState();
+    GLuint_t *binding = _glsARBBindingFor(s, target);
+
+    if (!binding) {
+        s->lastError = GL_INVALID_ENUM;
+        return NULL;
+    }
+    return glsFindShader(*binding);
+}
+
+/* Shared body for the env/local parameter getters. */
+static void _glsGetARBParam(unsigned int target, unsigned int index,
+                            float *out, BOOL isEnv)
+{
+    GLS_State  *s  = glsGetState();
+    GLS_Shader *sh;
+    const float *slot;
+
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+
+    sh = _glsARBBoundProgram(target);
+    if (index >= GLS_MAX_PROGRAM_PARAMS) {
+        s->lastError = GL_INVALID_VALUE;
+        return;
+    }
+    /* A parameter never set, or set before the program string arrived, reads
+     * back as zero, which is the ARB default. */
+    if (!sh || !sh->arb)
+        return;
+
+    slot = isEnv ? sh->arb->envParams[index] : sh->arb->localParams[index];
+    out[0] = slot[0]; out[1] = slot[1]; out[2] = slot[2]; out[3] = slot[3];
+}
+
+void _glsGetProgramEnvParameterfvARB(unsigned int target, unsigned int index, float *params)
+{
+    if (params) _glsGetARBParam(target, index, params, TRUE);
+}
+
+void _glsGetProgramLocalParameterfvARB(unsigned int target, unsigned int index, float *params)
+{
+    if (params) _glsGetARBParam(target, index, params, FALSE);
+}
+
+void _glsGetProgramEnvParameterdvARB(unsigned int target, unsigned int index, double *params)
+{
+    float v[4];
+    if (!params) return;
+    _glsGetARBParam(target, index, v, TRUE);
+    params[0] = v[0]; params[1] = v[1]; params[2] = v[2]; params[3] = v[3];
+}
+
+void _glsGetProgramLocalParameterdvARB(unsigned int target, unsigned int index, double *params)
+{
+    float v[4];
+    if (!params) return;
+    _glsGetARBParam(target, index, v, FALSE);
+    params[0] = v[0]; params[1] = v[1]; params[2] = v[2]; params[3] = v[3];
+}
+
+void _glsProgramEnvParameter4dvARB(unsigned int target, unsigned int index, const double *params)
+{
+    float v[4];
+    if (!params) return;
+    v[0] = (float)params[0]; v[1] = (float)params[1];
+    v[2] = (float)params[2]; v[3] = (float)params[3];
+    _glsProgramEnvParameter4fvARB(target, index, v);
+}
+
+void _glsProgramLocalParameter4dvARB(unsigned int target, unsigned int index, const double *params)
+{
+    float v[4];
+    if (!params) return;
+    v[0] = (float)params[0]; v[1] = (float)params[1];
+    v[2] = (float)params[2]; v[3] = (float)params[3];
+    _glsProgramLocalParameter4fvARB(target, index, v);
+}
+
+void _glsGetProgramivARB(unsigned int target, unsigned int pname, int *params)
+{
+    GLS_State  *s  = glsGetState();
+    GLS_Shader *sh;
+    GLuint_t   *binding;
+
+    if (!params) return;
+    *params = 0;
+
+    binding = _glsARBBindingFor(s, target);
+    if (!binding) {
+        s->lastError = GL_INVALID_ENUM;
+        return;
+    }
+    sh = glsFindShader(*binding);
+
+    switch (pname) {
+    case 0x8677: /* GL_PROGRAM_BINDING_ARB */
+        *params = (int)*binding;
+        break;
+    case 0x8627: /* GL_PROGRAM_LENGTH_ARB */
+        *params = (sh && sh->source) ? (int)strlen(sh->source) : 0;
+        break;
+    case 0x8876: /* GL_PROGRAM_FORMAT_ARB */
+        *params = 0x8875;                   /* GL_PROGRAM_FORMAT_ASCII_ARB */
+        break;
+    case 0x864B: /* GL_PROGRAM_ERROR_POSITION_ARB */
+        /* -1 is "the last program string parsed cleanly".  A string that
+         * failed to translate leaves no program object behind, and the
+         * error was already reported at glProgramStringARB time. */
+        *params = -1;
+        break;
+    case 0x88B4: /* GL_MAX_PROGRAM_LOCAL_PARAMETERS_ARB */
+    case 0x88B5: /* GL_MAX_PROGRAM_ENV_PARAMETERS_ARB */
+        *params = GLS_MAX_PROGRAM_PARAMS;
+        break;
+    case 0x88B6: /* GL_PROGRAM_UNDER_NATIVE_LIMITS_ARB */
+        *params = 1;
+        break;
+    default:
+        /* The remaining pnames are per-program resource counts.  What runs
+         * is the translated D3D9 shader, so an ARB instruction or register
+         * count would be invented; zero is a defined value for all of them
+         * and pairs with the under-native-limits answer above. */
+        *params = 0;
+        break;
+    }
+}
+
+void _glsGetProgramStringARB(unsigned int target, unsigned int pname, void *string)
+{
+    GLS_Shader *sh;
+
+    if (!string) return;
+    if (pname != 0x8628) {                  /* GL_PROGRAM_STRING_ARB */
+        glsGetState()->lastError = GL_INVALID_ENUM;
+        return;
+    }
+    sh = _glsARBBoundProgram(target);
+    /* The caller sized its buffer from GL_PROGRAM_LENGTH_ARB, so write
+     * exactly that many bytes and no terminator, as the spec requires. */
+    if (sh && sh->source)
+        memcpy(string, sh->source, strlen(sh->source));
+}
+
+unsigned char _glsIsProgramARB(unsigned int program)
+{
+    GLS_Shader *sh;
+
+    if (program == 0) return 0;
+    sh = glsFindShader(program);
+    return (GLboolean)((sh && sh->allocated && sh->arb) ? 1 : 0);
+}
+
 /* ===================================================================
  *  SECTION 12: ARB Shader Object (handles both shaders and programs)
  * =================================================================== */
@@ -6633,6 +6797,50 @@ void _glsDeleteObjectARB(unsigned int obj)
         _glsReleaseProgramShaders(prog);
         prog->allocated = FALSE;
     }
+}
+
+/*
+ * ARB_shader_objects queries.  GL_ARB_shader_objects is advertised, and
+ * Quake 4 and other id Tech titles use the ARB object entry points rather
+ * than the core GL 2.0 spellings.
+ */
+
+unsigned int _glsGetHandleARB(unsigned int pname)
+{
+    /* GL_PROGRAM_OBJECT_ARB is the only defined query: the program object
+     * currently in use. */
+    if (pname != 0x8B40)
+        { glsGetState()->lastError = GL_INVALID_ENUM; return 0; }
+
+    return (unsigned int)glsGetState()->boundProgram;
+}
+
+void _glsGetObjectParameterfvARB(unsigned int obj, unsigned int pname, float *params)
+{
+    int v = 0;
+
+    if (!params) return;
+    /* Every ARB object parameter is integer-valued; the float entry point
+     * exists only because the extension predates the split. */
+    _glsGetObjectParameterivARB(obj, pname, &v);
+    *params = (float)v;
+}
+
+void _glsGetAttachedObjectsARB(unsigned int containerObj, int maxCount,
+                               int *count, unsigned int *obj)
+{
+    /* ARB handles and GL 2.0 names share one namespace in this backend, so
+     * this reports the same attachments glGetAttachedShaders does. */
+    GLS_Program *prog = glsFindProgram((GLuint_t)containerObj);
+    int n = 0;
+
+    if (prog && obj) {
+        if (prog->vertShader && n < maxCount)
+            obj[n++] = (unsigned int)prog->vertShader;
+        if (prog->fragShader && n < maxCount)
+            obj[n++] = (unsigned int)prog->fragShader;
+    }
+    if (count) *count = n;
 }
 
 void _glsGetObjectParameterivARB(unsigned int obj, unsigned int pname, int *params)

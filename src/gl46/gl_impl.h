@@ -379,6 +379,18 @@ void _glsProgramLocalParameter4fvARB(unsigned int target, unsigned int index, co
 /* ===== ARB shader object (handles both shaders and programs) ===== */
 void _glsDeleteObjectARB(unsigned int obj);
 void _glsGetObjectParameterivARB(unsigned int obj, unsigned int pname, int *params);
+void _glsGetObjectParameterfvARB(unsigned int obj, unsigned int pname, float *params);
+unsigned int _glsGetHandleARB(unsigned int pname);
+void _glsGetAttachedObjectsARB(unsigned int containerObj, int maxCount, int *count, unsigned int *obj);
+void _glsGetProgramEnvParameterfvARB(unsigned int target, unsigned int index, float *params);
+void _glsGetProgramEnvParameterdvARB(unsigned int target, unsigned int index, double *params);
+void _glsGetProgramLocalParameterfvARB(unsigned int target, unsigned int index, float *params);
+void _glsGetProgramLocalParameterdvARB(unsigned int target, unsigned int index, double *params);
+void _glsProgramEnvParameter4dvARB(unsigned int target, unsigned int index, const double *params);
+void _glsProgramLocalParameter4dvARB(unsigned int target, unsigned int index, const double *params);
+void _glsGetProgramivARB(unsigned int target, unsigned int pname, int *params);
+void _glsGetProgramStringARB(unsigned int target, unsigned int pname, void *string);
+unsigned char _glsIsProgramARB(unsigned int program);
 void _glsGetInfoLogARB(unsigned int obj, int maxLength, int *length, char *infoLog);
 
 /* ===== Multitexture =====

@@ -315,6 +315,18 @@ static void    APIENTRY _stub_glBindProgramARB(GLenum target, GLuint program) { 
 static void    APIENTRY _stub_glProgramStringARB(GLenum target, GLenum format, GLsizei len, const void *string) { _glsProgramStringARB(target, format, len, string); }
 static void    APIENTRY _stub_glProgramEnvParameter4fvARB(GLenum target, GLuint index, const GLfloat *params) { _glsProgramEnvParameter4fvARB(target, index, params); }
 static void    APIENTRY _stub_glProgramLocalParameter4fvARB(GLenum target, GLuint index, const GLfloat *params) { _glsProgramLocalParameter4fvARB(target, index, params); }
+static void    APIENTRY _stub_glGetProgramEnvParameterfvARB(GLenum target, GLuint index, GLfloat *params) { _glsGetProgramEnvParameterfvARB(target, index, params); }
+static void    APIENTRY _stub_glGetProgramEnvParameterdvARB(GLenum target, GLuint index, GLdouble *params) { _glsGetProgramEnvParameterdvARB(target, index, params); }
+static void    APIENTRY _stub_glGetProgramLocalParameterfvARB(GLenum target, GLuint index, GLfloat *params) { _glsGetProgramLocalParameterfvARB(target, index, params); }
+static void    APIENTRY _stub_glGetProgramLocalParameterdvARB(GLenum target, GLuint index, GLdouble *params) { _glsGetProgramLocalParameterdvARB(target, index, params); }
+static void    APIENTRY _stub_glProgramEnvParameter4dvARB(GLenum target, GLuint index, const GLdouble *params) { _glsProgramEnvParameter4dvARB(target, index, params); }
+static void    APIENTRY _stub_glProgramLocalParameter4dvARB(GLenum target, GLuint index, const GLdouble *params) { _glsProgramLocalParameter4dvARB(target, index, params); }
+static void    APIENTRY _stub_glGetProgramivARB(GLenum target, GLenum pname, GLint *params) { _glsGetProgramivARB(target, pname, params); }
+static void    APIENTRY _stub_glGetProgramStringARB(GLenum target, GLenum pname, void *string) { _glsGetProgramStringARB(target, pname, string); }
+static GLboolean APIENTRY _stub_glIsProgramARB(GLuint program) { return (GLboolean)_glsIsProgramARB(program); }
+static GLhandleARB APIENTRY _stub_glGetHandleARB(GLenum pname) { return (GLhandleARB)_glsGetHandleARB(pname); }
+static void    APIENTRY _stub_glGetObjectParameterfvARB(GLhandleARB obj, GLenum pname, GLfloat *params) { _glsGetObjectParameterfvARB((unsigned int)obj, pname, params); }
+static void    APIENTRY _stub_glGetAttachedObjectsARB(GLhandleARB containerObj, GLsizei maxCount, GLsizei *count, GLhandleARB *obj) { _glsGetAttachedObjectsARB((unsigned int)containerObj, maxCount, count, (unsigned int *)obj); }
 /*
  * Entry points that MUST be listed in the proc table below.
  *
@@ -650,6 +662,18 @@ static const GLD_modernProcEntry g_modernGL[] = {
     { "glProgramStringARB",         (PROC)_stub_glProgramStringARB },
     { "glProgramEnvParameter4fvARB",(PROC)_stub_glProgramEnvParameter4fvARB },
     { "glProgramLocalParameter4fvARB",(PROC)_stub_glProgramLocalParameter4fvARB },
+    { "glProgramEnvParameter4dvARB",(PROC)_stub_glProgramEnvParameter4dvARB },
+    { "glProgramLocalParameter4dvARB",(PROC)_stub_glProgramLocalParameter4dvARB },
+    { "glGetProgramEnvParameterfvARB",(PROC)_stub_glGetProgramEnvParameterfvARB },
+    { "glGetProgramEnvParameterdvARB",(PROC)_stub_glGetProgramEnvParameterdvARB },
+    { "glGetProgramLocalParameterfvARB",(PROC)_stub_glGetProgramLocalParameterfvARB },
+    { "glGetProgramLocalParameterdvARB",(PROC)_stub_glGetProgramLocalParameterdvARB },
+    { "glGetProgramivARB",          (PROC)_stub_glGetProgramivARB },
+    { "glGetProgramStringARB",      (PROC)_stub_glGetProgramStringARB },
+    { "glIsProgramARB",             (PROC)_stub_glIsProgramARB },
+    { "glGetHandleARB",             (PROC)_stub_glGetHandleARB },
+    { "glGetObjectParameterfvARB",  (PROC)_stub_glGetObjectParameterfvARB },
+    { "glGetAttachedObjectsARB",    (PROC)_stub_glGetAttachedObjectsARB },
     /* ARB buffer object aliases */
     { "glBindBufferARB",            (PROC)_stub_glBindBuffer },
     { "glDeleteBuffersARB",         (PROC)_stub_glDeleteBuffers },

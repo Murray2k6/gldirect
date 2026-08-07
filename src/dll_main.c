@@ -751,6 +751,95 @@ __except(EXCEPTION_EXECUTE_HANDLER) {
 
 // ***********************************************************************
 
+/*
+ * Which opengl32.dll is this, and is anything else answering to that name?
+ *
+ * A Wolfenstein fault report named nvoglv64.dll — NVIDIA's real OpenGL ICD —
+ * as the image nearest the fault.  That ICD is loaded by the system
+ * opengl32.dll, so both it and this wrapper were in the process under the
+ * same module name.  Anything resolving "opengl32.dll" by name can then get
+ * the wrong one, and GL entry points from the real driver called against a
+ * context this backend owns do not survive contact.
+ *
+ * This runs at load and writes what it finds to the diagnostic log, so the
+ * situation is visible in the first few lines of any report rather than
+ * inferred from a fault address forty pages later.  The wrapper's own
+ * lookups bind to this image by address and are unaffected either way.
+ */
+static void _gldLogModuleProvenance(HINSTANCE hSelf)
+{
+    char selfPath[MAX_PATH];
+    char exePath[MAX_PATH];
+    char selfDir[MAX_PATH];
+    char exeDir[MAX_PATH];
+    char *slash;
+    HMODULE byName;
+
+    selfPath[0] = exePath[0] = '\0';
+    if (!GetModuleFileNameA((HMODULE)hSelf, selfPath, MAX_PATH))
+        selfPath[0] = '\0';
+    if (!GetModuleFileNameA(NULL, exePath, MAX_PATH))
+        exePath[0] = '\0';
+
+    gldDiagLog("opengl32: this wrapper is %s",
+               selfPath[0] ? selfPath : "(path unavailable)");
+    gldDiagLog("opengl32: host executable is %s",
+               exePath[0] ? exePath : "(path unavailable)");
+
+    /* Is the wrapper actually beside the game, which is where a drop-in
+     * opengl32.dll has to be to take precedence? */
+    if (selfPath[0] && exePath[0]) {
+        lstrcpynA(selfDir, selfPath, MAX_PATH);
+        lstrcpynA(exeDir,  exePath,  MAX_PATH);
+        slash = strrchr(selfDir, '\\'); if (slash) *slash = '\0';
+        slash = strrchr(exeDir,  '\\'); if (slash) *slash = '\0';
+
+        if (lstrcmpiA(selfDir, exeDir) != 0)
+            gldDiagLog("opengl32: NOTE - the wrapper is not in the game "
+                       "directory (%s vs %s)", selfDir, exeDir);
+    }
+
+    /*
+     * The decisive check.  GetModuleHandle resolves by base name, so if it
+     * hands back something other than this image, a second opengl32.dll is
+     * loaded and owns the name.
+     */
+    byName = GetModuleHandleA("opengl32.dll");
+    if (byName && byName != (HMODULE)hSelf) {
+        char otherPath[MAX_PATH];
+
+        otherPath[0] = '\0';
+        if (!GetModuleFileNameA(byName, otherPath, MAX_PATH))
+            otherPath[0] = '\0';
+
+        gldDiagLog("opengl32: WARNING - the name \"opengl32.dll\" resolves to "
+                   "%s, not to this wrapper. A second OpenGL implementation is "
+                   "loaded in this process; anything resolving GL entry points "
+                   "by module name would get that one.",
+                   otherPath[0] ? otherPath : "(path unavailable)");
+    } else if (byName) {
+        gldDiagLog("opengl32: the name \"opengl32.dll\" resolves to this "
+                   "wrapper, as it must");
+    }
+
+    /* The real ICD is the thing the system opengl32.dll pulls in, and its
+     * presence is the signal that a second implementation is live. */
+    {
+        static const char *icds[] = {
+            "nvoglv64.dll", "nvoglv32.dll",      /* NVIDIA  */
+            "atioglxx.dll", "atio6axx.dll",      /* AMD     */
+            "ig9icd64.dll", "ig9icd32.dll"       /* Intel   */
+        };
+        int i;
+        for (i = 0; i < (int)(sizeof(icds) / sizeof(icds[0])); i++) {
+            if (GetModuleHandleA(icds[i]))
+                gldDiagLog("opengl32: NOTE - vendor OpenGL driver %s is loaded "
+                           "in this process", icds[i]);
+        }
+    }
+}
+
+
 int WINAPI DllMain(
 	HINSTANCE hInstance,
 	DWORD fdwReason,
@@ -762,6 +851,11 @@ int WINAPI DllMain(
         hInstanceDll = hInstance;
 
         gldDiagLog("DllMain: DLL_PROCESS_ATTACH");
+
+        // Say up front which opengl32.dll this is and whether a second
+        // one answers to the same name; a fault forty pages later reads
+        // very differently once that is known.
+        _gldLogModuleProvenance(hInstance);
 
 		// Record faults before the engine's own handler can swallow them.
 		// Cheap, passive, and the only way a crash inside an id Tech title

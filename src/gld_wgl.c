@@ -1080,7 +1080,14 @@ PROC APIENTRY _GLD_WGL_EXPORT(GetProcAddress)(
 			if (strcmp(a, "glGetString") == 0 || strcmp(a, "glGetStringi") == 0 || strcmp(a, "glGetError") == 0) {
 				/* Get from our own DLL exports instead */
 				static HMODULE hSelf = NULL;
-				if (!hSelf) hSelf = GetModuleHandleA("opengl32.dll");
+				/* By address, not by name: the system opengl32.dll can be
+				 * loaded alongside this one — see the note in
+				 * gldGetProcAddress_GL46 — and resolving by name could hand
+				 * back the real driver's GL entry points. */
+				if (!hSelf)
+					GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+					                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					                   (LPCSTR)&gldGetPixelFormat, &hSelf);
 				if (hSelf) {
 					PROC p = GetProcAddress(hSelf, a);
 					if (p) {

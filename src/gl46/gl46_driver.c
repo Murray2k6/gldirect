@@ -662,7 +662,23 @@ PROC gldGetProcAddress_GL46(
 	{
 		static HMODULE hSelf = NULL;
 		if (!hSelf)
-			hSelf = GetModuleHandle("opengl32.dll");
+			/*
+			 * Resolve this DLL by an address inside it, never by name.
+			 *
+			 * A Wolfenstein fault report showed nvoglv64.dll — NVIDIA's real OpenGL ICD —
+			 * loaded in the process, which means the system opengl32.dll is loaded
+			 * alongside this one. GetModuleHandle("opengl32.dll") then returns whichever
+			 * module holds that name, and if it is the system copy, GetProcAddress on it
+			 * hands back NVIDIA's real GL entry points. Those would be returned to the
+			 * application from wglGetProcAddress and called against a context this
+			 * backend owns, which is not a survivable combination.
+			 *
+			 * GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS on a function that is definitely in
+			 * this image cannot pick the wrong module.
+			 */
+			GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			                   (LPCSTR)&gldGetProcAddress_GL46, &hSelf);
 		if (hSelf) {
 			PROC p = GetProcAddress(hSelf, a);
 			if (p)

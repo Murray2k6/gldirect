@@ -656,6 +656,10 @@ HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor)
                bGotClientRect ? (long)rcClient.right  : 0L,
                bGotClientRect ? (long)rcClient.bottom : 0L,
                d3dpp.BackBufferWidth, d3dpp.BackBufferHeight);
+    gldDiagLog("GL46: device built from PF %d - backbuffer fmt 0x%X, depth fmt 0x%X, multisample %u",
+               gldGetPixelFormat(), (unsigned)d3dpp.BackBufferFormat,
+               (unsigned)d3dpp.AutoDepthStencilFormat,
+               (unsigned)d3dpp.MultiSampleType);
 
     // Vertex processing + multithreaded
     dwBehaviourFlags = (d3dCaps.DevCaps & D3DDEVCAPS_HWTRANSFORMANDLIGHT) ?

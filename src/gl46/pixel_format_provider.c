@@ -35,6 +35,7 @@
 #include "pixel_format_provider.h"
 #include "context_manager.h"
 #include "gld_log.h"
+#include "gld_diag.h"
 #include "gld_globals.h"
 #include <string.h>
 
@@ -365,6 +366,23 @@ int gldBuildPixelFormatList46(void)
         "gldBuildPixelFormatList46: enumerated %d pixel formats "
         "(multisampled formats: %s)",
         s_formatCount, s_haveMultisample ? "yes" : "none");
+
+    /* Also to the diagnostic log: which formats exist depends on what the
+     * game directory's d3d9.dll accepted, so a format index in this log
+     * means nothing without the list it came from. */
+    gldDiagLog("GL46: enumerated %d pixel formats (multisample: %s)",
+               s_formatCount, s_haveMultisample ? "yes" : "none");
+    {
+        int _i;
+        for (_i = 0; _i < s_formatCount; _i++) {
+            const GLD_pf46Entry *_e = &s_formats[_i];
+            gldDiagLog("GL46:   PF %2d: colour %d alpha %d depth %d stencil %d "
+                       "samples %d (D3D colour 0x%X depth 0x%X)",
+                       _i + 1, _e->pfd.cColorBits, _e->pfd.cAlphaBits,
+                       _e->pfd.cDepthBits, _e->pfd.cStencilBits, _e->samples,
+                       (unsigned)_e->colorFormat, (unsigned)_e->depthFormat);
+        }
+    }
 
     return s_formatCount;
 }

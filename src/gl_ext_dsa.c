@@ -47,6 +47,18 @@ static PROC _resolveGL(const char *name)
     PROC p = mesaProxyGetProcAddress(name);
     if (!p && g_mesaProxy.hMesaDLL)
         p = GetProcAddress(g_mesaProxy.hMesaDLL, name);
+
+    /*
+     * The default backend never loads Mesa at all (dwUseMesa=0), so both
+     * lookups above fail and every function in this file used to return
+     * early having done nothing.  Resolving against this DLL's own GL
+     * implementation is what makes them work on the path that is actually
+     * in use.
+     */
+    if (!p) {
+        extern PROC gldGetProcAddress_GL46(LPCSTR);
+        p = gldGetProcAddress_GL46(name);
+    }
     return p;
 }
 
@@ -87,6 +99,14 @@ static PFN_glActiveTexture    _pfnActiveTexture     = NULL;
 static PFN_glBindProgramARB   _pfnBindProgramARB   = NULL;
 static PFN_glGetQueryObjectuiv _pfnGetQueryObjectuiv = NULL;
 
+typedef void (APIENTRY *PFN_glTexStorage1D)(GLenum, GLsizei, GLenum, GLsizei);
+typedef void (APIENTRY *PFN_glTexStorage2D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+typedef void (APIENTRY *PFN_glTexStorage3D)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLsizei);
+
+static PFN_glTexStorage1D _pfnTexStorage1D;
+static PFN_glTexStorage2D _pfnTexStorage2D;
+static PFN_glTexStorage3D _pfnTexStorage3D;
+
 static void _ensureResolved(void)
 {
     if (_pfnBindFramebuffer) return; /* already resolved */
@@ -102,6 +122,9 @@ static void _ensureResolved(void)
     _pfnActiveTexture    = (PFN_glActiveTexture)_resolveGL("glActiveTexture");
     _pfnBindProgramARB   = (PFN_glBindProgramARB)_resolveGL("glBindProgramARB");
     _pfnGetQueryObjectuiv = (PFN_glGetQueryObjectuiv)_resolveGL("glGetQueryObjectuiv");
+    _pfnTexStorage1D     = (PFN_glTexStorage1D)_resolveGL("glTexStorage1D");
+    _pfnTexStorage2D     = (PFN_glTexStorage2D)_resolveGL("glTexStorage2D");
+    _pfnTexStorage3D     = (PFN_glTexStorage3D)_resolveGL("glTexStorage3D");
 
     /* Fallback: if glGetIntegerv not found via extension, try DLL export */
     if (!_pfnGetIntegerv && g_mesaProxy.hMesaDLL)
@@ -342,4 +365,97 @@ void APIENTRY glGetMultiQueryObjectuivAMD(GLuint id, GLuint count, GLenum pname,
         GLuint *dest = (GLuint*)((unsigned char*)params + i * stride);
         _pfnGetQueryObjectuiv(id + i, pname, dest);
     }
+}
+
+/*===========================================================================
+ * EXT_direct_state_access — texture storage and multi-texture binding
+ *
+ * The selector-free spellings of GL 4.2 glTexStorage* and of
+ * glActiveTexture + glBindTexture.  Same save / bind / call / restore
+ * pattern as the framebuffer entry points above.
+ *===========================================================================*/
+
+#define GL_TEXTURE_1D             0x0DE0
+#define GL_TEXTURE_2D             0x0DE1
+#define GL_TEXTURE_3D             0x806F
+#define GL_TEXTURE_CUBE_MAP       0x8513
+#define GL_TEXTURE_BINDING_1D     0x8068
+#define GL_TEXTURE_BINDING_2D     0x8069
+#define GL_TEXTURE_BINDING_3D     0x806A
+#define GL_TEXTURE_BINDING_CUBE_MAP 0x8514
+#define GL_ACTIVE_TEXTURE         0x84E0
+
+/* Which query reports the binding for a texture target. */
+static GLenum _bindingEnumFor(GLenum target)
+{
+    switch (target) {
+    case GL_TEXTURE_1D:       return GL_TEXTURE_BINDING_1D;
+    case GL_TEXTURE_2D:       return GL_TEXTURE_BINDING_2D;
+    case GL_TEXTURE_3D:       return GL_TEXTURE_BINDING_3D;
+    case GL_TEXTURE_CUBE_MAP: return GL_TEXTURE_BINDING_CUBE_MAP;
+    default:                  return 0;
+    }
+}
+
+void APIENTRY glBindMultiTextureEXT(GLenum texunit, GLenum target, GLuint texture)
+{
+    GLint savedUnit = 0;
+
+    _ensureResolved();
+    if (!_pfnActiveTexture || !_pfnBindTexture || !_pfnGetIntegerv) return;
+
+    _pfnGetIntegerv(GL_ACTIVE_TEXTURE, &savedUnit);
+    _pfnActiveTexture(texunit);
+    _pfnBindTexture(target, texture);
+    _pfnActiveTexture((GLenum)savedUnit);
+}
+
+/* Shared body: bind the named texture on its target, run op, put back what
+ * was bound.  Returns FALSE when the target has no queryable binding, which
+ * is the one case the restore could not be honest about. */
+static BOOL _dsaBeginTexture(GLenum target, GLuint texture, GLint *savedTex)
+{
+    GLenum bindingEnum = _bindingEnumFor(target);
+
+    if (!_pfnBindTexture || !_pfnGetIntegerv || bindingEnum == 0)
+        return FALSE;
+
+    *savedTex = 0;
+    _pfnGetIntegerv(bindingEnum, savedTex);
+    _pfnBindTexture(target, texture);
+    return TRUE;
+}
+
+void APIENTRY glTextureStorage1DEXT(GLuint texture, GLenum target, GLsizei levels,
+                                    GLenum internalformat, GLsizei width)
+{
+    GLint saved = 0;
+    _ensureResolved();
+    if (!_pfnTexStorage1D) return;
+    if (!_dsaBeginTexture(target, texture, &saved)) return;
+    _pfnTexStorage1D(target, levels, internalformat, width);
+    _pfnBindTexture(target, (GLuint)saved);
+}
+
+void APIENTRY glTextureStorage2DEXT(GLuint texture, GLenum target, GLsizei levels,
+                                    GLenum internalformat, GLsizei width, GLsizei height)
+{
+    GLint saved = 0;
+    _ensureResolved();
+    if (!_pfnTexStorage2D) return;
+    if (!_dsaBeginTexture(target, texture, &saved)) return;
+    _pfnTexStorage2D(target, levels, internalformat, width, height);
+    _pfnBindTexture(target, (GLuint)saved);
+}
+
+void APIENTRY glTextureStorage3DEXT(GLuint texture, GLenum target, GLsizei levels,
+                                    GLenum internalformat, GLsizei width,
+                                    GLsizei height, GLsizei depth)
+{
+    GLint saved = 0;
+    _ensureResolved();
+    if (!_pfnTexStorage3D) return;
+    if (!_dsaBeginTexture(target, texture, &saved)) return;
+    _pfnTexStorage3D(target, levels, internalformat, width, height, depth);
+    _pfnBindTexture(target, (GLuint)saved);
 }

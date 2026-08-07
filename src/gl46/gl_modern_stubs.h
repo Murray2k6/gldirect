@@ -422,6 +422,30 @@ static void    APIENTRY _stub_glActiveStencilFaceEXT(GLenum face) { _glsActiveSt
 
 typedef struct { const char *name; PROC proc; } GLD_modernProcEntry;
 
+
+/* EXT_direct_state_access and friends, implemented in src/gl_ext_dsa.c.
+ * Declared with an opaque signature purely to take their address here; each
+ * definition carries its real one and callers reach them only through
+ * wglGetProcAddress, which is untyped. Without these entries the whole file
+ * was unreachable — every name in it resolved to NULL. */
+extern void APIENTRY glBindMultiTextureEXT(GLenum texunit, GLenum target, GLuint texture);
+extern void APIENTRY glGetMultiQueryObjectuivAMD(GLuint id, GLuint count, GLenum pname, GLuint stride, GLuint *params);
+extern void APIENTRY glGetNamedProgramLocalParameterIivEXT(GLuint program, GLenum target, GLuint index, GLint *params);
+extern void APIENTRY glGetNamedProgramLocalParameterIuivEXT(GLuint program, GLenum target, GLuint index, GLuint *params);
+extern void APIENTRY glNamedFramebufferTextureEXT(GLuint framebuffer, GLenum attachment, GLuint texture, GLint level);
+extern void APIENTRY glNamedFramebufferTextureFaceEXT(GLuint framebuffer, GLenum attachment, GLuint texture, GLint level, GLenum face);
+extern void APIENTRY glNamedFramebufferTextureLayerEXT(GLuint framebuffer, GLenum attachment, GLuint texture, GLint level, GLint layer);
+extern void APIENTRY glNamedProgramLocalParameterI4iEXT(GLuint program, GLenum target, GLuint index, GLint x, GLint y, GLint z, GLint w);
+extern void APIENTRY glNamedProgramLocalParameterI4ivEXT(GLuint program, GLenum target, GLuint index, const GLint *params);
+extern void APIENTRY glNamedProgramLocalParameterI4uiEXT(GLuint program, GLenum target, GLuint index, GLuint x, GLuint y, GLuint z, GLuint w);
+extern void APIENTRY glNamedProgramLocalParameterI4uivEXT(GLuint program, GLenum target, GLuint index, const GLuint *params);
+extern void APIENTRY glNamedProgramLocalParametersI4ivEXT(GLuint program, GLenum target, GLuint index, GLsizei count, const GLint *params);
+extern void APIENTRY glNamedProgramLocalParametersI4uivEXT(GLuint program, GLenum target, GLuint index, GLsizei count, const GLuint *params);
+extern void APIENTRY glNamedRenderbufferStorageMultisampleCoverageEXT(GLuint renderbuffer, GLsizei coverageSamples, GLsizei colorSamples, GLenum internalformat, GLsizei width, GLsizei height);
+extern void APIENTRY glTextureStorage1DEXT(GLuint texture, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width);
+extern void APIENTRY glTextureStorage2DEXT(GLuint texture, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height);
+extern void APIENTRY glTextureStorage3DEXT(GLuint texture, GLenum target, GLsizei levels, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth);
+
 static const GLD_modernProcEntry g_modernGL[] = {
     /* GL 2.0 Shaders */
     { "glCreateShader",             (PROC)_stub_glCreateShader },
@@ -674,6 +698,23 @@ static const GLD_modernProcEntry g_modernGL[] = {
     { "glGetHandleARB",             (PROC)_stub_glGetHandleARB },
     { "glGetObjectParameterfvARB",  (PROC)_stub_glGetObjectParameterfvARB },
     { "glGetAttachedObjectsARB",    (PROC)_stub_glGetAttachedObjectsARB },
+    { "glBindMultiTextureEXT", (PROC)glBindMultiTextureEXT },
+    { "glGetMultiQueryObjectuivAMD", (PROC)glGetMultiQueryObjectuivAMD },
+    { "glGetNamedProgramLocalParameterIivEXT", (PROC)glGetNamedProgramLocalParameterIivEXT },
+    { "glGetNamedProgramLocalParameterIuivEXT", (PROC)glGetNamedProgramLocalParameterIuivEXT },
+    { "glNamedFramebufferTextureEXT", (PROC)glNamedFramebufferTextureEXT },
+    { "glNamedFramebufferTextureFaceEXT", (PROC)glNamedFramebufferTextureFaceEXT },
+    { "glNamedFramebufferTextureLayerEXT", (PROC)glNamedFramebufferTextureLayerEXT },
+    { "glNamedProgramLocalParameterI4iEXT", (PROC)glNamedProgramLocalParameterI4iEXT },
+    { "glNamedProgramLocalParameterI4ivEXT", (PROC)glNamedProgramLocalParameterI4ivEXT },
+    { "glNamedProgramLocalParameterI4uiEXT", (PROC)glNamedProgramLocalParameterI4uiEXT },
+    { "glNamedProgramLocalParameterI4uivEXT", (PROC)glNamedProgramLocalParameterI4uivEXT },
+    { "glNamedProgramLocalParametersI4ivEXT", (PROC)glNamedProgramLocalParametersI4ivEXT },
+    { "glNamedProgramLocalParametersI4uivEXT", (PROC)glNamedProgramLocalParametersI4uivEXT },
+    { "glNamedRenderbufferStorageMultisampleCoverageEXT", (PROC)glNamedRenderbufferStorageMultisampleCoverageEXT },
+    { "glTextureStorage1DEXT", (PROC)glTextureStorage1DEXT },
+    { "glTextureStorage2DEXT", (PROC)glTextureStorage2DEXT },
+    { "glTextureStorage3DEXT", (PROC)glTextureStorage3DEXT },
     /* ARB buffer object aliases */
     { "glBindBufferARB",            (PROC)_stub_glBindBuffer },
     { "glDeleteBuffersARB",         (PROC)_stub_glDeleteBuffers },

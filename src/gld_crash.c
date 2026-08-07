@@ -294,6 +294,119 @@ static void _gldAppend(char *buf, int cap, int *len, const char *text)
  * that reached the unhandled filter - one that actually ended the process -
  * from a first-chance exception something downstream went on to handle.
  */
+/*
+ * Recover the caller when execution has jumped into unmapped memory.
+ *
+ * RtlCaptureStackBackTrace is worthless for that fault: the jump destroys the
+ * frame chain, so the trace is the three ntdll dispatch frames and the bad
+ * address itself, naming nobody.  But a call through a function pointer
+ * pushes its return address first, so the instruction after the call is
+ * still sitting at [rsp] — and the rest of the caller's frame is a little
+ * further up.  Scanning the top of the stack for values that land inside a
+ * loaded module recovers who made the call.
+ */
+static void _gldReportCallSite(EXCEPTION_POINTERS *pEP, char *buf, int cap, int *len)
+{
+    CONTEXT *ctx = pEP->ContextRecord;
+    const ULONG_PTR *sp;
+    char  line[600];
+    char  desc[MAX_PATH + 128];
+    int   found = 0;
+    int   i;
+
+    if (!ctx) return;
+
+#if defined(_M_X64)
+    sp = (const ULONG_PTR *)ctx->Rsp;
+#else
+    sp = (const ULONG_PTR *)(ULONG_PTR)ctx->Esp;
+#endif
+    if (!sp) return;
+
+    _gldAppend(buf, cap, len,
+        "\r\n***   the frame chain is gone, so the stack was scanned for the "
+        "return address the call pushed:");
+
+    /* 32 slots is well past any plausible argument spill area and still a
+     * fixed, bounded read. */
+    for (i = 0; i < 32; i++) {
+        MEMORY_BASIC_INFORMATION mbi;
+        ULONG_PTR value;
+
+        /* The stack itself is the one thing that may already be damaged, so
+         * every slot is probed before it is read. */
+        if (VirtualQuery(&sp[i], &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT)
+            break;
+
+        value = sp[i];
+        if (value < 0x10000)
+            continue;
+
+        ZeroMemory(&mbi, sizeof(mbi));
+        if (VirtualQuery((const void *)value, &mbi, sizeof(mbi)) != sizeof(mbi))
+            continue;
+        if (mbi.State != MEM_COMMIT || mbi.Type != MEM_IMAGE)
+            continue;
+        /* Only executable pages can be a return address. */
+        if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+            continue;
+
+        _gldDescribeAddress((const void *)value, desc);
+        wsprintfA(line, "\r\n***   [rsp+0x%02X] %s", (unsigned)(i * sizeof(ULONG_PTR)), desc);
+        _gldAppend(buf, cap, len, line);
+
+        if (++found >= 8)
+            break;
+    }
+
+    if (!found)
+        _gldAppend(buf, cap, len,
+            "\r\n***   no return address found on the stack - the call may have "
+            "been a jump, or the stack is damaged");
+}
+
+/*
+ * An address that belongs to no module may still be where a module used to
+ * be: a cached function pointer into a DLL that has since been unloaded
+ * lands exactly here, and reads as free memory afterwards.  Walking down
+ * from the fault reports the nearest image below it, which is what makes
+ * that case recognisable.
+ */
+static void _gldReportNearestImage(const void *addr, char *buf, int cap, int *len)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    char  line[600];
+    char  modPath[MAX_PATH];
+    const char *leaf;
+    ULONG_PTR probe = ((ULONG_PTR)addr) & ~(ULONG_PTR)0xFFFF;
+    int   steps;
+
+    for (steps = 0; steps < 256 && probe >= 0x10000; steps++, probe -= 0x10000) {
+        ZeroMemory(&mbi, sizeof(mbi));
+        if (VirtualQuery((const void *)probe, &mbi, sizeof(mbi)) != sizeof(mbi))
+            continue;
+        if (mbi.Type != MEM_IMAGE || mbi.State != MEM_COMMIT)
+            continue;
+        if (!GetModuleFileNameA((HMODULE)mbi.AllocationBase, modPath, MAX_PATH))
+            continue;
+
+        leaf = strrchr(modPath, '\\');
+        leaf = leaf ? leaf + 1 : modPath;
+        wsprintfA(line,
+            "\r\n***   nearest loaded image below the fault: %s at %p "
+            "(fault is 0x%IX past its base)",
+            leaf, mbi.AllocationBase,
+            (SIZE_T)((const char *)addr - (const char *)mbi.AllocationBase));
+        _gldAppend(buf, cap, len, line);
+        return;
+    }
+
+    _gldAppend(buf, cap, len,
+        "\r\n***   no loaded image within 16 MB below the fault address");
+}
+
 static void _gldBuildFaultReport(EXCEPTION_POINTERS *pEP, BOOL fatal,
                                  char *buf, int cap)
 {
@@ -336,6 +449,8 @@ static void _gldBuildFaultReport(EXCEPTION_POINTERS *pEP, BOOL fatal,
                 "\r\n***   fault address == instruction pointer: execution "
                 "jumped somewhere it cannot execute, which is a call through "
                 "a bad function pointer");
+            _gldReportNearestImage(rec->ExceptionAddress, buf, cap, &len);
+            _gldReportCallSite(pEP, buf, cap, &len);
         }
     }
 

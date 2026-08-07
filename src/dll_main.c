@@ -784,7 +784,32 @@ int WINAPI DllMain(
 		break;
 
 	case DLL_PROCESS_DETACH:
-		// Call exit clean-up sequence
+		/*
+		 * pvReserved is non-NULL when the process is exiting, and NULL when
+		 * the DLL is being unloaded by FreeLibrary while the process runs on.
+		 *
+		 * On process exit, releasing the D3D9 device runs the runtime's
+		 * teardown underneath the loader lock — and with a DXVK or RTX Remix
+		 * d3d9.dll that teardown joins worker threads which need the same
+		 * lock to finish, so the two wait on each other and the process never
+		 * exits.  A title that quits without deleting its GL context hangs in
+		 * Task Manager instead of closing.  The OS reclaims the device, its
+		 * memory and every GPU handle along with the address space, so
+		 * skipping that work at process exit loses nothing.
+		 *
+		 * The logs are closed either way: they are plain file I/O, safe under
+		 * the loader lock, and their tail is the only record of what the
+		 * application was doing when it exited.
+		 */
+		if (pvReserved != NULL) {
+			gldDiagLog("DllMain: DLL_PROCESS_DETACH (process exit) — "
+			           "leaving D3D9 teardown to the OS");
+			gldLogClose();
+			gldDiagLogClose();
+			break;
+		}
+
+		// A real unload: the device would outlive the DLL that owns it.
 		gldExitDriver();
 		break;
 	}

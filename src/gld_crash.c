@@ -169,8 +169,36 @@ static const char *_gldExceptionName(DWORD code)
     case EXCEPTION_DATATYPE_MISALIGNMENT: return "DATATYPE_MISALIGNMENT";
     case EXCEPTION_IN_PAGE_ERROR:         return "IN_PAGE_ERROR";
     case EXCEPTION_NONCONTINUABLE_EXCEPTION: return "NONCONTINUABLE";
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO:    return "FLT_DIVIDE_BY_ZERO";
+    case EXCEPTION_GUARD_PAGE:            return "GUARD_PAGE";
+    case 0xE06D7363:                      return "C++ EXCEPTION";
+    case 0xC0000374:                      return "HEAP_CORRUPTION";
+    case 0xC0000409:                      return "STACK_BUFFER_OVERRUN (fail-fast)";
+    case 0xC0000135:                      return "DLL_NOT_FOUND";
+    case 0xC0000139:                      return "ENTRYPOINT_NOT_FOUND";
+    case 0xC0000008:                      return "INVALID_HANDLE";
+    case 0xC000000D:                      return "INVALID_PARAMETER";
     default:                              return NULL;
     }
+}
+
+/*
+ * Is this exception worth reporting even though it has no name above?
+ *
+ * Naming a fixed list and dropping everything else is why a hard crash could
+ * leave nothing in the log at all: Wolfenstein died on the direct path with
+ * the last entry being an ordinary wglMakeCurrent, because whatever killed it
+ * was not one of the nine codes the table knew.
+ *
+ * NTSTATUS puts severity in the top two bits, and 0b11 is STATUS_SEVERITY_ERROR
+ * - the codes that end processes.  Anything at that severity is reported with
+ * its raw value rather than discarded, so an unknown fatal code still leaves a
+ * stack behind.  Informational and warning severities stay silent, since those
+ * are the ordinary traffic a runtime raises and handles by the thousand.
+ */
+static BOOL _gldExceptionIsFatalSeverity(DWORD code)
+{
+    return ((code & 0xC0000000u) == 0xC0000000u);
 }
 
 /*
@@ -428,7 +456,7 @@ static void _gldBuildFaultReport(EXCEPTION_POINTERS *pEP, BOOL fatal,
 
     wsprintfA(line, "*** %s: %s (0x%08X) on thread %lu",
               fatal ? "FATAL" : "FIRST-CHANCE",
-              name ? name : "exception",
+              name ? name : "unnamed fatal-severity exception",
               (unsigned)rec->ExceptionCode,
               (unsigned long)GetCurrentThreadId());
     _gldAppend(buf, cap, &len, line);
@@ -532,7 +560,7 @@ static LONG CALLBACK _gldVectoredHandler(EXCEPTION_POINTERS *pEP)
 
     rec  = pEP->ExceptionRecord;
     name = _gldExceptionName(rec->ExceptionCode);
-    if (!name)
+    if (!name && !_gldExceptionIsFatalSeverity(rec->ExceptionCode))
         return EXCEPTION_CONTINUE_SEARCH;   /* not fatal - normal traffic */
 
     /*

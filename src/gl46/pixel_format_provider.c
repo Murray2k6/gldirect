@@ -167,6 +167,21 @@ static int sMatchScore(const PIXELFORMATDESCRIPTOR *requested,
  * Public API
  * =================================================================== */
 
+/* Bits per pixel the desktop is running at, so formats shallower than it
+ * can be left out of the enumeration. */
+static BYTE sDisplayColorBits(D3DFORMAT fmt)
+{
+    switch (fmt) {
+    case D3DFMT_A8R8G8B8:
+    case D3DFMT_X8R8G8B8:   return 32;
+    case D3DFMT_A2R10G10B10: return 32;
+    case D3DFMT_R5G6B5:
+    case D3DFMT_X1R5G5B5:
+    case D3DFMT_A1R5G5B5:   return 16;
+    default:                return 0;   /* unknown: exclude nothing */
+    }
+}
+
 /* Colour formats worth offering as a windowed back buffer, best first. */
 static const struct {
     D3DFORMAT fmt;
@@ -276,6 +291,19 @@ int gldBuildPixelFormatList46(void)
 
         if (FAILED(IDirect3D9_CheckDeviceType(pD3D, glb.dwAdapter, D3DDEVTYPE_HAL,
                                               mode.Format, colorFmt, TRUE)))
+            continue;
+
+        /*
+         * Windowed presentation goes through the desktop, and this backend
+         * always builds the swap chain with the display format, so a format
+         * shallower than the desktop would advertise a colour depth the
+         * device does not then provide.  A Wolfenstein log caught exactly
+         * that: it selected a format reporting 16-bit colour and got a
+         * 32-bit back buffer.  Real drivers do not enumerate those on a
+         * 32-bit desktop either, and offering them lets ChoosePixelFormat's
+         * "smallest that meets the request" rule walk down into them.
+         */
+        if (s_colorCandidates[ci].colorBits < sDisplayColorBits(mode.Format))
             continue;
 
         probedColor++;

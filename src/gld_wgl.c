@@ -646,7 +646,18 @@ int APIENTRY _GLD_WGL_EXPORT(ChoosePixelFormat)(
 		 * depth and stencil entirely.
 		 */
 		if (ppfd->cDepthBits == 0) {
-			if (ppfdCandidate.cDepthBits > ppfdBest.cDepthBits) {
+			/* Rank a depth buffer and a stencil buffer together: preferring
+			 * the deepest depth alone picks a 32-bit depth format with no
+			 * stencil over a 24/8 one, and id Tech 4 shadow volumes need the
+			 * stencil far more than they need the eight extra depth bits. */
+			int candRank = (ppfdCandidate.cDepthBits ? 2 : 0) +
+			               (ppfdCandidate.cStencilBits ? 1 : 0);
+			int bestRank = (ppfdBest.cDepthBits ? 2 : 0) +
+			               (ppfdBest.cStencilBits ? 1 : 0);
+
+			if (candRank > bestRank ||
+			    (candRank == bestRank &&
+			     ppfdCandidate.cDepthBits > ppfdBest.cDepthBits)) {
 				ppfdBest = ppfdCandidate;
 				bestIndex = i;
 				continue;

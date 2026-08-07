@@ -138,6 +138,12 @@ static SRWLOCK g_deviceLock = SRWLOCK_INIT;
 static int s_swapInterval       = -1;
 static int s_deviceSwapInterval = -1;
 
+// Pixel format the live device was built from, -1 while none exists.  A
+// bootstrap context can select a format with no depth buffer and the real
+// window then select one with depth and stencil; without noticing that the
+// device keeps the bootstrap's configuration for the whole session.
+static int s_devicePixelFormat  = -1;
+
 // ***********************************************************************
 // Initialize the D3D9 layer for the GL46 backend.
 // Loads d3d9.dll and obtains Direct3DCreate9.
@@ -356,7 +362,11 @@ void gldBuildPresentParams46(HWND hWnd, D3DPRESENT_PARAMETERS *out)
         GLD_pf46Entry entry;
 
         if (gldGetPixelFormatD3D46(gldGetPixelFormat(), &entry)) {
-            out->BackBufferFormat  = entry.colorFormat;
+            /* BackBufferFormat stays the adapter's display format.  A
+             * windowed swap chain presents through the desktop, so the
+             * display format is the one guaranteed to work; the format's
+             * colour depth is a rendering-side promise this backend keeps
+             * on its own render targets. */
             out->MultiSampleType   = entry.msType;
             out->MultiSampleQuality = entry.msQuality;
 
@@ -441,18 +451,21 @@ int gldGetSwapInterval46(void)
 
 // ***********************************************************************
 
-BOOL gldSwapIntervalNeedsReset46(void)
+BOOL gldPresentParamsNeedReset46(void)
 {
     /* Before the first device is built there is nothing to reset. */
     if (s_deviceSwapInterval < 0)
         return FALSE;
 
-    return (gldGetSwapInterval46() != s_deviceSwapInterval);
+    if (gldGetSwapInterval46() != s_deviceSwapInterval)
+        return TRUE;
+
+    return (gldGetPixelFormat() != s_devicePixelFormat);
 }
 
 // ***********************************************************************
 
-void gldNoteSwapIntervalApplied46(void)
+void gldNotePresentParamsApplied46(void)
 {
     /*
      * Called only where a device was actually created or Reset with the
@@ -461,6 +474,7 @@ void gldNoteSwapIntervalApplied46(void)
      * was meant to carry it failed, and the retry would never happen.
      */
     s_deviceSwapInterval = gldGetSwapInterval46();
+    s_devicePixelFormat  = gldGetPixelFormat();
 }
 
 // ***********************************************************************
@@ -590,7 +604,7 @@ HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor)
             gldDiagLog("GL46: Reset on context reuse failed (0x%08X)",
                        (unsigned)hrReset);
         } else {
-            gldNoteSwapIntervalApplied46();
+            gldNotePresentParamsApplied46();
         }
 
         __try {
@@ -666,7 +680,7 @@ HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor)
 
     // The device now carries the presentation interval those parameters asked
     // for, so a later wglSwapIntervalEXT can tell whether it changed anything.
-    gldNoteSwapIntervalApplied46();
+    gldNotePresentParamsApplied46();
 
     {
         UINT available = IDirect3DDevice9_GetAvailableTextureMem(pDev);
@@ -817,7 +831,8 @@ BOOL _gldEnsureDevice(HWND hWnd)
         GLD_pf46Entry entry;
 
         if (gldGetPixelFormatD3D46(gldGetPixelFormat(), &entry)) {
-            d3dpp.BackBufferFormat    = entry.colorFormat;
+            /* Back buffer format left at the display format; see the note
+             * in gldBuildPresentParams46(). */
             d3dpp.MultiSampleType     = entry.msType;
             d3dpp.MultiSampleQuality  = entry.msQuality;
 
@@ -878,7 +893,7 @@ BOOL _gldEnsureDevice(HWND hWnd)
         return FALSE;
     }
 
-    gldNoteSwapIntervalApplied46();
+    gldNotePresentParamsApplied46();
 
     {
         UINT available = IDirect3DDevice9_GetAvailableTextureMem(pDev);

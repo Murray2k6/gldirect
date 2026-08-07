@@ -124,17 +124,36 @@ static int sMatchScore(const PIXELFORMATDESCRIPTOR *requested,
     if (candidate->cColorBits == requested->cColorBits)
         score += 5;
 
-    /* Prefer matching depth buffer */
-    if (candidate->cDepthBits >= requested->cDepthBits)
-        score += 10;
-    if (candidate->cDepthBits == requested->cDepthBits)
-        score += 5;
+    /*
+     * Prefer matching depth buffer.
+     *
+     * A request for zero depth bits means "don't care", not "no depth
+     * buffer": bootstrap windows are routinely filled in that way, and every
+     * real driver still hands back a format that has depth.  Scoring an exact
+     * match on zero would make a depth-less format win, and because the D3D9
+     * device is process-global and built from whichever format is selected
+     * when it is created, that loses depth for the whole session.
+     */
+    if (requested->cDepthBits == 0) {
+        if (candidate->cDepthBits > 0)
+            score += 10;
+    } else {
+        if (candidate->cDepthBits >= requested->cDepthBits)
+            score += 10;
+        if (candidate->cDepthBits == requested->cDepthBits)
+            score += 5;
+    }
 
-    /* Prefer matching stencil buffer */
-    if (candidate->cStencilBits >= requested->cStencilBits)
-        score += 5;
-    if (candidate->cStencilBits == requested->cStencilBits)
-        score += 3;
+    /* Prefer matching stencil buffer, on the same reasoning. */
+    if (requested->cStencilBits == 0) {
+        if (candidate->cStencilBits > 0)
+            score += 5;
+    } else {
+        if (candidate->cStencilBits >= requested->cStencilBits)
+            score += 5;
+        if (candidate->cStencilBits == requested->cStencilBits)
+            score += 3;
+    }
 
     /* Prefer matching alpha */
     if (candidate->cAlphaBits >= requested->cAlphaBits)

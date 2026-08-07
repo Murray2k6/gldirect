@@ -339,11 +339,11 @@ BOOL gldSwapBuffers_GL46(
 					gldLogPrintf(GLDLOG_ERROR,
 						"GL46: device-lost Reset failed (0x%08X)", hr);
 				else {
-					gldNoteSwapIntervalApplied46();
+					gldNotePresentParamsApplied46();
 					bWasReset = TRUE;
 				}
 			}
-		} else if (gldSwapIntervalNeedsReset46()) {
+		} else if (gldPresentParamsNeedReset46()) {
 			// wglSwapIntervalEXT asked for a different presentation interval.
 			// D3D9 only changes one through a Reset, and the frame the
 			// application just presented is already on screen, so this is the
@@ -354,18 +354,18 @@ BOOL gldSwapBuffers_GL46(
 
 			gldBuildPresentParams46(hResetWnd, &d3dpp);
 
-			gldDiagLog("GL46: swap-interval Reset hWnd=%p interval=%d",
-				(void*)hResetWnd, gldGetSwapInterval46());
+			gldDiagLog("GL46: present-params Reset hWnd=%p interval=%d pf=%d",
+				(void*)hResetWnd, gldGetSwapInterval46(), gldGetPixelFormat());
 
 			_glsReleaseDeviceLosableResources(pDev);
 
 			hrInterval = IDirect3DDevice9_Reset(pDev, &d3dpp);
 			if (FAILED(hrInterval))
 				gldLogPrintf(GLDLOG_ERROR,
-					"GL46: swap-interval Reset failed (0x%08X) — "
+					"GL46: present-params Reset failed (0x%08X) — "
 					"continuing at the previous interval", hrInterval);
 			else {
-				gldNoteSwapIntervalApplied46();
+				gldNotePresentParamsApplied46();
 				bWasReset = TRUE;
 			}
 		}

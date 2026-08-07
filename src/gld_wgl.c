@@ -631,7 +631,27 @@ int APIENTRY _GLD_WGL_EXPORT(ChoosePixelFormat)(
 			continue;
 		}
 		
-		if ((ppfd->cDepthBits > ppfdBest.cDepthBits &&
+		/*
+		 * A request of zero depth bits means "don't care", not "no depth
+		 * buffer": bootstrap windows are routinely filled in that way and
+		 * every real driver still hands back a format that has depth.
+		 *
+		 * The rule below cannot express that on its own — with a zero
+		 * request "ppfd->cDepthBits <= ppfdCandidate.cDepthBits" is true for
+		 * every candidate, so it walks toward the smallest depth buffer on
+		 * offer.  That was harmless while the smallest was 16, but once the
+		 * format list gained genuinely depth-less entries it selects one of
+		 * those, and since the process-global D3D9 device is built from
+		 * whichever format is current when it is created, the session loses
+		 * depth and stencil entirely.
+		 */
+		if (ppfd->cDepthBits == 0) {
+			if (ppfdCandidate.cDepthBits > ppfdBest.cDepthBits) {
+				ppfdBest = ppfdCandidate;
+				bestIndex = i;
+				continue;
+			}
+		} else if ((ppfd->cDepthBits > ppfdBest.cDepthBits &&
 			ppfdCandidate.cDepthBits > ppfdBest.cDepthBits) ||
 			(ppfd->cDepthBits <= ppfdCandidate.cDepthBits &&
 			ppfdCandidate.cDepthBits < ppfdBest.cDepthBits))
@@ -640,9 +660,11 @@ int APIENTRY _GLD_WGL_EXPORT(ChoosePixelFormat)(
 			bestIndex = i;
 			continue;
 		}
-		
-		if (ppfd->cStencilBits &&
-			ppfdCandidate.cStencilBits > ppfdBest.cStencilBits)
+
+		/* Stencil reads the same way: asking for none is not a request to
+		 * be denied one, and id Tech 4's shadow volumes need the buffer to
+		 * exist on the device however the bootstrap PFD was filled in. */
+		if (ppfdCandidate.cStencilBits > ppfdBest.cStencilBits)
 		{
 			ppfdBest = ppfdCandidate;
 			bestIndex = i;

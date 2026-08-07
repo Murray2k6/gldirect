@@ -86,6 +86,8 @@ typedef struct {
     BOOL                ClientPointers;
 } GLD_MINIDUMP_EXCEPTION_INFO;
 
+static volatile LONG g_inHandler = 0;
+
 static void _gldWriteCrashDump(EXCEPTION_POINTERS *pEP)
 {
     HMODULE hDbg;
@@ -123,10 +125,17 @@ static void _gldWriteCrashDump(EXCEPTION_POINTERS *pEP)
 
     {
         GLD_MINIDUMP_EXCEPTION_INFO mei;
-        /* MiniDumpWithFullMemory (0x2) | WithHandleData (0x4) |
-         * WithFullMemoryInfo (0x800) | WithThreadInfo (0x1000) - spelled
-         * numerically so this compiles without pulling in dbghelp.h. */
-        const DWORD type = 0x2 | 0x4 | 0x800 | 0x1000;
+        /* MiniDumpWithDataSegs (0x1) | WithHandleData (0x4) |
+         * WithIndirectlyReferencedMemory (0x40) | WithThreadInfo (0x1000) -
+         * spelled numerically so this compiles without pulling in dbghelp.h.
+         *
+         * Deliberately not WithFullMemory: that walks every mapped region in
+         * the process, and against a DXVK/RTX Remix d3d9.dll - which maps
+         * large device-visible regions - dbgcore faulted inside the write and
+         * took the fault report with it.  These flags keep the stacks, the
+         * loaded module list and the memory the registers point at, which is
+         * what the report is read for. */
+        const DWORD type = 0x1 | 0x4 | 0x40 | 0x1000;
 
         mei.ThreadId          = GetCurrentThreadId();
         mei.ExceptionPointers = pEP;
@@ -222,6 +231,17 @@ static LONG CALLBACK _gldVectoredHandler(EXCEPTION_POINTERS *pEP)
     if (!name)
         return EXCEPTION_CONTINUE_SEARCH;   /* not fatal - normal traffic */
 
+    /*
+     * Re-entrancy guard.  Everything below runs inside an exception, and
+     * anything it touches can raise one of its own - the dump writer did
+     * exactly that, faulting inside dbgcore while reporting a fault in
+     * d3d9.dll, so the log recorded the handler's own crash instead of the
+     * one being investigated.  A nested fault now leaves immediately and the
+     * original report survives.
+     */
+    if (InterlockedCompareExchange(&g_inHandler, 1, 0) != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
     addr = rec->ExceptionAddress;
 
     /* A faulting instruction inside a loop would otherwise fill the log with
@@ -229,8 +249,10 @@ static LONG CALLBACK _gldVectoredHandler(EXCEPTION_POINTERS *pEP)
      * once for the whole process, so a benign fault the wrapper raises and
      * handles itself cannot hide the one that follows it - see the note on
      * g_faultSites above. */
-    if (!_gldFaultSiteIsNew(addr))
+    if (!_gldFaultSiteIsNew(addr)) {
+        InterlockedExchange(&g_inHandler, 0);
         return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     szMod[0] = '\0';
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -264,6 +286,8 @@ static LONG CALLBACK _gldVectoredHandler(EXCEPTION_POINTERS *pEP)
 
     _gldLogStackTrace();
     _gldWriteCrashDump(pEP);
+
+    InterlockedExchange(&g_inHandler, 0);
 
     /* Let the game's own handler run. This records, it does not intervene. */
     return EXCEPTION_CONTINUE_SEARCH;

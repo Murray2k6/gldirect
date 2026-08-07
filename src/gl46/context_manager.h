@@ -106,7 +106,7 @@ void gldApplyDefaultDeviceState46(IDirect3DDevice9 *pDev);
  */
 BOOL gldSetSwapInterval46(int interval);
 int  gldGetSwapInterval46(void);
-BOOL gldSwapIntervalNeedsReset46(void);
+BOOL gldPresentParamsNeedReset46(void);
 
 /*
  * Record that a device was successfully created or Reset with the parameters
@@ -114,7 +114,7 @@ BOOL gldSwapIntervalNeedsReset46(void);
  * one the live device carries agree again.  Call it only after the call that
  * carried them actually succeeded.
  */
-void gldNoteSwapIntervalApplied46(void);
+void gldNotePresentParamsApplied46(void);
 
 /*
  * Create a D3D9 device for the GL46 context.

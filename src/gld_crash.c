@@ -20,7 +20,6 @@
 *********************************************************************************/
 
 #include <windows.h>
-#include <intrin.h>
 #include "gld_diag.h"
 
 static PVOID  g_hVeh = NULL;
@@ -147,11 +146,8 @@ static void _gldWriteCrashDump(EXCEPTION_POINTERS *pEP)
         mei.ExceptionPointers = pEP;
         mei.ClientPointers    = FALSE;
 
-        /* pEP NULL when the process is exiting deliberately: there is no
-         * exception to describe, and MiniDumpWriteDump wants NULL rather
-         * than a record pointing at nothing. */
         if (pWrite(GetCurrentProcess(), GetCurrentProcessId(), hFile,
-                   type, pEP ? &mei : NULL, NULL, NULL))
+                   type, &mei, NULL, NULL))
             gldDiagLogFatal("*** FAULT: full memory dump written to %s", path);
         else
             gldDiagLogFatal("*** FAULT: MiniDumpWriteDump failed (%lu)",
@@ -603,214 +599,6 @@ _gldReportFault(pEP, FALSE);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/*===========================================================================
- * Termination interception
- *
- * Wolfenstein dies on the direct path leaving no fault report and no
- * DLL_PROCESS_DETACH.  The reporter now covers every fatal-severity
- * exception, so the absence of a report means no exception was raised, and
- * the absence of a detach means DllMain never ran on the way out.  Both are
- * true of TerminateProcess and of a fail-fast, and neither of those is a
- * crash: the engine is deciding something is unacceptable and killing
- * itself.
- *
- * An exception handler cannot see that.  These three APIs are hooked in the
- * host executable's import table instead, so the moment one is called the
- * process still exists and a dump can be written from inside it, with the
- * caller's address recorded.  The original is then invoked, so behaviour is
- * unchanged - this observes the exit, it does not prevent it.
- *===========================================================================*/
-
-typedef VOID (WINAPI *FN_ExitProcess)(UINT);
-typedef BOOL (WINAPI *FN_TerminateProcess)(HANDLE, UINT);
-typedef VOID (WINAPI *FN_RaiseFailFastException)(PEXCEPTION_RECORD, PCONTEXT, DWORD);
-
-static FN_ExitProcess            g_realExitProcess = NULL;
-static FN_TerminateProcess       g_realTerminateProcess = NULL;
-static FN_RaiseFailFastException g_realRaiseFailFast = NULL;
-
-/* One report per process; a terminating process has no second chance. */
-static volatile LONG g_terminationReported = 0;
-
-static void _gldReportTermination(const char *api, UINT code, void *caller)
-{
-    static char buf[2048];
-    char  line[600];
-    char  desc[MAX_PATH + 128];
-    int   len = 0;
-
-    if (InterlockedCompareExchange(&g_terminationReported, 1, 0) != 0)
-        return;
-
-    buf[0] = '\0';
-    wsprintfA(line, "*** TERMINATION: %s(code=%u) on thread %lu - the process "
-                    "is being ended deliberately, not crashing",
-              api, code, (unsigned long)GetCurrentThreadId());
-    _gldAppend(buf, (int)sizeof(buf), &len, line);
-
-    _gldDescribeAddress(caller, desc);
-    wsprintfA(line, "\r\n***   called from %s", desc);
-    _gldAppend(buf, (int)sizeof(buf), &len, line);
-
-    /* The caller's own frame is what names the engine routine that decided
-     * to quit - Sys_Error and friends sit one or two frames further up. */
-    {
-        void  *frames[24];
-        USHORT captured, i;
-
-        captured = RtlCaptureStackBackTrace(1, 24, frames, NULL);
-        if (captured) {
-            wsprintfA(line, "\r\n***   stack (%u frames, innermost first):",
-                      (unsigned)captured);
-            _gldAppend(buf, (int)sizeof(buf), &len, line);
-            for (i = 0; i < captured; i++) {
-                _gldDescribeAddress(frames[i], desc);
-                wsprintfA(line, "\r\n***   [%2u] %s", (unsigned)i, desc);
-                _gldAppend(buf, (int)sizeof(buf), &len, line);
-            }
-        }
-    }
-
-    gldDiagLogFatal("%s", buf);
-    _gldWriteCrashDump(NULL);       /* NULL: no exception to describe */
-}
-
-static VOID WINAPI _gldExitProcessHook(UINT uExitCode)
-{
-    _gldReportTermination("ExitProcess", uExitCode, _ReturnAddress());
-    if (g_realExitProcess)
-        g_realExitProcess(uExitCode);
-    /* Unreachable, but the compiler does not know that. */
-    ExitProcess(uExitCode);
-}
-
-static BOOL WINAPI _gldTerminateProcessHook(HANDLE hProcess, UINT uExitCode)
-{
-    /* Only our own process matters; a game terminating a child is normal. */
-    if (hProcess == GetCurrentProcess() ||
-        GetProcessId(hProcess) == GetCurrentProcessId())
-        _gldReportTermination("TerminateProcess", uExitCode, _ReturnAddress());
-
-    return g_realTerminateProcess ?
-           g_realTerminateProcess(hProcess, uExitCode) : FALSE;
-}
-
-static VOID WINAPI _gldRaiseFailFastHook(PEXCEPTION_RECORD pRec, PCONTEXT pCtx,
-                                         DWORD dwFlags)
-{
-    _gldReportTermination("RaiseFailFastException",
-                          pRec ? pRec->ExceptionCode : 0, _ReturnAddress());
-    if (g_realRaiseFailFast)
-        g_realRaiseFailFast(pRec, pCtx, dwFlags);
-}
-
-/*
- * Replace one imported function pointer in a module's import table.
- *
- * The import table is patched rather than the API's code: it needs no
- * instruction rewriting, cannot be defeated by the target being hot-patched
- * already, and touches nothing outside this process's own IAT page.
- */
-static BOOL _gldPatchImport(HMODULE hMod, const char *dllName,
-                            const char *fnName, PROC replacement,
-                            PROC *pOriginal)
-{
-    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)hMod;
-    IMAGE_NT_HEADERS *nt;
-    IMAGE_IMPORT_DESCRIPTOR *imp;
-    DWORD impRVA;
-    BOOL patched = FALSE;
-
-    if (!hMod || dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return FALSE;
-    nt = (IMAGE_NT_HEADERS *)((char *)hMod + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE)
-        return FALSE;
-
-    impRVA = nt->OptionalHeader
-                .DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    if (!impRVA)
-        return FALSE;
-
-    imp = (IMAGE_IMPORT_DESCRIPTOR *)((char *)hMod + impRVA);
-
-    for (; imp->Name; imp++) {
-        const char *name = (const char *)hMod + imp->Name;
-        IMAGE_THUNK_DATA *orig, *thunk;
-
-        if (lstrcmpiA(name, dllName) != 0)
-            continue;
-        if (!imp->OriginalFirstThunk || !imp->FirstThunk)
-            continue;
-
-        orig  = (IMAGE_THUNK_DATA *)((char *)hMod + imp->OriginalFirstThunk);
-        thunk = (IMAGE_THUNK_DATA *)((char *)hMod + imp->FirstThunk);
-
-        for (; orig->u1.AddressOfData; orig++, thunk++) {
-            IMAGE_IMPORT_BY_NAME *ibn;
-            DWORD prot;
-
-            if (IMAGE_SNAP_BY_ORDINAL(orig->u1.Ordinal))
-                continue;
-            ibn = (IMAGE_IMPORT_BY_NAME *)((char *)hMod + orig->u1.AddressOfData);
-            if (lstrcmpA((const char *)ibn->Name, fnName) != 0)
-                continue;
-
-            if (!VirtualProtect(&thunk->u1.Function, sizeof(void *),
-                                PAGE_READWRITE, &prot))
-                continue;
-
-            if (pOriginal && !*pOriginal)
-                *pOriginal = (PROC)(ULONG_PTR)thunk->u1.Function;
-            thunk->u1.Function = (ULONG_PTR)replacement;
-
-            VirtualProtect(&thunk->u1.Function, sizeof(void *), prot, &prot);
-            patched = TRUE;
-        }
-    }
-
-    return patched;
-}
-
-/* Install the termination hooks in the host executable. */
-static void _gldHookTermination(void)
-{
-    HMODULE hExe = GetModuleHandleA(NULL);
-    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
-    int hooked = 0;
-    static const char *dlls[] = { "kernel32.dll", "KERNEL32.dll",
-                                  "kernelbase.dll", "KERNELBASE.dll",
-                                  "api-ms-win-core-processthreads-l1-1-0.dll" };
-    int i;
-
-    /* Resolve the real entry points up front: if the import table turns out
-     * not to name them, the hooks still have something to call through to. */
-    if (hK32) {
-        if (!g_realExitProcess)
-            g_realExitProcess = (FN_ExitProcess)GetProcAddress(hK32, "ExitProcess");
-        if (!g_realTerminateProcess)
-            g_realTerminateProcess = (FN_TerminateProcess)GetProcAddress(hK32, "TerminateProcess");
-        if (!g_realRaiseFailFast)
-            g_realRaiseFailFast = (FN_RaiseFailFastException)GetProcAddress(hK32, "RaiseFailFastException");
-    }
-
-    for (i = 0; i < (int)(sizeof(dlls) / sizeof(dlls[0])); i++) {
-        if (_gldPatchImport(hExe, dlls[i], "ExitProcess",
-                            (PROC)_gldExitProcessHook, (PROC *)&g_realExitProcess))
-            hooked++;
-        if (_gldPatchImport(hExe, dlls[i], "TerminateProcess",
-                            (PROC)_gldTerminateProcessHook, (PROC *)&g_realTerminateProcess))
-            hooked++;
-        if (_gldPatchImport(hExe, dlls[i], "RaiseFailFastException",
-                            (PROC)_gldRaiseFailFastHook, (PROC *)&g_realRaiseFailFast))
-            hooked++;
-    }
-
-    gldDiagLog("crash dump: %d termination entry point(s) hooked in the host "
-               "executable; a deliberate exit will now leave a dump behind",
-               hooked);
-}
-
 void gldCrashHandlerInstall(void)
 {
     if (g_hVeh)
@@ -818,11 +606,6 @@ void gldCrashHandlerInstall(void)
     /* First in the chain, so an engine handler installed later cannot preempt it. */
     g_hVeh = AddVectoredExceptionHandler(1, _gldVectoredHandler);
     g_prevFilter = SetUnhandledExceptionFilter(_gldUnhandledFilter);
-
-    /* Armed at load, from DllMain's DLL_PROCESS_ATTACH.  A deliberate
-     * termination has to be caught while the process still exists, and by
-     * the time one is called it is far too late to install anything. */
-    _gldHookTermination();
 }
 
 void gldCrashHandlerRemove(void)

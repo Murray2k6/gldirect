@@ -215,12 +215,196 @@ static void _gldLogStackTrace(void)
     }
 }
 
+/*===========================================================================
+ * Fault reporting
+ *
+ * Three things about the old reporter made a real fault unreadable, all of
+ * them visible in a Wolfenstein log:
+ *
+ *   - Each line was emitted separately, so with id Tech's SMP threads the
+ *     lines of one report arrived shuffled between another thread's normal
+ *     logging.  It read as three faults beside unrelated calls when it was
+ *     one fault and a busy second thread.  A report is now built whole and
+ *     emitted in a single call.
+ *
+ *   - GetModuleHandleEx by address returned nothing for an address that was
+ *     plainly inside d3d9.dll, and the report said "belongs to no loaded
+ *     module".  VirtualQuery answers from the memory map instead, and can
+ *     tell a genuine wild jump from a fault in real code.
+ *
+ *   - Everything was labelled FAULT whether or not the process survived it.
+ *     A first-chance exception that something downstream handles now says
+ *     so, and only the unhandled filter reports one that ended the process.
+ *===========================================================================*/
+
+/* Describe an address from the memory map: module + offset when it is inside
+ * a mapped image, and what the region actually is when it is not. */
+static void _gldDescribeAddress(const void *addr, char *out)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    char  modPath[MAX_PATH];
+    const char *leaf;
+
+    out[0] = '\0';
+    if (!addr) { wsprintfA(out, "NULL"); return; }
+
+    ZeroMemory(&mbi, sizeof(mbi));
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+        wsprintfA(out, "%p (unqueryable)", addr);
+        return;
+    }
+
+    if (mbi.State != MEM_COMMIT) {
+        wsprintfA(out, "%p (memory not committed - reserved or free)", addr);
+        return;
+    }
+
+    if (mbi.Type == MEM_IMAGE &&
+        GetModuleFileNameA((HMODULE)mbi.AllocationBase, modPath, MAX_PATH)) {
+        leaf = strrchr(modPath, '\\');
+        leaf = leaf ? leaf + 1 : modPath;
+        wsprintfA(out, "%p = %s+0x%X", addr, leaf,
+                  (unsigned)((const char *)addr - (const char *)mbi.AllocationBase));
+        return;
+    }
+
+    /* Committed, but no module owns it: heap, stack or generated code.
+     * Executing here is the signature of a call through a stale or corrupt
+     * function pointer, which is worth saying outright. */
+    wsprintfA(out, "%p (committed %s memory, protect 0x%X - no module owns it)",
+              addr,
+              mbi.Type == MEM_PRIVATE ? "private" :
+              mbi.Type == MEM_MAPPED  ? "mapped"  : "unknown",
+              (unsigned)mbi.Protect);
+}
+
+/* Append to a bounded buffer without ever running past its end. */
+static void _gldAppend(char *buf, int cap, int *len, const char *text)
+{
+    int n = lstrlenA(text);
+    if (*len + n >= cap - 1) n = cap - 1 - *len;
+    if (n <= 0) return;
+    CopyMemory(buf + *len, text, n);
+    *len += n;
+    buf[*len] = '\0';
+}
+
+/*
+ * Build the whole report into one buffer.  fatal distinguishes an exception
+ * that reached the unhandled filter - one that actually ended the process -
+ * from a first-chance exception something downstream went on to handle.
+ */
+static void _gldBuildFaultReport(EXCEPTION_POINTERS *pEP, BOOL fatal,
+                                 char *buf, int cap)
+{
+    EXCEPTION_RECORD *rec = pEP->ExceptionRecord;
+    CONTEXT          *ctx = pEP->ContextRecord;
+    void  *frames[32];
+    USHORT captured, i;
+    char   line[600];
+    char   desc[MAX_PATH + 128];
+    int    len = 0;
+    const char *name = _gldExceptionName(rec->ExceptionCode);
+
+    buf[0] = '\0';
+
+    wsprintfA(line, "*** %s: %s (0x%08X) on thread %lu",
+              fatal ? "FATAL" : "FIRST-CHANCE",
+              name ? name : "exception",
+              (unsigned)rec->ExceptionCode,
+              (unsigned long)GetCurrentThreadId());
+    _gldAppend(buf, cap, &len, line);
+
+    _gldDescribeAddress(rec->ExceptionAddress, desc);
+    wsprintfA(line, "\r\n***   faulting instruction at %s", desc);
+    _gldAppend(buf, cap, &len, line);
+
+    /* For an access violation the record carries what was attempted and
+     * where, which is what separates a wild jump from a bad dereference. */
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        rec->NumberParameters >= 2) {
+        const char *how = (rec->ExceptionInformation[0] == 0) ? "reading" :
+                          (rec->ExceptionInformation[0] == 1) ? "writing" :
+                          (rec->ExceptionInformation[0] == 8) ? "executing (DEP)" :
+                                                                "accessing";
+        _gldDescribeAddress((const void *)rec->ExceptionInformation[1], desc);
+        wsprintfA(line, "\r\n***   while %s %s", how, desc);
+        _gldAppend(buf, cap, &len, line);
+
+        if (rec->ExceptionInformation[1] == (ULONG_PTR)rec->ExceptionAddress) {
+            _gldAppend(buf, cap, &len,
+                "\r\n***   fault address == instruction pointer: execution "
+                "jumped somewhere it cannot execute, which is a call through "
+                "a bad function pointer");
+        }
+    }
+
+    if (ctx) {
+#if defined(_M_X64)
+        wsprintfA(line, "\r\n***   rip=%p rsp=%p rbp=%p rax=%p rcx=%p rdx=%p",
+                  (void *)ctx->Rip, (void *)ctx->Rsp, (void *)ctx->Rbp,
+                  (void *)ctx->Rax, (void *)ctx->Rcx, (void *)ctx->Rdx);
+#else
+        wsprintfA(line, "\r\n***   eip=%p esp=%p ebp=%p eax=%p ecx=%p edx=%p",
+                  (void *)(ULONG_PTR)ctx->Eip, (void *)(ULONG_PTR)ctx->Esp,
+                  (void *)(ULONG_PTR)ctx->Ebp, (void *)(ULONG_PTR)ctx->Eax,
+                  (void *)(ULONG_PTR)ctx->Ecx, (void *)(ULONG_PTR)ctx->Edx);
+#endif
+        _gldAppend(buf, cap, &len, line);
+    }
+
+    /* Skip this handler's own frames so the first line of the trace is the
+     * code being investigated, not the code doing the reporting. */
+    captured = RtlCaptureStackBackTrace(2, 32, frames, NULL);
+    if (captured == 0) {
+        _gldAppend(buf, cap, &len, "\r\n***   no stack frames captured");
+        return;
+    }
+
+    wsprintfA(line, "\r\n***   stack (%u frames, innermost first):",
+              (unsigned)captured);
+    _gldAppend(buf, cap, &len, line);
+
+    for (i = 0; i < captured; i++) {
+        _gldDescribeAddress(frames[i], desc);
+        wsprintfA(line, "\r\n***   [%2u] %s", (unsigned)i, desc);
+        _gldAppend(buf, cap, &len, line);
+    }
+}
+
+/* Emit a complete report in a single call, so no other thread's logging can
+ * land in the middle of it. */
+static void _gldReportFault(EXCEPTION_POINTERS *pEP, BOOL fatal)
+{
+    /* Static rather than stack: a fault is no time to touch the heap or to
+     * put 8 KiB on a stack that may itself be the thing that overflowed.
+     * g_inHandler serialises every caller. */
+    static char buf[8192];
+
+    _gldBuildFaultReport(pEP, fatal, buf, (int)sizeof(buf));
+    gldDiagLogFatal("%s", buf);
+}
+
+/*
+ * Unhandled exceptions - the ones that actually end the process.  The
+ * vectored handler sees every exception first-chance, including the many a
+ * runtime raises and handles internally; only this filter can say that
+ * nothing downstream dealt with it.
+ */
+static LONG WINAPI _gldUnhandledFilter(EXCEPTION_POINTERS *pEP)
+{
+    if (pEP && pEP->ExceptionRecord) {
+        _gldReportFault(pEP, TRUE);
+        _gldWriteCrashDump(pEP);
+    }
+    /* Hand back to whatever the application installed before us. */
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static LONG CALLBACK _gldVectoredHandler(EXCEPTION_POINTERS *pEP)
 {
     EXCEPTION_RECORD *rec;
     const char *name;
-    HMODULE hMod = NULL;
-    char szMod[MAX_PATH];
     void *addr;
 
     if (!pEP || !pEP->ExceptionRecord)
@@ -254,38 +438,12 @@ static LONG CALLBACK _gldVectoredHandler(EXCEPTION_POINTERS *pEP)
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    szMod[0] = '\0';
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCSTR)addr, &hMod) && hMod) {
-        if (!GetModuleFileNameA(hMod, szMod, MAX_PATH))
-            szMod[0] = '\0';
-    }
-
-    gldDiagLogFatal("*** FAULT: %s (0x%08X) at %p", name,
-               (unsigned)rec->ExceptionCode, addr);
-
-    if (szMod[0]) {
-        /* The offset is what makes the address usable: it survives ASLR, so it
-         * can be matched against a map/PDB for this build. */
-        gldDiagLogFatal("*** FAULT: module %s base %p offset 0x%IX",
-                   szMod, (void *)hMod, (SIZE_T)((char *)addr - (char *)hMod));
-    } else {
-        gldDiagLogFatal("*** FAULT: address belongs to no loaded module "
-                   "(jumped through a bad pointer)");
-    }
-
-    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
-        rec->NumberParameters >= 2) {
-        static const char *op[] = { "reading", "writing", "executing" };
-        ULONG_PTR kind = rec->ExceptionInformation[0];
-        gldDiagLogFatal("*** FAULT: %s address %p",
-                   (kind <= 2) ? op[kind] : "accessing",
-                   (void *)rec->ExceptionInformation[1]);
-    }
-
-    _gldLogStackTrace();
-    _gldWriteCrashDump(pEP);
+    /* The report itself is built and emitted by _gldReportFault, which
+     * resolves addresses through the memory map and writes the whole
+     * thing in one call.  The per-line emission that used to live here
+     * could not attribute an address inside d3d9.dll and interleaved
+     * with other threads. */
+_gldReportFault(pEP, FALSE);
 
     InterlockedExchange(&g_inHandler, 0);
 
@@ -299,6 +457,7 @@ void gldCrashHandlerInstall(void)
         return;
     /* First in the chain, so an engine handler installed later cannot preempt it. */
     g_hVeh = AddVectoredExceptionHandler(1, _gldVectoredHandler);
+    SetUnhandledExceptionFilter(_gldUnhandledFilter);
 }
 
 void gldCrashHandlerRemove(void)

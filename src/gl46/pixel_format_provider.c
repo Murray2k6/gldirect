@@ -33,17 +33,29 @@
 *********************************************************************************/
 
 #include "pixel_format_provider.h"
+#include "context_manager.h"
 #include "gld_log.h"
+#include "gld_globals.h"
 #include <string.h>
 
 /*---------------------- Static module state ----------------------*/
 
 /*
- * Enumerated pixel format descriptors.
- * Built by gldBuildPixelFormatList46().
+ * Enumerated pixel formats.
+ *
+ * Each entry pairs the PIXELFORMATDESCRIPTOR the application sees with the
+ * D3D9 surface formats that back it, so device creation can build a swap
+ * chain that actually provides what the format promised.  The list is probed
+ * against the d3d9.dll that is really loaded rather than assumed: a DXVK or
+ * RTX Remix d3d9.dll accepts a narrower set of D3DFORMATs than a stock
+ * runtime, and enumerating a format it will refuse produces a pixel format
+ * that fails at device creation instead of at selection.
  */
-static PIXELFORMATDESCRIPTOR s_formats[GLD_PF46_MAX_FORMATS];
+static GLD_pf46Entry s_formats[GLD_PF46_MAX_FORMATS];
 static int s_formatCount = 0;
+
+/* TRUE once at least one multisampled format has been enumerated. */
+static BOOL s_haveMultisample = FALSE;
 
 /*---------------------- Internal helper functions ----------------------*/
 
@@ -135,69 +147,228 @@ static int sMatchScore(const PIXELFORMATDESCRIPTOR *requested,
  * Public API
  * =================================================================== */
 
-int gldBuildPixelFormatList46(void)
+/* Colour formats worth offering as a windowed back buffer, best first. */
+static const struct {
+    D3DFORMAT fmt;
+    BYTE colorBits, redBits, greenBits, blueBits, alphaBits;
+    BYTE redShift, greenShift, blueShift, alphaShift;
+} s_colorCandidates[] = {
+    { D3DFMT_A8R8G8B8, 32, 8, 8, 8, 8,  16, 8, 0, 24 },
+    { D3DFMT_X8R8G8B8, 32, 8, 8, 8, 0,  16, 8, 0,  0 },
+    { D3DFMT_A1R5G5B5, 16, 5, 5, 5, 1,  10, 5, 0, 15 },
+    { D3DFMT_X1R5G5B5, 16, 5, 5, 5, 0,  10, 5, 0,  0 },
+    { D3DFMT_R5G6B5,   16, 5, 6, 5, 0,  11, 5, 0,  0 },
+};
+
+/*
+ * Depth-stencil formats, best first.  D3DFMT_UNKNOWN is the depth-less
+ * entry: an application is entitled to ask for a format with no depth
+ * buffer, and offering one costs a swap chain nothing.
+ */
+static const struct {
+    D3DFORMAT fmt;
+    BYTE depthBits, stencilBits;
+} s_depthCandidates[] = {
+    { D3DFMT_D24S8,   24, 8 },
+    { D3DFMT_D24X8,   24, 0 },
+    { D3DFMT_D32,     32, 0 },
+    { D3DFMT_D16,     16, 0 },
+    { D3DFMT_D15S1,   15, 1 },
+    { D3DFMT_UNKNOWN,  0, 0 },
+};
+
+/* Sample counts to probe. NONE first so an application that never asks for
+ * multisampling is never handed a multisampled format by preference. */
+static const D3DMULTISAMPLE_TYPE s_msCandidates[] = {
+    D3DMULTISAMPLE_NONE,
+    D3DMULTISAMPLE_2_SAMPLES,
+    D3DMULTISAMPLE_4_SAMPLES,
+    D3DMULTISAMPLE_8_SAMPLES,
+    D3DMULTISAMPLE_16_SAMPLES,
+};
+
+/*
+ * Fallback list used when D3D9 is not available to probe.  Keeps the wrapper
+ * enumerating something so pixel format selection and context creation still
+ * work in a headless or pre-initialisation call.
+ */
+static int sBuildAssumedList(void)
 {
-    /*
-     * Enumerate 8 pixel format combinations:
-     *   Color: 16-bit (R5G6B5), 32-bit (A8R8G8B8)
-     *   Depth: 16-bit, 24-bit
-     *   Stencil: 0-bit, 8-bit
-     *
-     * All formats are double-buffered with hardware acceleration.
-     */
-
-    /* Color depth parameters */
-    static const struct {
-        BYTE colorBits, redBits, greenBits, blueBits, alphaBits;
-        BYTE redShift, greenShift, blueShift, alphaShift;
-    } colorConfigs[] = {
-        /* 16-bit R5G6B5 */
-        { 16, 5, 6, 5, 0,  11, 5, 0, 0 },
-        /* 32-bit A8R8G8B8 */
-        { 32, 8, 8, 8, 8,  16, 8, 0, 24 },
+    static const struct { BYTE depthBits, stencilBits; D3DFORMAT fmt; } ds[] = {
+        { 24, 8, D3DFMT_D24S8 },
+        { 24, 0, D3DFMT_D24X8 },
+        { 16, 0, D3DFMT_D16   },
+        {  0, 0, D3DFMT_UNKNOWN },
     };
-
-    /* Depth/stencil parameters */
-    static const struct {
-        BYTE depthBits, stencilBits;
-    } dsConfigs[] = {
-        { 16, 0 },
-        { 16, 8 },
-        { 24, 0 },
-        { 24, 8 },
-    };
-
-    int ci, di;
+    int i;
 
     s_formatCount = 0;
+    s_haveMultisample = FALSE;
 
-    for (ci = 0; ci < 2; ci++) {
-        for (di = 0; di < 4; di++) {
-            if (s_formatCount >= GLD_PF46_MAX_FORMATS)
-                break;
+    for (i = 0; i < (int)(sizeof(ds) / sizeof(ds[0])); i++) {
+        GLD_pf46Entry *e = &s_formats[s_formatCount];
 
-            sInitPFD(&s_formats[s_formatCount],
-                     colorConfigs[ci].colorBits,
-                     colorConfigs[ci].redBits,
-                     colorConfigs[ci].greenBits,
-                     colorConfigs[ci].blueBits,
-                     colorConfigs[ci].alphaBits,
-                     colorConfigs[ci].redShift,
-                     colorConfigs[ci].greenShift,
-                     colorConfigs[ci].blueShift,
-                     colorConfigs[ci].alphaShift,
-                     dsConfigs[di].depthBits,
-                     dsConfigs[di].stencilBits);
-
-            s_formatCount++;
-        }
+        memset(e, 0, sizeof(*e));
+        sInitPFD(&e->pfd, 32, 8, 8, 8, 8, 16, 8, 0, 24,
+                 ds[i].depthBits, ds[i].stencilBits);
+        e->colorFormat = D3DFMT_X8R8G8B8;
+        e->depthFormat = ds[i].fmt;
+        e->msType      = D3DMULTISAMPLE_NONE;
+        e->msQuality   = 0;
+        e->samples     = 0;
+        s_formatCount++;
     }
 
-    gldLogPrintf(GLDLOG_INFO,
-        "gldBuildPixelFormatList46: enumerated %d pixel formats",
+    gldLogPrintf(GLDLOG_WARN,
+        "gldBuildPixelFormatList46: D3D9 unavailable, assuming %d formats",
         s_formatCount);
 
     return s_formatCount;
+}
+
+int gldBuildPixelFormatList46(void)
+{
+    IDirect3D9     *pD3D = gldGetD3D46();
+    D3DDISPLAYMODE  mode;
+    int             ci, di, mi;
+    int             probedColor = 0;
+
+    s_formatCount = 0;
+    s_haveMultisample = FALSE;
+
+    if (!pD3D)
+        return sBuildAssumedList();
+
+    ZeroMemory(&mode, sizeof(mode));
+    if (FAILED(IDirect3D9_GetAdapterDisplayMode(pD3D, glb.dwAdapter, &mode)))
+        return sBuildAssumedList();
+
+    /*
+     * Windowed presentation, so every colour format has to be one the runtime
+     * will present against the current desktop mode.  On a 32-bit desktop that
+     * normally rules the 16-bit formats out, which is the honest answer: an
+     * application asking for 16-bit colour then matches a 32-bit format under
+     * the "at least this many bits" rule instead of being handed a format the
+     * device would refuse to create.
+     */
+    for (ci = 0; ci < (int)(sizeof(s_colorCandidates) / sizeof(s_colorCandidates[0])); ci++) {
+        D3DFORMAT colorFmt = s_colorCandidates[ci].fmt;
+
+        if (FAILED(IDirect3D9_CheckDeviceType(pD3D, glb.dwAdapter, D3DDEVTYPE_HAL,
+                                              mode.Format, colorFmt, TRUE)))
+            continue;
+
+        probedColor++;
+
+        for (di = 0; di < (int)(sizeof(s_depthCandidates) / sizeof(s_depthCandidates[0])); di++) {
+            D3DFORMAT depthFmt = s_depthCandidates[di].fmt;
+
+            if (depthFmt != D3DFMT_UNKNOWN) {
+                if (FAILED(IDirect3D9_CheckDeviceFormat(pD3D, glb.dwAdapter,
+                        D3DDEVTYPE_HAL, mode.Format, D3DUSAGE_DEPTHSTENCIL,
+                        D3DRTYPE_SURFACE, depthFmt)))
+                    continue;
+
+                /* A depth format the runtime accepts on its own may still be
+                 * unusable with this colour format. */
+                if (FAILED(IDirect3D9_CheckDepthStencilMatch(pD3D, glb.dwAdapter,
+                        D3DDEVTYPE_HAL, mode.Format, colorFmt, depthFmt)))
+                    continue;
+            }
+
+            for (mi = 0; mi < (int)(sizeof(s_msCandidates) / sizeof(s_msCandidates[0])); mi++) {
+                D3DMULTISAMPLE_TYPE msType = s_msCandidates[mi];
+                DWORD  msQualityLevels = 0;
+                DWORD  msQuality = 0;
+                GLD_pf46Entry *e;
+
+                if (s_formatCount >= GLD_PF46_MAX_FORMATS)
+                    break;
+
+                if (msType != D3DMULTISAMPLE_NONE) {
+                    if (FAILED(IDirect3D9_CheckDeviceMultiSampleType(pD3D,
+                            glb.dwAdapter, D3DDEVTYPE_HAL, colorFmt, TRUE,
+                            msType, &msQualityLevels)))
+                        continue;
+
+                    /* The depth buffer has to carry the same sample count or
+                     * the device cannot be created with the pair. */
+                    if (depthFmt != D3DFMT_UNKNOWN &&
+                        FAILED(IDirect3D9_CheckDeviceMultiSampleType(pD3D,
+                            glb.dwAdapter, D3DDEVTYPE_HAL, depthFmt, TRUE,
+                            msType, NULL)))
+                        continue;
+
+                    if (msQualityLevels > 0)
+                        msQuality = msQualityLevels - 1;
+                }
+
+                e = &s_formats[s_formatCount];
+                memset(e, 0, sizeof(*e));
+
+                sInitPFD(&e->pfd,
+                         s_colorCandidates[ci].colorBits,
+                         s_colorCandidates[ci].redBits,
+                         s_colorCandidates[ci].greenBits,
+                         s_colorCandidates[ci].blueBits,
+                         s_colorCandidates[ci].alphaBits,
+                         s_colorCandidates[ci].redShift,
+                         s_colorCandidates[ci].greenShift,
+                         s_colorCandidates[ci].blueShift,
+                         s_colorCandidates[ci].alphaShift,
+                         s_depthCandidates[di].depthBits,
+                         s_depthCandidates[di].stencilBits);
+
+                e->colorFormat = colorFmt;
+                e->depthFormat = depthFmt;
+                e->msType      = msType;
+                e->msQuality   = msQuality;
+                e->samples     = (int)msType;   /* D3DMULTISAMPLE_n_SAMPLES == n */
+
+                if (e->samples > 0)
+                    s_haveMultisample = TRUE;
+
+                s_formatCount++;
+            }
+        }
+    }
+
+    /* A runtime that refused every colour format still has to produce a
+     * usable list; the device creation path logs the real failure. */
+    if (s_formatCount == 0) {
+        gldLogPrintf(GLDLOG_WARN,
+            "gldBuildPixelFormatList46: D3D9 accepted none of the %d probed "
+            "colour formats for windowed presentation", probedColor);
+        return sBuildAssumedList();
+    }
+
+    gldLogPrintf(GLDLOG_INFO,
+        "gldBuildPixelFormatList46: enumerated %d pixel formats "
+        "(multisampled formats: %s)",
+        s_formatCount, s_haveMultisample ? "yes" : "none");
+
+    return s_formatCount;
+}
+
+// ***********************************************************************
+
+BOOL gldGetPixelFormatD3D46(int format, GLD_pf46Entry *out)
+{
+    if (!out)
+        return FALSE;
+
+    if (format < 1 || format > s_formatCount)
+        return FALSE;
+
+    *out = s_formats[format - 1];
+    return TRUE;
+}
+
+// ***********************************************************************
+
+BOOL gldHaveMultisampleFormats46(void)
+{
+    return s_haveMultisample;
 }
 
 // ***********************************************************************
@@ -224,7 +395,7 @@ int gldChoosePixelFormat46(HDC hDC, const PIXELFORMATDESCRIPTOR *ppfd)
     }
 
     for (i = 0; i < s_formatCount; i++) {
-        int score = sMatchScore(ppfd, &s_formats[i]);
+        int score = sMatchScore(ppfd, &s_formats[i].pfd);
         if (score > bestScore) {
             bestScore = score;
             bestIndex = i + 1;  /* 1-based index */
@@ -269,7 +440,7 @@ int gldDescribePixelFormat46(HDC hDC, int format, UINT size,
     }
 
     /* Copy the PFD for the requested format (1-based index) */
-    memcpy(ppfd, &s_formats[format - 1], sizeof(PIXELFORMATDESCRIPTOR));
+    memcpy(ppfd, &s_formats[format - 1].pfd, sizeof(PIXELFORMATDESCRIPTOR));
 
     return s_formatCount;
 }
@@ -369,9 +540,11 @@ typedef enum {
  * Returns FALSE for attributes this backend does not know about; the
  * caller decides whether that is fatal.
  */
-static BOOL sGetAttribValue(const PIXELFORMATDESCRIPTOR *pfd, int attrib,
+static BOOL sGetAttribValue(const GLD_pf46Entry *entry, int attrib,
                             int *value)
 {
+    const PIXELFORMATDESCRIPTOR *pfd = &entry->pfd;
+
     switch (attrib) {
 
     case WGL_NUMBER_PIXEL_FORMATS_ARB:
@@ -472,9 +645,14 @@ static BOOL sGetAttribValue(const PIXELFORMATDESCRIPTOR *pfd, int attrib,
     case WGL_STENCIL_BITS_ARB:  *value = pfd->cStencilBits; return TRUE;
     case WGL_AUX_BUFFERS_ARB:   *value = pfd->cAuxBuffers;  return TRUE;
 
-    /* No multisampled or sRGB-capable formats are enumerated. */
     case WGL_SAMPLE_BUFFERS_ARB:
+        *value = (entry->samples > 0) ? 1 : 0;
+        return TRUE;
     case WGL_SAMPLES_ARB:
+        *value = entry->samples;
+        return TRUE;
+
+    /* No sRGB-capable formats are enumerated. */
     case WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB:
         *value = 0;
         return TRUE;
@@ -543,8 +721,9 @@ static GLD_pf46MatchKind sMatchKind(int attrib)
 static BOOL sIsUnsatisfiable(int attrib, int value)
 {
     switch (attrib) {
-    case WGL_SAMPLE_BUFFERS_ARB:
-    case WGL_SAMPLES_ARB:
+    /* Multisampling is no longer categorically unavailable — the enumerated
+     * list carries whatever sample counts the runtime accepted, so a sample
+     * request is left to ordinary "at least this many" matching. */
     case WGL_ACCUM_BITS_ARB:
     case WGL_ACCUM_RED_BITS_ARB:
     case WGL_ACCUM_GREEN_BITS_ARB:
@@ -577,8 +756,13 @@ static BOOL sIsUnsatisfiable(int attrib, int value)
  * application that only asks for "a window, double buffered" and takes
  * piFormats[0] gets the 32-bit RGBA / D24S8 format.
  */
-static int sFormatQuality(const PIXELFORMATDESCRIPTOR *pfd)
+static int sFormatQuality(const GLD_pf46Entry *entry)
 {
+    const PIXELFORMATDESCRIPTOR *pfd = &entry->pfd;
+
+    /* Sample count is deliberately absent: a multisampled format is only
+     * better when the application asked for one, and letting it win ties
+     * would hand multisampling to callers that never requested it. */
     return pfd->cColorBits + pfd->cAlphaBits +
            pfd->cDepthBits + pfd->cStencilBits;
 }
@@ -591,7 +775,7 @@ static int sFormatQuality(const PIXELFORMATDESCRIPTOR *pfd)
  *
  * Returns -1 when the candidate is rejected.
  */
-static int sScoreARB(const PIXELFORMATDESCRIPTOR *pfd,
+static int sScoreARB(const GLD_pf46Entry *entry,
                      const int *attribs, const int *values, int count,
                      BOOL relaxUnsatisfiable, BOOL relaxSizes)
 {
@@ -608,7 +792,7 @@ static int sScoreARB(const PIXELFORMATDESCRIPTOR *pfd,
         if (relaxUnsatisfiable && sIsUnsatisfiable(attribs[i], values[i]))
             continue;
 
-        if (!sGetAttribValue(pfd, attribs[i], &got)) {
+        if (!sGetAttribValue(entry, attribs[i], &got)) {
             /* Unknown attribute: cannot constrain the choice. */
             continue;
         }
@@ -631,7 +815,7 @@ static int sScoreARB(const PIXELFORMATDESCRIPTOR *pfd,
     }
 
     /* Keep the request score dominant over the tie-break. */
-    return score * 1000 + sFormatQuality(pfd);
+    return score * 1000 + sFormatQuality(entry);
 }
 
 /*
@@ -777,7 +961,7 @@ BOOL gldGetPixelFormatAttribivARB46(HDC hDC, int iPixelFormat, int iLayerPlane,
                                     UINT nAttributes, const int *piAttributes,
                                     int *piValues)
 {
-    const PIXELFORMATDESCRIPTOR *pfd;
+    const GLD_pf46Entry *entry;
     UINT i;
 
     (void)hDC;
@@ -804,8 +988,8 @@ BOOL gldGetPixelFormatAttribivARB46(HDC hDC, int iPixelFormat, int iLayerPlane,
      * format index, so resolve the descriptor leniently and only reject
      * an out-of-range index when a real format attribute is asked for.
      */
-    pfd = (iPixelFormat >= 1 && iPixelFormat <= s_formatCount) ?
-          &s_formats[iPixelFormat - 1] : NULL;
+    entry = (iPixelFormat >= 1 && iPixelFormat <= s_formatCount) ?
+            &s_formats[iPixelFormat - 1] : NULL;
 
     for (i = 0; i < nAttributes; i++) {
         int value = 0;
@@ -815,14 +999,14 @@ BOOL gldGetPixelFormatAttribivARB46(HDC hDC, int iPixelFormat, int iLayerPlane,
             continue;
         }
 
-        if (!pfd) {
+        if (!entry) {
             gldLogPrintf(GLDLOG_WARN,
                 "wglGetPixelFormatAttribivARB: format %d out of range [1, %d]",
                 iPixelFormat, s_formatCount);
             return FALSE;
         }
 
-        if (!sGetAttribValue(pfd, piAttributes[i], &value)) {
+        if (!sGetAttribValue(entry, piAttributes[i], &value)) {
             /*
              * An unknown attribute describes a capability this backend
              * does not have.  Reporting zero answers the question

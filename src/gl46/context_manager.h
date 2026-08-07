@@ -90,6 +90,33 @@ void gldBuildPresentParams46(HWND hWnd, D3DPRESENT_PARAMETERS *out);
 void gldApplyDefaultDeviceState46(IDirect3DDevice9 *pDev);
 
 /*
+ * WGL_EXT_swap_control.
+ *
+ * The interval the application asks for through wglSwapIntervalEXT.  It seeds
+ * from the INI's bWaitForRetrace and an explicit call then overrides it, since
+ * the application is stating what it wants frame by frame.
+ *
+ * D3D9 can only change a presentation interval through a device Reset, so a new
+ * value is recorded here and gldSwapBuffers_GL46 applies it after the next
+ * Present.  gldSwapIntervalNeedsReset46() reports whether the live device was
+ * built with a different interval than the current request.
+ *
+ * gldSetSwapInterval46 returns FALSE for values this backend will not honour
+ * (negative intervals need WGL_EXT_swap_control_tear, which is not advertised).
+ */
+BOOL gldSetSwapInterval46(int interval);
+int  gldGetSwapInterval46(void);
+BOOL gldSwapIntervalNeedsReset46(void);
+
+/*
+ * Record that a device was successfully created or Reset with the parameters
+ * gldBuildPresentParams46() last produced, so the requested interval and the
+ * one the live device carries agree again.  Call it only after the call that
+ * carried them actually succeeded.
+ */
+void gldNoteSwapIntervalApplied46(void);
+
+/*
  * Create a D3D9 device for the GL46 context.
  *
  * Parameters:

@@ -192,7 +192,9 @@ static char g_szGLDExtensions[]	=
 "GL_EXT_fog_coord "
 "GL_EXT_secondary_color "
 "GL_EXT_gpu_shader4 "
-"GL_EXT_swap_control "
+/* Swap control is WGL_EXT_swap_control, a WGL extension; it is advertised
+ * through wglGetExtensionsStringARB/EXT, not here. There is no such GL
+ * extension for glGetString(GL_EXTENSIONS) to name. */
 "GL_NV_blend_square "
 "GL_NV_texture_env_combine4 "
 "GL_SGIS_generate_mipmap "

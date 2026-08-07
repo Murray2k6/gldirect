@@ -41,14 +41,33 @@
 #define __GL46_PIXEL_FORMAT_PROVIDER_H
 
 #include <windows.h>
+#include <d3d9.h>
 
 /*---------------------- Macros and type definitions ----------------------*/
 
 /*
  * Maximum number of pixel formats we enumerate.
- * 2 color depths * 2 depth sizes * 2 stencil sizes = 8 formats.
+ *
+ * The list is the cross product of the colour formats the loaded d3d9.dll
+ * will present windowed, the depth-stencil formats it will pair with each of
+ * them, and the multisample types it accepts for that pair.  On a stock
+ * runtime that is roughly 1 colour x 5 depth-stencil x 4 sample counts; the
+ * ceiling leaves room for a runtime that exposes more.
  */
-#define GLD_PF46_MAX_FORMATS    8
+#define GLD_PF46_MAX_FORMATS    64
+
+/*
+ * One enumerated pixel format: what the application is told, and the D3D9
+ * surface configuration that has to be created to make it true.
+ */
+typedef struct {
+    PIXELFORMATDESCRIPTOR   pfd;
+    D3DFORMAT               colorFormat;
+    D3DFORMAT               depthFormat;    /* D3DFMT_UNKNOWN = no depth buffer */
+    D3DMULTISAMPLE_TYPE     msType;
+    DWORD                   msQuality;
+    int                     samples;        /* WGL_SAMPLES_ARB, 0 = none */
+} GLD_pf46Entry;
 
 /*------------------------- Function Prototypes ---------------------------*/
 
@@ -112,6 +131,21 @@ int gldDescribePixelFormat46(HDC hDC, int format, UINT size,
  *   The number of pixel formats available.
  */
 int gldGetPixelFormatCount46(void);
+
+/*
+ * Fetch the D3D9 configuration behind a 1-based pixel format index, so device
+ * creation can build a swap chain that provides the colour, depth-stencil and
+ * sample count the format advertised.
+ *
+ * Returns FALSE when the index is out of range, leaving *out untouched.
+ */
+BOOL gldGetPixelFormatD3D46(int format, GLD_pf46Entry *out);
+
+/*
+ * TRUE when the enumeration found at least one multisampled format, which is
+ * what makes advertising WGL_ARB_multisample truthful.
+ */
+BOOL gldHaveMultisampleFormats46(void);
 
 /*
  * WGL_ARB_pixel_format / WGL_EXT_pixel_format implementation.

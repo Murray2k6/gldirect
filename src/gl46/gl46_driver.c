@@ -338,8 +338,35 @@ BOOL gldSwapBuffers_GL46(
 				if (FAILED(hr))
 					gldLogPrintf(GLDLOG_ERROR,
 						"GL46: device-lost Reset failed (0x%08X)", hr);
-				else
+				else {
+					gldNoteSwapIntervalApplied46();
 					bWasReset = TRUE;
+				}
+			}
+		} else if (gldSwapIntervalNeedsReset46()) {
+			// wglSwapIntervalEXT asked for a different presentation interval.
+			// D3D9 only changes one through a Reset, and the frame the
+			// application just presented is already on screen, so this is the
+			// one point in the frame where that costs nothing.
+			D3DPRESENT_PARAMETERS d3dpp;
+			HWND hResetWnd = hWnd ? hWnd : (ctx ? ctx->hWnd : NULL);
+			HRESULT hrInterval;
+
+			gldBuildPresentParams46(hResetWnd, &d3dpp);
+
+			gldDiagLog("GL46: swap-interval Reset hWnd=%p interval=%d",
+				(void*)hResetWnd, gldGetSwapInterval46());
+
+			_glsReleaseDeviceLosableResources(pDev);
+
+			hrInterval = IDirect3DDevice9_Reset(pDev, &d3dpp);
+			if (FAILED(hrInterval))
+				gldLogPrintf(GLDLOG_ERROR,
+					"GL46: swap-interval Reset failed (0x%08X) — "
+					"continuing at the previous interval", hrInterval);
+			else {
+				gldNoteSwapIntervalApplied46();
+				bWasReset = TRUE;
 			}
 		}
 
@@ -371,16 +398,30 @@ BOOL gldSwapBuffers_GL46(
 #define GLD_WGL_EXTENSIONS \
 	"WGL_ARB_create_context WGL_ARB_create_context_profile " \
 	"WGL_ARB_extensions_string WGL_EXT_extensions_string " \
-	"WGL_ARB_pixel_format WGL_EXT_pixel_format"
+	"WGL_ARB_pixel_format WGL_EXT_pixel_format " \
+	"WGL_EXT_swap_control"
+
+/*
+ * WGL_ARB_multisample is only true when the enumeration actually found
+ * multisampled formats, which depends on what the loaded d3d9.dll accepts.
+ * Advertising it unconditionally would invite an application to request
+ * samples this backend has no format for.
+ */
+static const char *_gldWglExtensionString(void)
+{
+	return gldHaveMultisampleFormats46() ?
+	       GLD_WGL_EXTENSIONS " WGL_ARB_multisample" :
+	       GLD_WGL_EXTENSIONS;
+}
 
 static const char *WINAPI _wglGetExtensionsStringARB(HDC hDC)
 {
-	return GLD_WGL_EXTENSIONS;
+	return _gldWglExtensionString();
 }
 
 static const char *WINAPI _wglGetExtensionsStringEXT(void)
 {
-	return GLD_WGL_EXTENSIONS;
+	return _gldWglExtensionString();
 }
 
 /*
@@ -542,6 +583,27 @@ static HGLRC WINAPI _wglCreateContextAttribsARB(HDC hDC, HGLRC hShareContext, co
 	return hglrc;
 }
 
+/*
+ * WGL_EXT_swap_control. The interval is recorded here and takes effect on the
+ * next present, because D3D9 can only change a presentation interval through a
+ * device Reset.
+ */
+
+static BOOL WINAPI _wglSwapIntervalEXT(int interval)
+{
+	extern BOOL gldValidate(void);
+
+	if (!gldValidate())
+		return FALSE;
+
+	return gldSetSwapInterval46(interval);
+}
+
+static int WINAPI _wglGetSwapIntervalEXT(void)
+{
+	return gldGetSwapInterval46();
+}
+
 // Lookup table for extension functions
 typedef struct {
 	const char *name;
@@ -558,6 +620,8 @@ static const GLD_procEntry gl46ProcTable[] = {
 	{ "wglGetPixelFormatAttribivEXT",  (PROC)_wglGetPixelFormatAttribivARB },
 	{ "wglGetPixelFormatAttribfvARB",  (PROC)_wglGetPixelFormatAttribfvARB },
 	{ "wglGetPixelFormatAttribfvEXT",  (PROC)_wglGetPixelFormatAttribfvARB },
+	{ "wglSwapIntervalEXT",            (PROC)_wglSwapIntervalEXT },
+	{ "wglGetSwapIntervalEXT",         (PROC)_wglGetSwapIntervalEXT },
 	{ NULL, NULL }
 };
 

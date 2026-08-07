@@ -105,6 +105,8 @@ typedef BOOL  (WINAPI *PFN_CHOOSE_PIXEL_FORMAT_ARB)(HDC, const int *,
                                                     int *, UINT *);
 typedef BOOL  (WINAPI *PFN_GET_PIXEL_FORMAT_ATTRIB_IV_ARB)(HDC, int, int, UINT,
                                                            const int *, int *);
+typedef BOOL  (WINAPI *PFN_SWAP_INTERVAL_EXT)(int);
+typedef int   (WINAPI *PFN_GET_SWAP_INTERVAL_EXT)(void);
 
 /* WGL_ARB_pixel_format */
 #define WGL_NUMBER_PIXEL_FORMATS_ARB 0x2000
@@ -371,8 +373,50 @@ int main(int argc, char **argv)
         if (!choosePixelFormatARB(dc, multisampleAttributes, NULL, 8,
                                   arbFormats, &formatCount) ||
             formatCount == 0 || arbFormats[0] <= 0) {
-            fprintf(stderr, "wglChoosePixelFormatARB failed to degrade an "
-                            "unsupported multisample request\n");
+            fprintf(stderr, "wglChoosePixelFormatARB failed to satisfy a "
+                            "multisample request\n");
+            goto cleanup;
+        }
+    }
+
+    /*
+     * WGL_EXT_swap_control. id Tech titles drive r_swapInterval through this
+     * every time the setting changes.
+     */
+    {
+        PFN_GET_EXTENSIONS_STRING_ARB getExtensionsStringARB =
+            (PFN_GET_EXTENSIONS_STRING_ARB)getProcAddress("wglGetExtensionsStringARB");
+        PFN_SWAP_INTERVAL_EXT swapIntervalEXT =
+            (PFN_SWAP_INTERVAL_EXT)getProcAddress("wglSwapIntervalEXT");
+        PFN_GET_SWAP_INTERVAL_EXT getSwapIntervalEXT =
+            (PFN_GET_SWAP_INTERVAL_EXT)getProcAddress("wglGetSwapIntervalEXT");
+        const char *wglExtensions = getExtensionsStringARB ?
+                                    getExtensionsStringARB(dc) : NULL;
+
+        if (!wglExtensions || !strstr(wglExtensions, "WGL_EXT_swap_control")) {
+            fprintf(stderr, "WGL_EXT_swap_control is not advertised\n");
+            goto cleanup;
+        }
+        if (!swapIntervalEXT || !getSwapIntervalEXT) {
+            fprintf(stderr, "WGL_EXT_swap_control entry points did not resolve\n");
+            goto cleanup;
+        }
+        if (!swapIntervalEXT(1) || getSwapIntervalEXT() != 1) {
+            fprintf(stderr, "wglSwapIntervalEXT(1) did not take: reported %d\n",
+                    getSwapIntervalEXT());
+            goto cleanup;
+        }
+        if (!swapIntervalEXT(0) || getSwapIntervalEXT() != 0) {
+            fprintf(stderr, "wglSwapIntervalEXT(0) did not take: reported %d\n",
+                    getSwapIntervalEXT());
+            goto cleanup;
+        }
+        /* Adaptive vsync needs WGL_EXT_swap_control_tear, which is not
+         * advertised, so a negative interval must be refused rather than
+         * silently accepted. */
+        if (swapIntervalEXT(-1)) {
+            fprintf(stderr, "wglSwapIntervalEXT(-1) was accepted without "
+                            "WGL_EXT_swap_control_tear\n");
             goto cleanup;
         }
     }

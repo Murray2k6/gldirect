@@ -47,6 +47,11 @@
 #include "gld_diag.h"
 #include "gl_impl.h"
 #include "glsl_to_hlsl.h"
+#include "pixel_format_provider.h"
+
+/* The wrapper's currently selected pixel format, owned by gld_wgl.c, which
+ * publishes it through this one accessor and no header. */
+extern int gldGetPixelFormat(void);
 
 // ***********************************************************************
 // D3D9 globals for the GL46 backend
@@ -121,6 +126,17 @@ static GLD_gl46_dx9_globals gl46Globals;
 // initialised and has no destroy call, so there is no teardown ordering to get
 // wrong and no deleted-lock window during module eviction.
 static SRWLOCK g_deviceLock = SRWLOCK_INIT;
+
+// WGL_EXT_swap_control state.
+//
+// s_swapInterval is what the application last asked for, -1 until the first
+// query seeds it from the INI's bWaitForRetrace.  s_deviceSwapInterval is the
+// interval the live device was actually built with, -1 while no device exists,
+// and the two differing is what tells SwapBuffers a Reset is owed.  A plain int
+// read/write is atomic on both targets, and the worst a racing writer can cost
+// is one frame presented at the previous interval.
+static int s_swapInterval       = -1;
+static int s_deviceSwapInterval = -1;
 
 // ***********************************************************************
 // Initialize the D3D9 layer for the GL46 backend.
@@ -322,9 +338,34 @@ void gldBuildPresentParams46(HWND hWnd, D3DPRESENT_PARAMETERS *out)
     out->BackBufferFormat       = d3ddm.Format;
     out->BackBufferCount        = 1;
     out->EnableAutoDepthStencil = FALSE;
-    /* AutoDepthStencilFormat not needed — presentation only */
     out->hDeviceWindow          = hWnd;
     out->PresentationInterval   = D3DPRESENT_INTERVAL_DEFAULT;
+
+    /*
+     * Honour the pixel format the application selected.
+     *
+     * Without this the device was always created with EnableAutoDepthStencil
+     * FALSE and no depth-stencil surface anywhere, so a format that promised
+     * 24-bit depth and 8-bit stencil delivered neither: glEnable(GL_DEPTH_TEST)
+     * turned on D3DRS_ZENABLE against a device with nothing to test against,
+     * and stencil work had no buffer at all.  The format list is probed
+     * against the loaded d3d9.dll, so whatever it names here is a combination
+     * that runtime already said it would accept.
+     */
+    {
+        GLD_pf46Entry entry;
+
+        if (gldGetPixelFormatD3D46(gldGetPixelFormat(), &entry)) {
+            out->BackBufferFormat  = entry.colorFormat;
+            out->MultiSampleType   = entry.msType;
+            out->MultiSampleQuality = entry.msQuality;
+
+            if (entry.depthFormat != D3DFMT_UNKNOWN) {
+                out->EnableAutoDepthStencil = TRUE;
+                out->AutoDepthStencilFormat = entry.depthFormat;
+            }
+        }
+    }
 
     if (hWnd && GetClientRect(hWnd, &rc) && rc.right > 0 && rc.bottom > 0) {
         out->BackBufferWidth  = rc.right;
@@ -334,13 +375,92 @@ void gldBuildPresentParams46(HWND hWnd, D3DPRESENT_PARAMETERS *out)
         out->BackBufferHeight = d3ddm.Height;
     }
 
-    if (!glb.bWaitForRetrace) {
+    /*
+     * Presentation interval, from whatever the application last asked
+     * wglSwapIntervalEXT for.  This backend always presents windowed, and
+     * D3D9 accepts only DEFAULT, ONE and IMMEDIATE there, so an interval of
+     * 2 or more becomes ONE rather than being refused.
+     */
+    {
+        int   interval = gldGetSwapInterval46();
+        DWORD wanted   = (interval <= 0) ? D3DPRESENT_INTERVAL_IMMEDIATE
+                                         : D3DPRESENT_INTERVAL_ONE;
+
         ZeroMemory(&d3dCaps, sizeof(d3dCaps));
         if (SUCCEEDED(IDirect3D9_GetDeviceCaps(gl46Globals.pD3D, glb.dwAdapter,
                                                D3DDEVTYPE_HAL, &d3dCaps)) &&
-            (d3dCaps.PresentationIntervals & D3DPRESENT_INTERVAL_IMMEDIATE))
-            out->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+            (d3dCaps.PresentationIntervals & wanted))
+            out->PresentationInterval = wanted;
+        else if (wanted == D3DPRESENT_INTERVAL_ONE)
+            out->PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
     }
+}
+
+// ***********************************************************************
+// WGL_EXT_swap_control
+// ***********************************************************************
+
+BOOL gldSetSwapInterval46(int interval)
+{
+    /*
+     * A negative interval means adaptive vsync, which belongs to
+     * WGL_EXT_swap_control_tear.  That extension is not advertised, so the
+     * spec's answer is to refuse the value rather than silently clamp it.
+     */
+    if (interval < 0) {
+        gldLogPrintf(GLDLOG_WARN,
+            "wglSwapIntervalEXT: interval %d needs WGL_EXT_swap_control_tear",
+            interval);
+        return FALSE;
+    }
+
+    if (interval != s_swapInterval) {
+        gldLogPrintf(GLDLOG_SYSTEM,
+            "wglSwapIntervalEXT: swap interval %d -> %d (applied at the next present)",
+            s_swapInterval, interval);
+        s_swapInterval = interval;
+    }
+
+    return TRUE;
+}
+
+// ***********************************************************************
+
+int gldGetSwapInterval46(void)
+{
+    /*
+     * Until the application says otherwise the INI's bWaitForRetrace decides,
+     * which keeps the setting meaningful for titles that never call
+     * wglSwapIntervalEXT at all.
+     */
+    if (s_swapInterval < 0)
+        s_swapInterval = glb.bWaitForRetrace ? 1 : 0;
+
+    return s_swapInterval;
+}
+
+// ***********************************************************************
+
+BOOL gldSwapIntervalNeedsReset46(void)
+{
+    /* Before the first device is built there is nothing to reset. */
+    if (s_deviceSwapInterval < 0)
+        return FALSE;
+
+    return (gldGetSwapInterval46() != s_deviceSwapInterval);
+}
+
+// ***********************************************************************
+
+void gldNoteSwapIntervalApplied46(void)
+{
+    /*
+     * Called only where a device was actually created or Reset with the
+     * parameters gldBuildPresentParams46() produced.  Recording it there
+     * instead would claim the interval had changed even when the Reset that
+     * was meant to carry it failed, and the retry would never happen.
+     */
+    s_deviceSwapInterval = gldGetSwapInterval46();
 }
 
 // ***********************************************************************
@@ -469,6 +589,8 @@ HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor)
                 "GL46: Reset on context reuse failed (0x%08X)", hrReset);
             gldDiagLog("GL46: Reset on context reuse failed (0x%08X)",
                        (unsigned)hrReset);
+        } else {
+            gldNoteSwapIntervalApplied46();
         }
 
         __try {
@@ -541,6 +663,10 @@ HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor)
         gldLogPrintf(GLDLOG_ERROR, "GL46: CreateDevice failed (0x%08X)", hr);
         return NULL;
     }
+
+    // The device now carries the presentation interval those parameters asked
+    // for, so a later wglSwapIntervalEXT can tell whether it changed anything.
+    gldNoteSwapIntervalApplied46();
 
     {
         UINT available = IDirect3DDevice9_GetAvailableTextureMem(pDev);
@@ -682,7 +808,25 @@ BOOL _gldEnsureDevice(HWND hWnd)
     d3dpp.BackBufferCount         = 1;
     d3dpp.EnableAutoDepthStencil  = FALSE;
     d3dpp.hDeviceWindow           = hWnd;
-    d3dpp.PresentationInterval    = D3DPRESENT_INTERVAL_IMMEDIATE;
+    d3dpp.PresentationInterval    = D3DPRESENT_INTERVAL_DEFAULT;
+
+    /* Same pixel-format plumbing as gldBuildPresentParams46(); see the note
+     * there for why a device without a depth-stencil surface silently broke
+     * every format that advertised depth or stencil bits. */
+    {
+        GLD_pf46Entry entry;
+
+        if (gldGetPixelFormatD3D46(gldGetPixelFormat(), &entry)) {
+            d3dpp.BackBufferFormat    = entry.colorFormat;
+            d3dpp.MultiSampleType     = entry.msType;
+            d3dpp.MultiSampleQuality  = entry.msQuality;
+
+            if (entry.depthFormat != D3DFMT_UNKNOWN) {
+                d3dpp.EnableAutoDepthStencil = TRUE;
+                d3dpp.AutoDepthStencilFormat = entry.depthFormat;
+            }
+        }
+    }
     {
         RECT rc;
         if (hWnd && GetClientRect(hWnd, &rc) && rc.right > 0 && rc.bottom > 0) {
@@ -694,9 +838,16 @@ BOOL _gldEnsureDevice(HWND hWnd)
         }
     }
 
-    if (!glb.bWaitForRetrace) {
-        if (d3dCaps.PresentationIntervals & D3DPRESENT_INTERVAL_IMMEDIATE)
-            d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    /* Same presentation-interval policy as gldBuildPresentParams46(), which
+     * this path cannot call because it runs before gl46Globals.pD3D is
+     * published and would be handed a zeroed parameter block. */
+    {
+        int   interval = gldGetSwapInterval46();
+        DWORD wanted   = (interval <= 0) ? D3DPRESENT_INTERVAL_IMMEDIATE
+                                         : D3DPRESENT_INTERVAL_ONE;
+
+        if (d3dCaps.PresentationIntervals & wanted)
+            d3dpp.PresentationInterval = wanted;
     }
 
     // Always multithreaded + vertex processing
@@ -726,6 +877,8 @@ BOOL _gldEnsureDevice(HWND hWnd)
         ReleaseSRWLockExclusive(&g_deviceLock);
         return FALSE;
     }
+
+    gldNoteSwapIntervalApplied46();
 
     {
         UINT available = IDirect3DDevice9_GetAvailableTextureMem(pDev);

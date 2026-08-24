@@ -36,6 +36,7 @@
 #include <string.h>
 
 #include "gld_diag.h"
+#include "gld_profile.h"
 
 /* SRWLOCK_INIT needs no initialisation call and has no destroy call, so unlike
  * a CRITICAL_SECTION it cannot be used after deletion - there is nothing to
@@ -102,6 +103,31 @@ static int gldDiagVerboseResolved(void)
         }
     }
     return g_diagVerbose;
+}
+
+/*
+ * Public check for the verbose flag.  Cheap, and safe from any thread: the
+ * resolution is guarded by the same lock every writer uses, and the resolved
+ * value is cached in the single shared state, so repeated calls after the
+ * first cost nothing.  Lets a call site gate a large dump (a whole shader
+ * source listing, say) on exactly the same flag gldDiagLogV uses.
+ */
+int gldDiagVerboseGet(void)
+{
+    int verbose;
+
+    if (InterlockedCompareExchange(&g_diagShutdown, 0, 0) != 0)
+        return 0;
+
+    if (!gldDiagEnter())
+        return 0;
+
+    __try {
+        verbose = gldDiagVerboseResolved();
+    } __finally {
+        gldDiagLeave();
+    }
+    return verbose;
 }
 
 /* Callers hold the lock. */
@@ -272,4 +298,63 @@ void gldDiagLogV(const char *fmt, ...)
     } __finally {
         gldDiagLeave();
     }
+}
+
+/* ------------------------------------------------------------------
+ * One-time fault flags.
+ *
+ * A fault flag is the wrapper saying "a game did something this layer
+ * knows how to call wrong, or asked for something it does not implement".
+ * Every flag is written at most once per (category, key) pair for the
+ * whole process, so a broken call repeated once per frame leaves exactly
+ * one line in the log instead of a log that is one line repeated.  The
+ * category names the subsystem; the key names the call or the value.
+ * ------------------------------------------------------------------ */
+
+#define GLD_FAULT_FLAG_SLOTS 256
+
+static ULONG g_faultFlags[GLD_FAULT_FLAG_SLOTS];
+
+/* FNV-1a, good enough to spread fault keys over the slot table. */
+static ULONG gldFlagHash(const char *s)
+{
+    ULONG h = 2166136261u;
+
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+void gldFlagFault(const char *category, const char *key)
+{
+    char line[384];
+    ULONG h;
+    ULONG slot;
+    ULONG prev;
+    size_t n;
+
+    if (!category || !key)
+        return;
+
+    h = gldFlagHash(category);
+    h ^= gldFlagHash(key) + 0x9E3779B9u + (h << 6) + (h >> 2);
+    slot = h % GLD_FAULT_FLAG_SLOTS;
+
+    /* Claim the slot only if it is empty.  If another thread flagged the
+     * same pair first, this one stays silent.  A collision with a different
+     * pair is allowed to write its line anyway: one extra line is noise, but
+     * a suppressed flag is the crash that comes back as a silent exit. */
+    prev = (ULONG)InterlockedCompareExchange(
+               (volatile LONG *)&g_faultFlags[slot], (LONG)h, 0);
+    if (prev == h)
+        return;
+
+    n = _snprintf(line, sizeof(line), "FAULT FLAG [%s] %s", category, key);
+    if (n >= sizeof(line))
+        _snprintf(line, sizeof(line), "FAULT FLAG [%s] %s",
+                  category, "(key truncated)");
+    gldDiagLog("%s", line);
+    gldProfileMessage(line);
 }

@@ -46,19 +46,9 @@ GLS_MatrixStack* glsGetCurrentMatrixStack(void)
 {
     GLS_State *s = &g_glState;
     switch (s->matrixMode) {
-    case 0x1701: /* GL_MODELVIEW */  return &s->modelviewStack;
-    case 0x1702: /* GL_PROJECTION */ return &s->projectionStack;
-    case 0x1702 + 0x100: /* GL_TEXTURE (0x1702) - actually 0x1702 is projection */
-    default:
-        break;
-    }
-    /* GL_TEXTURE = 0x1702? No, GL_TEXTURE = 0x1702 is wrong. Let me use correct values */
-    /* GL_MODELVIEW = 0x1700, GL_PROJECTION = 0x1701, GL_TEXTURE = 0x1702 */
-    /* Correction: */
-    switch (s->matrixMode) {
-    case 0x1700: return &s->modelviewStack;
-    case 0x1701: return &s->projectionStack;
-    case 0x1702: {
+    case 0x1700: /* GL_MODELVIEW */  return &s->modelviewStack;
+    case 0x1701: /* GL_PROJECTION */ return &s->projectionStack;
+    case 0x1702: { /* GL_TEXTURE */
         int unit = (s->activeTexUnit >= 0x84C0) ? (s->activeTexUnit - 0x84C0) : 0;
         if (unit < 0 || unit >= GLS_MAX_TEX_UNITS) unit = 0;
         return &s->textureStack[unit];

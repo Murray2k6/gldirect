@@ -33,6 +33,7 @@
 *********************************************************************************/
 
 #include "swap_chain.h"
+#include "context_manager.h"
 #include "error_handler.h"
 #include "gld_log.h"
 
@@ -40,7 +41,8 @@
 
 BOOL gldSwapBuffers46(HDC hDC)
 {
-    BOOL result;
+    IDirect3DDevice9 *pDev;
+    HWND hWnd;
 
     if (!hDC) {
         gldLogPrintf(GLDLOG_ERROR,
@@ -48,15 +50,34 @@ BOOL gldSwapBuffers46(HDC hDC)
         return FALSE;
     }
 
-    result = SwapBuffers(hDC);
-
-    if (!result) {
-        gldLogPrintf(GLDLOG_ERROR,
-            "gldSwapBuffers46: SwapBuffers failed (error %lu)",
-            GetLastError());
+    pDev = gldGetD3DDevice46();
+    if (!pDev) {
+        static BOOL logged = FALSE;
+        if (!logged) {
+            logged = TRUE;
+            gldLogPrintf(GLDLOG_WARN,
+                "gldSwapBuffers46: no D3D9 device, falling back to GDI SwapBuffers");
+        }
+        return SwapBuffers(hDC);
     }
 
-    return result;
+    hWnd = WindowFromDC(hDC);
+    {
+        HRESULT hr;
+
+        /* EndScene may fail with D3DERR_INVALIDCALL if no scene is active;
+         * that is normal and not an error. */
+        (void)IDirect3DDevice9_EndScene(pDev);
+
+        hr = IDirect3DDevice9_Present(pDev, NULL, NULL, hWnd ? hWnd : NULL, NULL);
+        if (FAILED(hr)) {
+            gldLogPrintf(GLDLOG_ERROR,
+                "gldSwapBuffers46: D3D9 Present failed (0x%08lX)",
+                (unsigned long)hr);
+            return FALSE;
+        }
+        return TRUE;
+    }
 }
 
 // ***********************************************************************

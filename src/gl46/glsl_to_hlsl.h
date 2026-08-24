@@ -71,6 +71,19 @@ void glslSetDeviceCaps(const D3DCAPS9 *pCaps);
 BOOL glslTranspileAndCompile(int shaderType, const char *glslSource,
     void **ppBytecode, DWORD *pBytecodeSize);
 
+/* Program-specific vertex attribute bindings.  OpenGL applies
+ * glBindAttribLocation before link; D3D9 instead bakes input semantics into
+ * the compiled vertex shader, so the linker must pass those bindings into
+ * the transpiler. */
+typedef struct {
+    const char *name;
+    int         location;
+} glslAttributeBinding;
+
+BOOL glslTranspileAndCompileBound(int shaderType, const char *glslSource,
+    const glslAttributeBinding *bindings, int bindingCount,
+    void **ppBytecode, DWORD *pBytecodeSize);
+
 /* Create D3D9 vertex/pixel shader from compiled bytecode */
 BOOL glslCreateVertexShader(IDirect3DDevice9 *pDev, const void *bytecode, DWORD size,
     IDirect3DVertexShader9 **ppShader);

@@ -8,7 +8,7 @@
 *  Inputs: tools/glmap.json, tools/gl_stub_classification.py,
 *          tools/gl_dsa_mapping.py.  See tools/glmap.README.
 *
-*  822 entry points: 487 core names plus 335 extension aliases, every one with the
+*  823 entry points: 487 core names plus 336 extension aliases, every one with the
 *  exact parameter list the Khronos registry gives it.  Before this file existed
 *  gldGetProcAddress_GL46 answered these names with a no-op whose argument count
 *  was guessed from the name, which corrupts the stack on x86 __stdcall whenever
@@ -4421,6 +4421,12 @@ static void APIENTRY _gen_glGetPointerv(GLenum pname, void **params)
     _glsGetPointerv((unsigned int)pname, (void **)params);
 }
 
+static GLboolean APIENTRY _gen_glIsTexture(GLuint texture)
+{
+    (void)texture;
+    return (GLboolean)_glsIsTexture((unsigned int)texture) ? GL_TRUE : GL_FALSE;
+}
+
 static void APIENTRY _gen_glTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const void *pixels)
 {
     (void)target; (void)level; (void)xoffset; (void)width; (void)format; (void)type; (void)pixels;
@@ -4743,6 +4749,7 @@ static const GLD_modernProcEntry g_generatedGL[] = {
     { "glIsQueryARB",                                  (PROC)_gen_glIsQuery },
     { "glIsSampler",                                   (PROC)_gen_glIsSampler },
     { "glIsSync",                                      (PROC)_gen_glIsSync },
+    { "glIsTextureEXT",                                (PROC)_gen_glIsTexture },
     { "glIsTransformFeedback",                         (PROC)_gen_glIsTransformFeedback },
     { "glIsTransformFeedbackNV",                       (PROC)_gen_glIsTransformFeedback },
     { "glIsVertexArrayAPPLE",                          (PROC)_stub_glIsVertexArray },

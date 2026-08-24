@@ -438,6 +438,17 @@
     <ClCompile Include="src\gld_wgl.c" />
     <ClCompile Include="src\gld_crash.c" />
     <ClCompile Include="src\gld_diag.c" />
+    <ClCompile Include="src\gld_profile.cpp">
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\tracy_client.cpp">
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="src\mesa_proxy.c" />
     <ClCompile Include="src\gl_mesa_forward.c" />
     <ClCompile Include="src\gl_ext_dsa.c" />
@@ -466,6 +477,7 @@
     <ClCompile Include="src\gl46\gl_dx9_compat.c" />
     <ClCompile Include="src\gl46\glsl_to_hlsl.c" />
     <ClCompile Include="src\gl46\arb_asm_translator.c" />
+    <ClCompile Include="src\gl46\semantic_overlay.c" />
     <ClCompile Include="src\gl46\gl_legacy_impl.c" />
     <!-- Mesa source files — Mesa provides the OpenGL state machine, D3D9 is the renderer -->
     <ClCompile Include="mesa\src\mesa\array_cache\ac_context.c" />
@@ -557,6 +569,8 @@
     <ClInclude Include="src\gld_macros.h" />
     <ClInclude Include="src\gld_pf.h" />
     <ClInclude Include="src\gld_wgl.h" />
+    <ClInclude Include="src\gld_profile.h" />
+    <ClInclude Include="src\gld_tracy_config.h" />
     <ClInclude Include="src\glu.h" />
     <ClInclude Include="src\gl46\error_handler.h" />
     <ClInclude Include="src\gl46\context_manager.h" />
@@ -582,6 +596,7 @@
     <ClInclude Include="src\gl46\gl_dx9_compat.h" />
     <ClInclude Include="src\gl46\glsl_to_hlsl.h" />
     <ClInclude Include="src\gl46\arb_asm_translator.h" />
+    <ClInclude Include="src\gl46\semantic_overlay.h" />
     <ClInclude Include="src\mesa_compat.h" />
     <ClInclude Include="src\mesa_proxy.h" />
     <ClInclude Include="src\dll_main.h" />

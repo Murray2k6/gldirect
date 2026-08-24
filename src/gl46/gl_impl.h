@@ -342,6 +342,8 @@ void _glsGetCompressedTexImage(unsigned int target, int level, void *img);
 void _glsGetTexImage(unsigned int target, int level, unsigned int format, unsigned int type, void *pixels);
 void _glsGetTexLevelParameteriv(unsigned int target, int level, unsigned int pname, int *params);
 void _glsGetTexParameteriv(unsigned int target, unsigned int pname, int *params);
+void _glsGetTexLevelParameterfv(unsigned int target, int level, unsigned int pname, float *params);
+void _glsGetTexParameterfv(unsigned int target, unsigned int pname, float *params);
 unsigned char _glsAreTexturesResident(int n, const unsigned int *textures, unsigned char *residences);
 void _glsCopyTexSubImage3D(unsigned int target, int level, int xoffset, int yoffset, int zoffset, int x, int y, int width, int height);
 void _glsDrawRangeElements(unsigned int mode, unsigned int start, unsigned int end, int count, unsigned int type, const void *indices);
@@ -436,6 +438,17 @@ void _glsLightfv(unsigned int light, unsigned int pname, const float *params);
 void _glsLightModelf(unsigned int pname, float param);
 void _glsLightModelfv(unsigned int pname, const float *params);
 
+/* ===== Sampler-state helpers =====
+ *
+ * Drive SetSamplerState through the same GL->D3D9 min/mag/mip/wrap mapping the
+ * rest of the wrapper uses.  Shared with the semantic overlay so narration can
+ * publish per-stage sampler state for Remix without duplicating the mapping.
+ */
+void _glsApplySamplerObjectToD3D(unsigned int unit, const GLS_Sampler *samp);
+void _glsApplyTextureObjectSamplingToD3D(unsigned int unit, const GLS_Texture *tex);
+void _glsApplyTextureLevelRangeToD3D(unsigned int unit, const GLS_Texture *tex);
+IDirect3DTexture9 *_glsGetSingleLevelTexture(GLS_Texture *tex);
+
 /* ===== Material functions ===== */
 void _glsMaterialf(unsigned int face, unsigned int pname, float param);
 void _glsMaterialfv(unsigned int face, unsigned int pname, const float *params);
@@ -498,13 +511,14 @@ typedef struct {
     DWORD color;
     DWORD specular;     /* glSecondaryColor; D3D9 mandates this order */
     float u0, v0;
-    float u1, v1;
+    float texcoord1[4];     /* tangent/attrib 9 is commonly a full vec4 */
     float genericAttrib6[4];    /* texcoord set 2: ARB vertex.attrib[6] */
     float genericAttrib7[4];    /* texcoord set 3: ARB vertex.attrib[7] */
 } GLS_D3DVertex;
 
 #define GLS_D3DFVF (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | \
-                    D3DFVF_TEX4 | D3DFVF_TEXCOORDSIZE4(2) | D3DFVF_TEXCOORDSIZE4(3))
+                    D3DFVF_TEX4 | D3DFVF_TEXCOORDSIZE4(1) | \
+                    D3DFVF_TEXCOORDSIZE4(2) | D3DFVF_TEXCOORDSIZE4(3))
 
 /* ===== D3D9 helper functions ===== */
 D3DFORMAT _glsMapGLFormatToD3D(unsigned int internalformat);
@@ -557,6 +571,7 @@ void _glsEvalMesh2(unsigned int mode, int i1, int i2, int j1, int j2);
 void _glsEvalPoint1(int i);
 void _glsEvalPoint2(int i, int j);
 void _glsGetMapfv(unsigned int target, unsigned int query, float *v);
+void _glsGetMapdv(unsigned int target, unsigned int query, double *v);
 BOOL _glsSetEvalEnable(unsigned int cap, BOOL enable);
 void _glsSelectBuffer(int size, unsigned int *buffer);
 void _glsFeedbackBuffer(int size, unsigned int type, float *buffer);

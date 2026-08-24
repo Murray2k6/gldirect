@@ -38,7 +38,11 @@ extern "C" {
 #define GLS_MAX_PROGRAMS        512
 #define GLS_MAX_QUERIES         256
 #define GLS_MAX_SAMPLERS        64
-#define GLS_MAX_TEX_UNITS       8
+/* D3D9 Shader Model 3 exposes sixteen pixel-sampler stages (s0-s15).
+ * Clamping OpenGL units 8-15 back onto unit zero made id Tech's later image
+ * binds overwrite the UI/font texture and left Remix reporting "Texture 0
+ * without valid hash". */
+#define GLS_MAX_TEX_UNITS       16
 #define GLS_MAX_VERTEX_ATTRIBS  16
 #define GLS_MAX_MATRIX_STACK    32
 #define GLS_MAX_LIGHTS          8
@@ -57,7 +61,18 @@ typedef struct {
     GLenum_t            internalFormat;
     GLenum_t            minFilter, magFilter;
     GLenum_t            wrapS, wrapT, wrapR;
+    GLint_t             baseLevel;      /* GL_TEXTURE_BASE_LEVEL (0 default) */
+    GLint_t             maxLevel;       /* GL_TEXTURE_MAX_LEVEL (1000 default) */
+    float               minLod;         /* GL_TEXTURE_MIN_LOD (-1000 default)   */
+    float               maxLod;         /* GL_TEXTURE_MAX_LOD (+1000 default)   */
+    float               maxAnisotropy;  /* GL_TEXTURE_MAX_ANISOTROPY_EXT (1.0)  */
     IDirect3DTexture9   *pTex;          /* D3D9 texture (NULL until data uploaded) */
+    /* RTX Remix forces mip filtering back on whenever linear min/mag
+     * filtering is requested.  A one-level view of a GL texture whose
+     * BASE_LEVEL == MAX_LEVEL prevents that override from reading undefined
+     * allocation-tail mips while preserving linear filtering. */
+    IDirect3DTexture9   *pSingleLevelTex;
+    BOOL                singleLevelDirty;
     IDirect3DCubeTexture9 *pCubeTex;
     IDirect3DVolumeTexture9 *pVolTex;   /* GL_TEXTURE_3D storage */
     GLuint_t            bufferObject;  /* GL_TEXTURE_BUFFER source buffer */
@@ -144,12 +159,19 @@ typedef struct {
     GLenum_t            colorAttachTarget[4];
     GLint_t             colorAttachLevel[4];
     GLuint_t            colorAttachRB[4];       /* renderbuffer attachments */
+    /* D3D9 cannot bind the wrapper's D3DPOOL_MANAGED sampling textures as
+     * render targets.  Each active colour attachment therefore owns a
+     * DEFAULT-pool render surface while it is attached; gl_impl resolves that
+     * surface back into the sampling texture when the draw FBO is left. */
+    IDirect3DSurface9   *colorRenderTarget[4];
+    BOOL                colorRenderTargetDirty[4];
     GLuint_t            depthAttachment;
     GLuint_t            stencilAttachment;
     GLuint_t            depthStencilAttachment;
     GLuint_t            depthAttachRB;
     GLuint_t            stencilAttachRB;
     GLuint_t            depthStencilAttachRB;
+    IDirect3DSurface9   *depthStencilTarget;
     BOOL                allocated;
 } GLS_FBO;
 
@@ -264,7 +286,7 @@ typedef struct {
  * sampler's texture it describes.  Both come from the reflected constant table
  * when the program links.
  */
-#define GLS_MAX_TEXDIM  8
+#define GLS_MAX_TEXDIM  GLS_MAX_TEX_UNITS
 typedef struct {
     int                 vsRegister;     /* register of _glsl_texdim_<name>, -1 if absent */
     int                 psRegister;
@@ -303,12 +325,24 @@ typedef struct {
     GLS_ResolvedUniform resolved[GLS_MAX_UNIFORMS];
     int                 resolvedCount;
 
+    /* Sampler uniforms are program state in GL, while D3D9 texture stages are
+     * device-global.  Keeping this mapping on GLS_State made the last program
+     * to set sampler s0 silently redirect every other program's s0 after a
+     * glUseProgram switch — exactly the missing/pink UI texture failure in
+     * id Tech. */
+    unsigned char       samplerStageUnit[GLS_MAX_TEX_UNITS];
+    BOOL                samplerStageSet[GLS_MAX_TEX_UNITS];
+    BOOL                samplerMissingLogged;
+
     /* Synthesized _glsl_texdim_* uniforms this program's shaders declare.
      * Empty for every program that does not use texelFetch/textureSize, which
      * is what keeps the per-draw cost at a single count check. */
     GLS_TexDimBinding   texDim[GLS_MAX_TEXDIM];
     int                 texDimCount;
     int                 viewportRegister; /* synthesized VS clip/viewport adjustment */
+    int                 builtinMvpRegister;
+    int                 builtinModelViewRegister;
+    int                 builtinProjectionRegister;
 
     /* Vertex attribute names.  These do not survive into D3D9 bytecode,
      * so they are captured from the GLSL source when the program links;
@@ -318,6 +352,12 @@ typedef struct {
     BOOL                softwareGraphicsStages;
     BOOL                softwareVertexExecution;
     BOOL                softwareFragmentExecution;
+
+    /* Both stages are structurally equivalent to what the D3D9 fixed-function
+     * pipeline can produce (conservative scan performed at link time).  A
+     * program marked TRUE may be degraded to FFP while Remix is active so the
+     * scene reconstruction sees a classic, reliably classified draw. */
+    BOOL                ffpEquivalent;
     GLS_StageVarying    stageVaryings[GLS_MAX_STAGE_VARYINGS];
     int                 stageVaryingCount;
     int                 stageCaptureWords;
@@ -734,6 +774,11 @@ typedef struct {
     GLS_Material        materialBack;
     float               lightModelAmbient[4];
     BOOL                lightModelTwoSide;
+
+    /* TRUE once any glLight* call has run.  Programs that never configure GL
+     * lights (e.g. OpenMW, which does all lighting in GLSL) fall back to
+     * synthesizing D3D lights from the program's light uniforms instead. */
+    BOOL                lightsEverConfigured;
 
     /* Texture coordinate generation, per unit, per coordinate (S,T,R,Q) */
     GLenum_t            texGenMode[GLS_MAX_TEX_UNITS][4];

@@ -1027,6 +1027,7 @@ DEF_ONLY_SHIMS = {
     'glCopyTexSubImage2D': '_glsCopyTexSubImage2D((unsigned int)target, (int)level,'
                            ' (int)xoffset, (int)yoffset, (int)x, (int)y, (int)width,'
                            ' (int)height)',
+    'glIsTexture': '_glsIsTexture((unsigned int)texture) ? GL_TRUE : GL_FALSE',
     'glGetPointerv': '_glsGetPointerv((unsigned int)pname, (void **)params)',
     'glTexSubImage1D': '_glsTexSubImage1D((unsigned int)target, (int)level, (int)xoffset,'
                        ' (int)width, (unsigned int)format, (unsigned int)type, pixels)',

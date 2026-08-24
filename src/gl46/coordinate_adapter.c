@@ -110,65 +110,30 @@ void gldFlipViewportY(int windowHeight, int *y, int *height)
 
 void gldInitCoordinateAdapter(GLD_glContext *ctx)
 {
-    BOOL hasClipControl = FALSE;
-
     if (!ctx) {
         gldLogPrintf(GLDLOG_ERROR,
             "gldInitCoordinateAdapter: NULL context pointer");
         return;
     }
 
-    // Default to unavailable until proven otherwise.
+    /*
+     * This backend does not own a native OpenGL context.  Its advertised GL
+     * 4.6 version is implemented by the private state machine and D3D9, so
+     * GLAD's native-driver glClipControl pointer is intentionally NULL.
+     *
+     * The old code inferred clip-control support from the emulated version,
+     * then warned that the native pointer was NULL.  That warning in the game
+     * log looked like a missing required feature, and an unchecked call here
+     * would jump through address zero.  D3D9 viewport origin, depth mapping,
+     * front-face winding and half-pixel placement are already applied in the
+     * draw translator, so native ARB_clip_control is neither available nor
+     * required on this path.
+     */
     ctx->bClipControlAvailable = FALSE;
-
-    // ------------------------------------------------------------------
-    // Determine ARB_clip_control availability based on GL version.
-    //
-    // GL 4.5+: ARB_clip_control is core and guaranteed available.
-    // GL 3.3–4.4: query the GLAD extension flag for GL_ARB_clip_control.
-    // ------------------------------------------------------------------
-    if (ctx->glVersionMajor > 4 ||
-        (ctx->glVersionMajor == 4 && ctx->glVersionMinor >= 5)) {
-        // Core in GL 4.5+, guaranteed available.
-        hasClipControl = TRUE;
-        gldLogPrintf(GLDLOG_INFO,
-            "ARB_clip_control is core in GL %d.%d",
-            ctx->glVersionMajor, ctx->glVersionMinor);
-    } else {
-        // GL 3.3–4.4 fallback: check the extension via GLAD.
-        if (GLAD_GL_ARB_clip_control) {
-            hasClipControl = TRUE;
-            gldLogPrintf(GLDLOG_INFO,
-                "GL_ARB_clip_control extension available on GL %d.%d",
-                ctx->glVersionMajor, ctx->glVersionMinor);
-        } else {
-            gldLogPrintf(GLDLOG_WARN,
-                "GL_ARB_clip_control not available on GL %d.%d — "
-                "will use manual projection/viewport adjustments",
-                ctx->glVersionMajor, ctx->glVersionMinor);
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // If clip control is available, activate it to match DX9 conventions:
-    //   - GL_UPPER_LEFT: window origin at top-left (matches DX9)
-    //   - GL_ZERO_TO_ONE: clip space depth [0,1] (matches DX9)
-    // ------------------------------------------------------------------
-    if (hasClipControl) {
-        if (glClipControl) {
-            glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE);
-            gldCheckGLError("glClipControl", "CoordinateAdapter_Init");
-
-            ctx->bClipControlAvailable = TRUE;
-            gldLogPrintf(GLDLOG_SYSTEM,
-                "glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE) set successfully — "
-                "DX9 coordinate conventions active");
-        } else {
-            gldLogPrintf(GLDLOG_WARN,
-                "ARB_clip_control reported available but glClipControl is NULL — "
-                "falling back to manual adjustments");
-        }
-    }
+    gldLogPrintf(GLDLOG_INFO,
+        "D3D9 coordinate translation active for emulated GL %d.%d "
+        "(native ARB_clip_control not required)",
+        ctx->glVersionMajor, ctx->glVersionMinor);
 }
 
 // ***********************************************************************

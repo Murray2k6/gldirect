@@ -102,6 +102,8 @@ typedef struct {
 typedef struct {
     GLuint          listId;
     BOOL            inUse;
+    BOOL            tombstone;   /* slot freed by gldDeleteLists46; keeps the
+                                    probe chain intact until it is reused */
     GLD_dlCommand  *commands;
     int             cmdCount;
     int             cmdCapacity;

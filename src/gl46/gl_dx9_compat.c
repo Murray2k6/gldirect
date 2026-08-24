@@ -13,6 +13,7 @@
 #include "context_manager.h"
 #include "glsl_to_hlsl.h"
 #include "gld_context.h"
+#include "gld_diag.h"
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -877,7 +878,14 @@ void gldCompatCompressedTexImage2D(unsigned int target, int level,
 
     hr = IDirect3DDevice9_CreateTexture(g_pDev, width, height, 1,
         0, d3dFmt, D3DPOOL_MANAGED, &ct->pTex, NULL);
-    if (FAILED(hr)) { ct->pTex = NULL; return; }
+    if (FAILED(hr)) {
+        gldLogPrintf(GLDLOG_WARN,
+            "GLCompat: CompressedTexImage2D CreateTexture FAILED hr=0x%08X %dx%d fmt=%d (video memory exhausted?)",
+            hr, width, height, (int)d3dFmt);
+        gldFlagFault("video-memory", "compressed texture allocation failed");
+        ct->pTex = NULL;
+        return;
+    }
     ct->width = width;
     ct->height = height;
     ct->d3dFmt = d3dFmt;

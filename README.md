@@ -51,6 +51,28 @@ The integration follows the architecture described by the pinned
 Remix intercepts a D3D9 fixed-function/program-state stream, uses a 64-bit
 runtime, and supports 32-bit games through its bridge.
 
+## Tracy profiling
+
+The Release wrapper embeds the [Tracy 0.13.1 client](https://github.com/wolfpld/tracy/releases/tag/v0.13.1).
+It starts on the first WGL call, outside the Windows loader lock, and runs in
+on-demand mode: when no Tracy viewer is connected, frame history is not
+accumulated. The listener is restricted to localhost, sampling and source-code
+transfer are disabled, and the wrapper is process-pinned after profiling starts
+so a late `FreeLibrary` cannot unmap Tracy code beneath its worker thread.
+
+Run the game, open the matching Tracy 0.13.1 viewer on the same machine, and
+connect to the target named:
+
+```text
+GLDirect/<game-folder>/<executable>/<x86|x64>
+```
+
+The session metadata includes the full game and wrapper paths, process ID,
+architecture, and profiling mode. Captures contain GLDirect frame marks and
+zones for WGL context creation/binding/presentation, D3D9 device creation or
+reset, shader linking, and indexed/non-indexed draws. One-time wrapper fault
+flags also appear as colored Tracy messages.
+
 ## Build and verification
 
 Build `gld9.vcxproj` with Visual Studio 2022 in `Release|Win32` and
@@ -66,6 +88,20 @@ lists, oversized viewports and OpenGL depth conversion, named fragment outputs,
 geometry and tessellation stages, transform feedback, instancing, compute
 SSBO/image execution, ranged texture buffers, error handling, and buffer
 swapping without linking to the system OpenGL library.
+
+The ordinary smoke run validates GLDirect against the system D3D9 runtime. A
+real Remix check must run the matching Win32 harness from a 32-bit game's Remix
+directory so its local `d3d9.dll` bridge is loaded:
+
+```text
+wgl_smoke86.exe C:\absolute\path\to\bin\x86\Release\opengl32.dll --remix
+```
+
+That mode compiles FF4-style compatibility GLSL, checks the projection and
+model-view stacks independently, submits native DX9 shaders and geometry, and
+requires a fresh Remix server log to confirm a usable camera/ray-tracing pass.
+After teardown it also requires both bridge logs to report clean shutdown and
+the wrapper device reference count to reach zero.
 
 ## Emulation contract
 

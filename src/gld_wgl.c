@@ -40,6 +40,7 @@
 #include "mesa_compat.h"
 #include "mesa_proxy.h"
 #include "gld_diag.h"
+#include "gld_profile.h"
 #include "gl46/context_manager.h"
 #include "gl46/gl_dx9_compat.h"
 
@@ -288,6 +289,10 @@ static BOOL _gldMesaRequested(void)
 
 static void _gldInitMesaProxy(void)
 {
+	/* First WGL entry is safely outside DllMain's loader lock.  Start the
+	 * embedded profiler here even when Mesa is disabled. */
+	gldProfileStartup();
+
 	if (bMesaProxyReady || bMesaProxyAttempted)
 		return;
 	bMesaProxyAttempted = TRUE;
@@ -738,6 +743,7 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(CreateContext)(
 	int ipf;
 
 	_gldInitMesaProxy();
+	GLD_PROFILE_ZONE_BEGIN(profileZone, "wglCreateContext");
 
 	/* wglMakeCurrent and wglDeleteContext both hand their HGLRC straight to
 	 * Mesa when the proxy is live, so the handle they receive has to be one
@@ -749,6 +755,7 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(CreateContext)(
 	if (g_mesaProxy.initialized && g_mesaProxy.wglCreateContext) {
 		HGLRC hMesaRC = g_mesaProxy.wglCreateContext(a);
 		gldDiagLog("wglCreateContext: Mesa context %p", (void *)hMesaRC);
+		GLD_PROFILE_ZONE_END(profileZone);
 		return hMesaRC;
 	}
 
@@ -757,8 +764,10 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(CreateContext)(
 	gldDiagLog("wglCreateContext: Creating GLDirect context");
 
 	// Validate license
-	if (!gldValidate())
+	if (!gldValidate()) {
+		GLD_PROFILE_ZONE_END(profileZone);
 		return 0;
+	}
 
 	// Check that the current PFD is valid.
 	// 1. Try the wrapper's TLS curPFD (set by our wglSetPixelFormat).
@@ -788,11 +797,16 @@ HGLRC APIENTRY _GLD_WGL_EXPORT(CreateContext)(
 			gldSetPixelFormat(ipf);
 		} else {
 			gldDiagLog("wglCreateContext: ERROR - no pixel formats available");
+			GLD_PROFILE_ZONE_END(profileZone);
 			return (HGLRC)0;
 		}
 	}
 
-	return gldCreateContext(a, &glb.lpPF[ipf-1]);
+	{
+		HGLRC result = gldCreateContext(a, &glb.lpPF[ipf-1]);
+		GLD_PROFILE_ZONE_END(profileZone);
+		return result;
+	}
 }
 
 // ***********************************************************************
@@ -1116,17 +1130,19 @@ PROC APIENTRY _GLD_WGL_EXPORT(GetProcAddress)(
 					}
 				}
 			}
-			gldDiagLog("wglGetProcAddress: \"%s\" -> Mesa", a);
+			gldDiagLogV("wglGetProcAddress: \"%s\" -> Mesa", a);
 			return result;
 		}
 
-		gldDiagLog("wglGetProcAddress: \"%s\" -> NULL (not in Mesa or ext table); returning typed no-op", a);
+		/* Mesa does not know the name.  Ask the GL46 driver, which owns the
+		 * full 1.0-4.6 name table and follows the WGL contract: a known name
+		 * resolves to its exactly-typed entry point, an unknown name returns
+		 * NULL and is flagged once.  Returning a guessed-argument-count no-op
+		 * would corrupt the stack on x86 __stdcall whenever the guess is
+		 * wrong, and telling a game a capability exists when it does not
+		 * moves the failure from a clean NULL call to a mysterious one
+		 * mid-render. */
 		{
-			/* Never hand the caller NULL — many games/engines call the
-			 * returned pointer without a null-check. The GL46 driver has
-			 * a typed-no-op table that returns a stub matching the
-			 * argument count, so __stdcall stack cleanup stays correct
-			 * on x86. */
 			extern PROC gldGetProcAddress_GL46(LPCSTR a);
 			return gldGetProcAddress_GL46(a);
 		}
@@ -1137,7 +1153,7 @@ PROC APIENTRY _GLD_WGL_EXPORT(GetProcAddress)(
 		return NULL;
 
 	result = _gldDriver.wglGetProcAddress(a);
-	gldDiagLog("wglGetProcAddress: \"%s\" -> %s", a ? a : "(null)", result ? "found" : "NULL");
+	gldDiagLogV("wglGetProcAddress: \"%s\" -> %s", a ? a : "(null)", result ? "found" : "NULL");
 	return result;
 }
 
@@ -1148,17 +1164,27 @@ BOOL APIENTRY _GLD_WGL_EXPORT(MakeCurrent)(
 	HGLRC b)
 {
 	_gldInitMesaProxy();
+	GLD_PROFILE_ZONE_BEGIN(profileZone, "wglMakeCurrent");
 
-	if (g_mesaProxy.initialized && g_mesaProxy.wglMakeCurrent)
-		return g_mesaProxy.wglMakeCurrent(a, b);
+	if (g_mesaProxy.initialized && g_mesaProxy.wglMakeCurrent) {
+		BOOL result = g_mesaProxy.wglMakeCurrent(a, b);
+		GLD_PROFILE_ZONE_END(profileZone);
+		return result;
+	}
 
 	gldDiagLog("wglMakeCurrent: HDC=%p, HGLRC=%d", (void*)(INT_PTR)a, (int)(INT_PTR)b);
 
 	// Validate license
-	if (!gldValidate())
+	if (!gldValidate()) {
+		GLD_PROFILE_ZONE_END(profileZone);
 		return FALSE;
+	}
 
-	return gldMakeCurrent(a, b);
+	{
+		BOOL result = gldMakeCurrent(a, b);
+		GLD_PROFILE_ZONE_END(profileZone);
+		return result;
+	}
 }
 
 // ***********************************************************************
@@ -1248,11 +1274,27 @@ BOOL APIENTRY _GLD_WGL_EXPORT(SetPixelFormat)(
 		gldLogPrintf(GLDLOG_SYSTEM, "SetPixelFormat: PixelFormat %d has been set", b);
 		gldSetPixelFormat(b);
 		return TRUE;
-	} else {
-		gldLogPrintf(GLDLOG_ERROR,
-					"SetPixelFormat: PixelFormat %d is invalid and cannot be set", b);
-		return FALSE;
 	}
+
+	/*
+	 * Format index is outside our wrapper's table (1..nPixelFormatCount).
+	 * This happens when the game calls SetPixelFormat with an OS-level
+	 * pixel format index that it obtained from the real Win32
+	 * ChoosePixelFormat, not from our wrapper's ChoosePixelFormat or
+	 * wglChoosePixelFormatARB.
+	 *
+	 * Rejecting it here leaves the D3D9 device stuck at the bootstrap
+	 * window's size and the game renders black.  Accept it instead:
+	 * map it to our best-guess wrapper format (PF 1) so the game can
+	 * proceed, and let the D3D9 device creation / ResizeDrawable
+	 * handle the real window.
+	 */
+	gldLogPrintf(GLDLOG_WARN,
+		"SetPixelFormat: PixelFormat %d is outside wrapper range [1,%d] "
+		"- mapping to wrapper PF 1 (OS-level format passthrough)",
+		b, glb.nPixelFormatCount);
+	gldSetPixelFormat(1);
+	return TRUE;
 }
 
 //
@@ -1344,6 +1386,7 @@ BOOL APIENTRY _GLD_WGL_EXPORT(SwapBuffers)(
 	HDC a)
 {
 	_gldInitMesaProxy();
+	GLD_PROFILE_ZONE_BEGIN(profileZone, "wglSwapBuffers");
 
 	if (g_mesaProxy.initialized && g_mesaProxy.wglSwapBuffers) {
 		BOOL result;
@@ -1467,14 +1510,23 @@ BOOL APIENTRY _GLD_WGL_EXPORT(SwapBuffers)(
 			}
 		}
 
+		gldProfileFrameMark();
+		GLD_PROFILE_ZONE_END(profileZone);
 		return result;
 	}
 
 	// DX9 backend fallback (no Mesa)
-	if (!gldValidate())
+	if (!gldValidate()) {
+		GLD_PROFILE_ZONE_END(profileZone);
 		return FALSE;
+	}
 
-	return gldSwapBuffers(a);
+	{
+		BOOL result = gldSwapBuffers(a);
+		gldProfileFrameMark();
+		GLD_PROFILE_ZONE_END(profileZone);
+		return result;
+	}
 }
 
 // ***********************************************************************
@@ -1555,6 +1607,19 @@ BOOL gldWglResizeBuffers(
 	}
 
 	gldLogPrintf(GLDLOG_SYSTEM, "gldResize: %dx%d", dwWidth, dwHeight);
+
+	/* The classic GLDirect resize fault (SDL_SetVideoMode and fullscreen
+	 * switches) was GL state evaporating with the D3D context: texture
+	 * parameters, materials and display lists were lost and never re-emitted.
+	 * The GL46 backend keeps all of that state CPU-side and re-emits it per
+	 * draw, and its display list storage is process-global, so a resize must
+	 * not lose any of it.  The flag documents that the resize happened and
+	 * that the guarantee is being relied on, so a future regression that
+	 * makes state depend on the D3D context again fails loudly in the log
+	 * rather than as wrong geometry. */
+	if (bDefaultDriver)
+		gldLogPrintf(GLDLOG_INFO,
+			"gldResize: GL state (textures, params, materials, display lists) kept CPU-side - nothing re-emitted or lost");
 
 	// Note previous fullscreen vs window display status
 	bWasFullscreen = gld->bFullscreen;
@@ -2363,6 +2428,18 @@ DrawGlyph(	IN  UCHAR*	glyphBuf,
 				DWORD last;
 
 				count = (DWORD) *p++;
+
+				/* A quad-strip needs at least two vertices.  A zero- or
+				 * one-point "loop" is degenerate: the arithmetic below
+				 * would read before the stream ((count-1)*2) and divide
+				 * by zero (point % last with last == 0), faulting with
+				 * INT_DIVIDE_BY_ZERO.  Skip the loop, still advancing
+				 * past its data so the stream position stays intact. */
+				if (count < 2) {
+					p += count * 2;
+					continue;
+				}
+
 				_GLD_glBegin(GL_QUAD_STRIP);
 
 				/* Check if the first and last vertex are identical

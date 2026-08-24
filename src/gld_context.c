@@ -239,7 +239,8 @@ HDC gldGetCurrentDC(void)
 	hGLRC = gldGetCurrentContext();
 	if (hGLRC) {
 		lpCtx = gldGetContextAddress(hGLRC);
-		return lpCtx->hDC;
+		if (lpCtx && lpCtx->bAllocated)
+			return lpCtx->hDC;
 	}
 	return 0;
 }
@@ -1181,7 +1182,7 @@ BOOL gldDeleteContext(
 
 	// Make sure context is valid
 	lpCtx = gldGetContextAddress(a);
-	if (!lpCtx->bAllocated) {
+	if (!lpCtx || !lpCtx->bAllocated) {
 		gldLogPrintf(GLDLOG_WARN, "Tried to delete unallocated context HGLRC=%d", (int)(INT_PTR)a);
 //		return FALSE;
 		return TRUE; // HACK: Shuts up "WebLab Viewer Pro". KeithH

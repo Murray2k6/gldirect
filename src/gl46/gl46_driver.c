@@ -311,8 +311,8 @@ BOOL gldSwapBuffers_GL46(
 		// End the current scene
 		IDirect3DDevice9_EndScene(pDev);
 
-		// Present the back buffer
-		hr = IDirect3DDevice9_Present(pDev, NULL, NULL, NULL, NULL);
+		// Present the back buffer to the correct game window
+		hr = IDirect3DDevice9_Present(pDev, NULL, NULL, hWnd ? hWnd : NULL, NULL);
 
 		if (hr == D3DERR_DEVICELOST) {
 			// Device lost — try to reset next frame
@@ -687,8 +687,15 @@ PROC gldGetProcAddress_GL46(
 	}
 
 	/* WGL requires NULL for an unsupported name. A callable no-op makes games
-	 * believe a capability exists and commonly fails much later in rendering. */
-	gldDiagLog("wglGetProcAddress: \"%s\" -> UNMAPPED", a ? a : "(null)");
+	 * believe a capability exists and commonly fails much later in rendering.
+	 *
+	 * Flag the name once per process.  A game that resolves an unknown name
+	 * once, stores the NULL and calls it - the pattern behind the classic
+	 * "GetProcAddress: glGetString (Failed)" crashes - leaves one fault flag
+	 * per unknown name instead of one diag line per call, and the flag is the
+	 * first thing to read when the crash is a NULL call. */
+	gldDiagLogV("wglGetProcAddress: \"%s\" -> UNMAPPED", a ? a : "(null)");
+	gldFlagFault("proc-address", a ? a : "(null)");
 	return NULL;
 }
 

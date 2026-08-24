@@ -127,24 +127,24 @@ static void _gllDLBitmap(const void *p)
 #define GLL_INVALID_VALUE           0x0501
 #define GLL_INVALID_OPERATION       0x0502
 
-#define GLL_MAP1_COLOR_4            0x0D90
-#define GLL_MAP1_INDEX              0x0D91
-#define GLL_MAP1_NORMAL             0x0D92
-#define GLL_MAP1_TEXTURE_COORD_1    0x0D93
-#define GLL_MAP1_TEXTURE_COORD_2    0x0D94
-#define GLL_MAP1_TEXTURE_COORD_3    0x0D95
-#define GLL_MAP1_TEXTURE_COORD_4    0x0D96
-#define GLL_MAP1_VERTEX_3           0x0D97
-#define GLL_MAP1_VERTEX_4           0x0D98
-#define GLL_MAP2_COLOR_4            0x0DB0
-#define GLL_MAP2_INDEX              0x0DB1
-#define GLL_MAP2_NORMAL             0x0DB2
-#define GLL_MAP2_TEXTURE_COORD_1    0x0DB3
-#define GLL_MAP2_TEXTURE_COORD_2    0x0DB4
-#define GLL_MAP2_TEXTURE_COORD_3    0x0DB5
-#define GLL_MAP2_TEXTURE_COORD_4    0x0DB6
-#define GLL_MAP2_VERTEX_3           0x0DB7
-#define GLL_MAP2_VERTEX_4           0x0DB8
+#define GLL_MAP1_COLOR_4            0x0A10
+#define GLL_MAP1_INDEX              0x0A11
+#define GLL_MAP1_NORMAL             0x0A12
+#define GLL_MAP1_TEXTURE_COORD_1    0x0A13
+#define GLL_MAP1_TEXTURE_COORD_2    0x0A14
+#define GLL_MAP1_TEXTURE_COORD_3    0x0A15
+#define GLL_MAP1_TEXTURE_COORD_4    0x0A16
+#define GLL_MAP1_VERTEX_3           0x0A17
+#define GLL_MAP1_VERTEX_4           0x0A18
+#define GLL_MAP2_COLOR_4            0x0A20
+#define GLL_MAP2_INDEX              0x0A21
+#define GLL_MAP2_NORMAL             0x0A22
+#define GLL_MAP2_TEXTURE_COORD_1    0x0A23
+#define GLL_MAP2_TEXTURE_COORD_2    0x0A24
+#define GLL_MAP2_TEXTURE_COORD_3    0x0A25
+#define GLL_MAP2_TEXTURE_COORD_4    0x0A26
+#define GLL_MAP2_VERTEX_3           0x0A27
+#define GLL_MAP2_VERTEX_4           0x0A28
 
 #define GLL_POINT                   0x1B00
 #define GLL_LINE                    0x1B01
@@ -240,7 +240,7 @@ void _glsApplyTexEnv(int unit)
     GLS_State *s = glsGetState();
     GLS_TexEnv *e;
     D3DTEXTUREOP colorOp, alphaOp;
-    DWORD a1, a2, a0;
+    DWORD a1, a2, a0 = D3DTA_CURRENT;
 
     if (!pDev || unit < 0 || unit >= GLS_MAX_TEX_UNITS) return;
     e = &s->texEnv[unit];
@@ -264,21 +264,33 @@ void _glsApplyTexEnv(int unit)
         alphaOp = D3DTOP_SELECTARG2;
         break;
     case GLL_BLEND:
-        /* Cf = Cp*(1-Ct) + Cc*Ct */
-        colorOp = D3DTOP_LERP; a1 = D3DTA_TFACTOR; a2 = D3DTA_CURRENT;
-        alphaOp = D3DTOP_MODULATE;
+        /* Cf = Cp*(1-Ct) + Cc*Ct, Av = Ap.
+         * D3DTOP_LERP = Arg1*Arg2 + (1-Arg1)*Arg3, so the interpolant Arg1
+         * must be the texture alpha and Arg2/Arg3 the two operands. */
+        colorOp = D3DTOP_LERP; a1 = D3DTA_TFACTOR; a2 = D3DTA_CURRENT; a0 = D3DTA_TEXTURE;
+        alphaOp = D3DTOP_SELECTARG2;
         break;
     case GLL_ADD:
+        /* Cf = Cp + Ct, Av = Ap. */
         colorOp = D3DTOP_ADD; a1 = D3DTA_TEXTURE; a2 = D3DTA_CURRENT;
-        alphaOp = D3DTOP_MODULATE;
+        alphaOp = D3DTOP_SELECTARG2;
         break;
     case GLL_COMBINE:
         colorOp = _glLegacyCombineToOp(e->combineRGB,   e->rgbScale);
         alphaOp = _glLegacyCombineToOp(e->combineAlpha, e->alphaScale);
 
-        a1 = _glLegacySourceToArg(e->srcRGB[0]) | _glLegacyOperandModifier(e->operandRGB[0]);
-        a2 = _glLegacySourceToArg(e->srcRGB[1]) | _glLegacyOperandModifier(e->operandRGB[1]);
-        a0 = _glLegacySourceToArg(e->srcRGB[2]) | _glLegacyOperandModifier(e->operandRGB[2]);
+        if (e->combineRGB == GLL_INTERPOLATE) {
+            /* GL: A0*A2 + (1-A0)*A1 with A0 = SOURCE0.  D3D LERP has the
+             * interpolant in Arg1, so SOURCE0 goes to arg0 and the two
+             * operands swap into arg2/arg1. */
+            a0 = _glLegacySourceToArg(e->srcRGB[0]) | _glLegacyOperandModifier(e->operandRGB[0]);
+            a1 = _glLegacySourceToArg(e->srcRGB[2]) | _glLegacyOperandModifier(e->operandRGB[2]);
+            a2 = _glLegacySourceToArg(e->srcRGB[1]) | _glLegacyOperandModifier(e->operandRGB[1]);
+        } else {
+            a1 = _glLegacySourceToArg(e->srcRGB[0]) | _glLegacyOperandModifier(e->operandRGB[0]);
+            a2 = _glLegacySourceToArg(e->srcRGB[1]) | _glLegacyOperandModifier(e->operandRGB[1]);
+            a0 = _glLegacySourceToArg(e->srcRGB[2]) | _glLegacyOperandModifier(e->operandRGB[2]);
+        }
 
         IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_COLOROP,   colorOp);
         IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_COLORARG1, a1);
@@ -301,13 +313,23 @@ void _glsApplyTexEnv(int unit)
             return;
         }
 
-        IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAOP, alphaOp);
-        IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAARG1,
-            _glLegacySourceToArg(e->srcAlpha[0]) | _glLegacyOperandModifier(e->operandAlpha[0]));
-        IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAARG2,
-            _glLegacySourceToArg(e->srcAlpha[1]) | _glLegacyOperandModifier(e->operandAlpha[1]));
-        IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAARG0,
-            _glLegacySourceToArg(e->srcAlpha[2]) | _glLegacyOperandModifier(e->operandAlpha[2]));
+        if (e->combineAlpha == GLL_INTERPOLATE) {
+            IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAOP, alphaOp);
+            IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAARG1,
+                _glLegacySourceToArg(e->srcAlpha[2]) | _glLegacyOperandModifier(e->operandAlpha[2]));
+            IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAARG2,
+                _glLegacySourceToArg(e->srcAlpha[1]) | _glLegacyOperandModifier(e->operandAlpha[1]));
+            IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAARG0,
+                _glLegacySourceToArg(e->srcAlpha[0]) | _glLegacyOperandModifier(e->operandAlpha[0]));
+        } else {
+            IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAOP, alphaOp);
+            IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAARG1,
+                _glLegacySourceToArg(e->srcAlpha[0]) | _glLegacyOperandModifier(e->operandAlpha[0]));
+            IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAARG2,
+                _glLegacySourceToArg(e->srcAlpha[1]) | _glLegacyOperandModifier(e->operandAlpha[1]));
+            IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAARG0,
+                _glLegacySourceToArg(e->srcAlpha[2]) | _glLegacyOperandModifier(e->operandAlpha[2]));
+        }
         return;
 
     case GLL_MODULATE:
@@ -320,6 +342,7 @@ void _glsApplyTexEnv(int unit)
     IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_COLOROP,   colorOp);
     IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_COLORARG1, a1);
     IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_COLORARG2, a2);
+    IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_COLORARG0, a0);
     IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAOP,   alphaOp);
     IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
     IDirect3DDevice9_SetTextureStageState(pDev, unit, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
@@ -602,6 +625,14 @@ void _glsRasterPos4f(float x, float y, float z, float w)
     s->rasterColor[0] = s->currentColor[0]; s->rasterColor[1] = s->currentColor[1];
     s->rasterColor[2] = s->currentColor[2]; s->rasterColor[3] = s->currentColor[3];
     s->rasterIndex    = s->currentIndex;
+    {
+        int unit = (int)(s->activeTexUnit - GLL_TEXTURE0);
+        if (unit < 0 || unit >= GLS_MAX_TEX_UNITS) unit = 0;
+        s->rasterTexCoord[0] = s->currentTexCoord[unit][0];
+        s->rasterTexCoord[1] = s->currentTexCoord[unit][1];
+        s->rasterTexCoord[2] = s->currentTexCoord[unit][2];
+        s->rasterTexCoord[3] = s->currentTexCoord[unit][3];
+    }
 }
 
 void _glsWindowPos3f(float x, float y, float z)
@@ -617,6 +648,14 @@ void _glsWindowPos3f(float x, float y, float z)
     s->rasterColor[0] = s->currentColor[0]; s->rasterColor[1] = s->currentColor[1];
     s->rasterColor[2] = s->currentColor[2]; s->rasterColor[3] = s->currentColor[3];
     s->rasterIndex    = s->currentIndex;
+    {
+        int unit = (int)(s->activeTexUnit - GLL_TEXTURE0);
+        if (unit < 0 || unit >= GLS_MAX_TEX_UNITS) unit = 0;
+        s->rasterTexCoord[0] = s->currentTexCoord[unit][0];
+        s->rasterTexCoord[1] = s->currentTexCoord[unit][1];
+        s->rasterTexCoord[2] = s->currentTexCoord[unit][2];
+        s->rasterTexCoord[3] = s->currentTexCoord[unit][3];
+    }
 }
 
 void _glsPixelZoom(float xfactor, float yfactor)
@@ -929,6 +968,10 @@ void _glsEvalMesh1(unsigned int mode, int i1, int i2)
     float du;
     int i;
 
+    if (mode != GLL_POINT && mode != GLL_LINE) {
+        s->lastError = GLL_INVALID_ENUM;
+        return;
+    }
     if (s->mapGrid1n < 1) return;
     du = (s->mapGrid1u2 - s->mapGrid1u1) / (float)s->mapGrid1n;
 
@@ -944,6 +987,10 @@ void _glsEvalMesh2(unsigned int mode, int i1, int i2, int j1, int j2)
     float du, dv;
     int i, j;
 
+    if (mode != GLL_POINT && mode != GLL_LINE && mode != GLL_FILL) {
+        s->lastError = GLL_INVALID_ENUM;
+        return;
+    }
     if (s->mapGrid2un < 1 || s->mapGrid2vn < 1) return;
     du = (s->mapGrid2u2 - s->mapGrid2u1) / (float)s->mapGrid2un;
     dv = (s->mapGrid2v2 - s->mapGrid2v1) / (float)s->mapGrid2vn;
@@ -1054,6 +1101,46 @@ void _glsGetMapfv(unsigned int target, unsigned int query, float *v)
     s->lastError = GLL_INVALID_ENUM;
 }
 
+void _glsGetMapdv(unsigned int target, unsigned int query, double *v)
+{
+    GLS_State *s = glsGetState();
+    int comps, i1 = _glLegacyMap1Index((GLenum_t)target, &comps);
+    int i2 = (i1 < 0) ? _glLegacyMap2Index((GLenum_t)target, &comps) : -1;
+    int i, j, c, n = 0;
+
+    if (!v) return;
+
+    if (i1 >= 0) {
+        GLS_Map1 *m = &s->map1[i1];
+        switch (query) {
+        case 0x0A00: /* GL_COEFF  */
+            for (i = 0; i < m->order; i++)
+                for (c = 0; c < m->components; c++) v[n++] = m->points[i * 4 + c];
+            break;
+        case 0x0A01: /* GL_ORDER  */ v[0] = m->order; break;
+        case 0x0A02: /* GL_DOMAIN */ v[0] = m->u1; v[1] = m->u2; break;
+        default: s->lastError = GLL_INVALID_ENUM; break;
+        }
+        return;
+    }
+    if (i2 >= 0) {
+        GLS_Map2 *m = &s->map2[i2];
+        switch (query) {
+        case 0x0A00:
+            for (i = 0; i < m->uorder; i++)
+                for (j = 0; j < m->vorder; j++)
+                    for (c = 0; c < m->components; c++)
+                        v[n++] = m->points[((i * GLS_MAX_EVAL_ORDER) + j) * 4 + c];
+            break;
+        case 0x0A01: v[0] = m->uorder; v[1] = m->vorder; break;
+        case 0x0A02: v[0] = m->u1; v[1] = m->u2; v[2] = m->v1; v[3] = m->v2; break;
+        default: s->lastError = GLL_INVALID_ENUM; break;
+        }
+        return;
+    }
+    s->lastError = GLL_INVALID_ENUM;
+}
+
 /* Enable/disable hook for the GL_MAP1_x and GL_MAP2_x capabilities. */
 BOOL _glsSetEvalEnable(unsigned int cap, BOOL enable)
 {
@@ -1078,6 +1165,7 @@ void _glsSelectBuffer(int size, unsigned int *buffer)
 {
     GLS_State *s = glsGetState();
     if (s->renderMode == GLL_SELECT) { s->lastError = GLL_INVALID_OPERATION; return; }
+    if (size < 0)                    { s->lastError = GLL_INVALID_VALUE;    return; }
     s->selectBuffer     = buffer;
     s->selectBufferSize = size;
     s->selectIndex      = 0;
@@ -1087,6 +1175,13 @@ void _glsFeedbackBuffer(int size, unsigned int type, float *buffer)
 {
     GLS_State *s = glsGetState();
     if (s->renderMode == GLL_FEEDBACK) { s->lastError = GLL_INVALID_OPERATION; return; }
+    if (size < 0)                      { s->lastError = GLL_INVALID_VALUE;    return; }
+    /* GL_2D, GL_3D, GL_3D_COLOR, GL_3D_COLOR_TEXTURE, GL_4D_COLOR_TEXTURE */
+    if (type != 0x0600 && type != 0x0601 && type != 0x0602 &&
+        type != 0x0603 && type != 0x0604) {
+        s->lastError = GLL_INVALID_ENUM;
+        return;
+    }
     s->feedbackBuffer     = buffer;
     s->feedbackBufferSize = size;
     s->feedbackType       = type;
@@ -1242,6 +1337,7 @@ void _glsPolygonStipple(const unsigned char *mask)
 
     if (!warned) {
         warned = TRUE;
+        gldFlagFault("feature", "polygon-stipple");
         gldDiagLog("GL: PolygonStipple stored but not applied - D3D9 has no "
                    "polygon stipple; geometry draws unstippled");
     }
@@ -1263,6 +1359,7 @@ void _glsLineStipple(int factor, unsigned short pattern)
 
     if (!warned) {
         warned = TRUE;
+        gldFlagFault("feature", "line-stipple");
         gldDiagLog("GL: LineStipple stored but not applied - D3D9 has no line "
                    "stipple; lines draw solid");
     }
@@ -1280,6 +1377,7 @@ void _glsEdgeFlag(unsigned char flag)
     if (!warned && !flag &&
         (s->polygonModeFront != GLL_FILL || s->polygonModeBack != GLL_FILL)) {
         warned = TRUE;
+        gldFlagFault("feature", "edge-flag");
         gldDiagLogV("GL: EdgeFlag(FALSE) with non-FILL polygon mode - D3D9 has "
                    "no edge flags; all polygon edges will be drawn");
     }
@@ -1303,6 +1401,7 @@ void _glsIndexMask(unsigned int mask)
     s->indexWriteMask = mask;
     if (!warned) {
         warned = TRUE;
+        gldFlagFault("feature", "colour-index-mask");
         gldDiagLog("GL: IndexMask - colour-index rendering has no D3D9 "
                    "equivalent; the device is always RGBA");
     }
@@ -1361,12 +1460,12 @@ void _glsPixelTransferf(unsigned int pname, float param)
     GLS_State *s = glsGetState();
 
     switch (pname) {
-    case 0x0D16: s->redScale    = param; break;  /* GL_RED_SCALE     */
+    case 0x0D14: s->redScale    = param; break;  /* GL_RED_SCALE     */
     case 0x0D18: s->greenScale  = param; break;  /* GL_GREEN_SCALE   */
     case 0x0D1A: s->blueScale   = param; break;  /* GL_BLUE_SCALE    */
     case 0x0D1C: s->alphaScale  = param; break;  /* GL_ALPHA_SCALE   */
     case 0x0D1E: s->depthScale  = param; break;  /* GL_DEPTH_SCALE   */
-    case 0x0D17: s->redBias     = param; break;  /* GL_RED_BIAS      */
+    case 0x0D15: s->redBias     = param; break;  /* GL_RED_BIAS      */
     case 0x0D19: s->greenBias   = param; break;  /* GL_GREEN_BIAS    */
     case 0x0D1B: s->blueBias    = param; break;  /* GL_BLUE_BIAS     */
     case 0x0D1D: s->alphaBias   = param; break;  /* GL_ALPHA_BIAS    */
@@ -1608,7 +1707,8 @@ void _glsGetPixelMapuiv(unsigned int map, unsigned int *values)
     GLS_State *s = glsGetState();
     int idx = _glLegacyPixelMapIndex((GLenum_t)map), i;
 
-    if (idx < 0 || !values) return;
+    if (idx < 0) { glsGetState()->lastError = GLL_INVALID_ENUM; return; }
+    if (!values) return;
     _glsGetPixelMapfv(map, tmp);
     for (i = 0; i < s->pixelMapSize[idx]; i++)
         values[i] = _glLegacyPixelMapIsIndex(map)
@@ -1622,7 +1722,8 @@ void _glsGetPixelMapusv(unsigned int map, unsigned short *values)
     GLS_State *s = glsGetState();
     int idx = _glLegacyPixelMapIndex((GLenum_t)map), i;
 
-    if (idx < 0 || !values) return;
+    if (idx < 0) { s->lastError = GLL_INVALID_ENUM; return; }
+    if (!values) return;
     _glsGetPixelMapfv(map, tmp);
     for (i = 0; i < s->pixelMapSize[idx]; i++)
         values[i] = _glLegacyPixelMapIsIndex(map)
@@ -1768,6 +1869,7 @@ void _glsEdgeFlagPointer(int stride, const void *pointer)
 
     if (!warned) {
         warned = TRUE;
+        gldFlagFault("feature", "edge-flag-array");
         gldDiagLog("GL: EdgeFlagPointer - D3D9 has no per-vertex edge flag; "
                    "the array is ignored and all polygon edges are drawn");
     }
@@ -1789,6 +1891,7 @@ static void _glLegacyNoPalette(const char *fn)
         warned = TRUE;
         gldDiagLog("GL: %s - paletted textures are not supported; the palette "
                    "is ignored", fn);
+        gldFlagFault("feature", "paletted-texture");
     }
 }
 
@@ -1880,6 +1983,7 @@ void _glsSecondaryColorPointer(int size, unsigned int type, int stride, const vo
      * would silently be the current value instead. */
     if (!warned) {
         warned = TRUE;
+        gldFlagFault("feature", "secondary-color-array");
         gldDiagLogV("GL: SecondaryColorPointer - the secondary colour array is "
                    "not assembled; glSecondaryColor's current value is used");
     }
@@ -1916,6 +2020,7 @@ void _glsSampleMaski(unsigned int index, unsigned int mask)
 
     /* D3D9 has a single 32-bit sample mask, so only word 0 is representable. */
     if (index != 0) {
+        gldFlagFault("feature", "sample-mask-word");
         gldDiagLog("GL: SampleMaski word %u ignored - D3D9 has one 32-bit "
                    "sample mask", index);
         return;

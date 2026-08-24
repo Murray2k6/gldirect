@@ -1,4 +1,4 @@
-/*********************************************************************************
+﻿/*********************************************************************************
 *
 *  ===============================================================================
 *  |                  GLDirect: Direct3D Device Driver for Mesa.                 |
@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdarg.h>
 
 /*---------------------- Macros and type definitions ----------------------*/
 
@@ -64,7 +65,7 @@
 #define GLSL_MAX_LADDER         4
 
 /* Samplers a single shader may have texelFetch/textureSize lowered against.
- * Matches GLSL_MAX_SAMPLERS — a shader cannot reference more samplers than
+ * Matches GLSL_MAX_SAMPLERS ??? a shader cannot reference more samplers than
  * D3D9 has stages to bind them to. */
 #define GLSL_MAX_TEXDIM         GLSL_MAX_SAMPLERS
 
@@ -82,7 +83,7 @@
 #define GLSL_ARRAY_UNRESOLVED   (-1)
 
 /*
- * ID3DBlob COM interface — minimal definition for accessing
+ * ID3DBlob COM interface ??? minimal definition for accessing
  * D3DCompile output without linking d3dcompiler.lib.
  */
 typedef struct ID3DBlob ID3DBlob;
@@ -133,13 +134,24 @@ typedef struct {
  *
  * Kept for exactly one purpose: resolving "uniform vec4 bones[MAX_BONES];" to
  * its real extent.  Defines used anywhere else in the shader are not resolved
- * here — #define lines never survive into the emitted HLSL at all, which is a
+ * here ??? #define lines never survive into the emitted HLSL at all, which is a
  * separate and wider gap than this table is meant to close.
  */
 typedef struct {
     char    name[GLSL_MAX_NAME_LEN];
     int     value;
 } glslDefine;
+
+/* A deliberately small preprocessor subset for object-like scalar macros.
+ * Real compatibility-profile shaders commonly use numeric tuning constants
+ * (for example "#define UVCoordScale 1.0").  Preprocessor lines are removed
+ * before HLSL emission, so keeping the spelling in the body leaves an
+ * undeclared identifier.  Function-like and expression-valued macros remain
+ * outside this lightweight translator and take the software path. */
+typedef struct {
+    char name[GLSL_MAX_NAME_LEN];
+    char replacement[64];
+} glslObjectDefine;
 
 /*
  * Type replacement table entry.
@@ -164,7 +176,77 @@ typedef struct {
 
 static HMODULE          s_hD3DCompiler  = NULL;
 static PFN_D3DCompile   s_pfnD3DCompile = NULL;
-static BOOL             s_bInitialized  = FALSE;
+static volatile LONG    s_bInitialized  = FALSE;
+static volatile LONG    s_compilerLoadFailureLogged = FALSE;
+static SRWLOCK          s_compilerLock = SRWLOCK_INIT;
+
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+
+/*
+ * Load the architecture-correct compiler from the Windows system directory.
+ * A bare LoadLibrary("d3dcompiler_47.dll") can be redirected to, or poisoned by,
+ * the game directory and was observed failing with ERROR_INVALID_HANDLE in
+ * Amnesia. The absolute-path fallback supports systems where the secure search
+ * flag is unavailable.
+ */
+static HMODULE glslLoadSystemCompiler(char *resolvedPath,
+                                      size_t resolvedPathSize,
+                                      char *attemptedPath,
+                                      size_t attemptedPathSize,
+                                      DWORD *loadError)
+{
+    HMODULE module = NULL;
+    DWORD error = ERROR_MOD_NOT_FOUND;
+    char systemPath[MAX_PATH];
+    UINT systemPathLength;
+
+    if (resolvedPath && resolvedPathSize > 0)
+        resolvedPath[0] = '\0';
+    if (attemptedPath && attemptedPathSize > 0)
+        attemptedPath[0] = '\0';
+
+    SetLastError(ERROR_SUCCESS);
+    module = LoadLibraryExA("d3dcompiler_47.dll", NULL,
+                            LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module)
+        error = GetLastError();
+
+    if (!module) {
+        systemPathLength = GetSystemDirectoryA(systemPath, MAX_PATH);
+        if (systemPathLength > 0 &&
+            systemPathLength < MAX_PATH &&
+            systemPathLength + sizeof("\\d3dcompiler_47.dll") <= MAX_PATH) {
+            memcpy(systemPath + systemPathLength,
+                   "\\d3dcompiler_47.dll",
+                   sizeof("\\d3dcompiler_47.dll"));
+
+            if (attemptedPath && attemptedPathSize > 0) {
+                strncpy(attemptedPath, systemPath, attemptedPathSize - 1);
+                attemptedPath[attemptedPathSize - 1] = '\0';
+            }
+
+            SetLastError(ERROR_SUCCESS);
+            module = LoadLibraryExA(systemPath, NULL,
+                                    LOAD_WITH_ALTERED_SEARCH_PATH);
+            if (!module)
+                error = GetLastError();
+        }
+    }
+
+    if (module && resolvedPath && resolvedPathSize > 0) {
+        DWORD length = GetModuleFileNameA(module, resolvedPath,
+                                          (DWORD)resolvedPathSize);
+        if (length == 0 || length >= resolvedPathSize)
+            resolvedPath[0] = '\0';
+    }
+
+    if (loadError)
+        *loadError = module ? ERROR_SUCCESS : error;
+
+    return module;
+}
 
 /* Live device shader-model ceiling, pushed in by glslSetDeviceCaps.
  * Invalid means "assume vs_3_0/ps_3_0", the behaviour that predates the
@@ -196,7 +278,7 @@ static const glslTypeMap s_typeReplacements[] = {
     /* The two languages name a non-square matrix by opposite axes: GLSL's
      * matCxR is C columns of R rows, HLSL's floatRxC is R rows of C columns.
      * So the same matrix is mat2x3 in GLSL and float3x2 in HLSL, and mapping
-     * mat2x3 onto float2x3 would hand the compiler the transpose — which is
+     * mat2x3 onto float2x3 would hand the compiler the transpose ??? which is
      * why "vec3 * uniform mat2x3" arrived as an operand-size error rather than
      * merely as the missing-mul() error it really was.  Square types are
      * unaffected; the pair only differs when C != R. */
@@ -211,17 +293,117 @@ static const glslTypeMap s_typeReplacements[] = {
      * what it sampled; SM3 has one untyped sampler and no return-type
      * distinction, so both collapse onto it.  Whether the integers come back
      * intact is decided entirely by the D3D9 format the (untouched) texture
-     * upload path chose for the GL internal format — D3D9 has no true integer
+     * upload path chose for the GL internal format ??? D3D9 has no true integer
      * texture formats, so a wide integer format such as GL_R32UI has no
      * correct representation at all and is not claimed to work here. */
     { "usampler2D", "sampler"   },
     { "isampler2D", "sampler"   },
+    /* GLSL's shadow samplers exist for depth-comparison sampling, which SM3
+     * expresses on an ordinary sampler plus a manual compare.  A helper
+     * overload like "vec4 tex2D( sampler2DShadow sampler, vec3 texcoord )"
+     * only ever appears dead in the shipped shaders here ??? every texture
+     * uniform in the game is a plain sampler2D ??? but the declaration alone
+     * fails D3DCompile, so the shadow spelling is folded onto the plain
+     * sampler and the comparison the caller really wants is done in the
+     * shader arithmetic. */
+    { "sampler1DShadow",  "sampler"    },
+    { "sampler2DShadow",  "sampler"    },
+    { "samplerCubeShadow","samplerCUBE"},
+    /* GLSL multisample samplers have no SM3 equivalent; the declaration alone
+     * fails D3DCompile (unrecognized type 'sampler2DMS'), so fold onto the
+     * plain sampler the way the integer and shadow variants are. */
+    { "sampler2DMS",      "sampler"    },
+    { "sampler2DMSArray", "sampler"    },
     { NULL, NULL }
 };
 
 /*---------------------- Forward declarations ----------------------*/
 
+/* Bitwise lowering (glslRewriteBitwise): D3DCompile rejects &, |, ^, ~, <<
+ * and >> on every Shader Model 3 profile (error X3535), so glslDoTranspile
+ * rewrites them into float-domain bit arithmetic before D3DCompile ever sees
+ * the text.  The float domain represents every integer below 2^24 exactly
+ * (16777216 is the first integer float cannot hold), so the lowering is exact
+ * for the values shaders actually use.  Constants are turned into
+ * single-operand helper functions that only test the bits the constant sets;
+ * non-constant operands fall back to general 24-bit helpers.
+ *
+ * The collector records, across both buffers that get rewritten, which helper
+ * functions the rewritten text needs; glslBitEmitHelpers then appends exactly
+ * those functions to the helpers buffer. */
+#define GLSL_BIT_MAX_LITS 48
+
+typedef enum {
+    GLSL_BIT_NONE = 0,
+    /* binary (levels follow GLSL precedence: low to high) */
+    GLSL_BIT_TERN,
+    GLSL_BIT_LOR,
+    GLSL_BIT_LAND,
+    GLSL_BIT_OR,
+    GLSL_BIT_XOR,
+    GLSL_BIT_AND,
+    GLSL_BIT_EQ,
+    GLSL_BIT_NE,
+    GLSL_BIT_LT,
+    GLSL_BIT_GT,
+    GLSL_BIT_LE,
+    GLSL_BIT_GE,
+    GLSL_BIT_SHL,
+    GLSL_BIT_SHR,
+    GLSL_BIT_ADD,
+    GLSL_BIT_SUB,
+    GLSL_BIT_MUL,
+    GLSL_BIT_DIV,
+    GLSL_BIT_MOD,
+    /* unary */
+    GLSL_BIT_NOT,
+    /* compound assignments (scanner entry points only) */
+    GLSL_BIT_AND_EQ,
+    GLSL_BIT_OR_EQ,
+    GLSL_BIT_XOR_EQ,
+    GLSL_BIT_SHL_EQ,
+    GLSL_BIT_SHR_EQ
+} glslBitOp;
+
+typedef struct {
+    BOOL hasGeneralAnd;
+    BOOL hasGeneralOr;
+    BOOL hasGeneralXor;
+    BOOL hasGeneralShl;
+    BOOL hasGeneralShr;
+    unsigned int andConst[GLSL_BIT_MAX_LITS]; int andCount;
+    unsigned int orConst[GLSL_BIT_MAX_LITS];  int orCount;
+    unsigned int xorConst[GLSL_BIT_MAX_LITS]; int xorCount;
+    BOOL warnedRange;
+    BOOL warnedFallback;
+} glslBitCollector;
+
+typedef struct {
+    glslBitCollector *col;
+    BOOL failed;
+} glslBitCtx;
+
+/* Debug helper: if verbose, dump the head-line containing `vec3` that is
+ * likely a multi-line initializer.  Used by the pipeline instrumentation
+ * to find which pass deletes it. */
+static void glslDbgDumpAmbient(const char *tag, const char *text)
+{
+    const char *hit;
+    const char *start;
+    int len;
+    if (!gldDiagVerboseGet() || !text) return;
+    /* Search for `vec3 ambientLight` — the line that gets deleted. */
+    hit = strstr(text, "ambientLight");
+    if (!hit) return;
+    start = hit;
+    while (start > text && start[-1] != '\n') start--;
+    { const char *end = strchr(start, '\n'); len = end ? (int)(end - start) : 64; }
+    gldDiagLog("DBG [%s] ambient: '%.*s'", tag, len, start);
+}
+
 static BOOL glslDoTranspile(int shaderType, const char *glslSource,
+                            const glslAttributeBinding *bindings,
+                            int bindingCount,
                             char *hlslOut, int hlslBufSize);
 static BOOL glslIsWordBoundary(char c);
 static char *glslSkipWhitespace(const char *p);
@@ -241,16 +423,20 @@ static void glslRewriteMatrixProducts(char *text, int textSize,
 static int  glslCollectMatrixSymbols(const char *src,
                                      char (*out)[GLSL_MAX_NAME_LEN], int maxOut);
 static void glslApplyTypeReplacements(char *text);
-static void glslApplyFunctionReplacements(char *text, glslTexDimSet *texDim,
+static void glslApplyFunctionReplacements(char *text, int textSize,
+                                           glslTexDimSet *texDim,
                                            const glslVarDecl *uniforms,
                                            int uniformCount);
 static void glslApplyTextureLodRewrite(char *text,
                                        const glslVarDecl *uniforms,
                                        int uniformCount);
-static void glslApplyTexelFetchRewrite(char *text, glslTexDimSet *texDim);
-static void glslApplyTextureSizeRewrite(char *text, glslTexDimSet *texDim);
+static void glslApplyTexelFetchRewrite(char *text, int textSize, glslTexDimSet *texDim);
+static void glslApplyTextureSizeRewrite(char *text, int textSize, glslTexDimSet *texDim);
 static void glslDetectUnlowerableConstructs(const char *src);
 static void glslReplaceBuiltinVars(char *text, int shaderType);
+static void glslRewriteBitwise(char *text, int textSize, glslBitCollector *col);
+static BOOL glslBitNearUintLiteral(const char *text, int pos);
+static void glslBitEmitHelpers(glslBitCollector *col, char *helpers, int helpersSize);
 static const char *glslConvertType(const char *glslType);
 static int  glslParseDeclarations(const char *src, int shaderType,
                                   glslVarDecl *attributes, int *pAttrCount,
@@ -259,11 +445,16 @@ static int  glslParseDeclarations(const char *src, int shaderType,
                                   const glslDefine *defines, int defineCount,
                                   BOOL *pUnresolvedArray);
 static int  glslCollectDefines(const char *src, glslDefine *out, int maxOut);
+static int  glslCollectObjectDefines(const char *src, glslObjectDefine *out,
+                                     int maxOut);
+static void glslApplyObjectDefines(char *text,
+                                   const glslObjectDefine *defines, int count);
 static void glslRenameReservedWords(char *text);
 static const char *glslReservedWordRenameOf(const char *name);
 static BOOL glslNameCollidesWithBuiltin(const char *name);
 static void glslExtractMainBody(const char *src, char *body, int bodySize);
 static void glslRemoveDeclarationLines(char *src);
+static void glslJoinContinuationLines(char *src);
 static int  glslCollectFragmentOutputs(const char *src,
                                        glslFragOutput *outputs, int maxOutputs);
 static void glslBuildVertexShader(const glslVarDecl *attrs, int attrCount,
@@ -285,37 +476,95 @@ static void glslBuildPixelShader(const glslVarDecl *varyings, int varyCount,
 
 BOOL glslTranspilerInit(void)
 {
-    if (s_bInitialized)
+    BOOL initialized = FALSE;
+    HMODULE compiler = NULL;
+    PFN_D3DCompile compileProc = NULL;
+    char compilerPath[MAX_PATH];
+    char attemptedPath[MAX_PATH];
+    DWORD error = ERROR_SUCCESS;
+
+    if (InterlockedCompareExchange(&s_bInitialized, FALSE, FALSE))
         return TRUE;
 
-    s_hD3DCompiler = LoadLibraryA("d3dcompiler_47.dll");
-    if (!s_hD3DCompiler) {
-        gldLogPrintf(GLDLOG_ERROR, "glslTranspilerInit: Failed to load d3dcompiler_47.dll (error %u)\n",
-                     GetLastError());
-        return FALSE;
+    AcquireSRWLockExclusive(&s_compilerLock);
+    __try {
+        if (InterlockedCompareExchange(&s_bInitialized, FALSE, FALSE)) {
+            initialized = TRUE;
+            __leave;
+        }
+
+        compiler = glslLoadSystemCompiler(compilerPath, sizeof(compilerPath),
+                                          attemptedPath, sizeof(attemptedPath),
+                                          &error);
+        if (!compiler) {
+            if (InterlockedCompareExchange(&s_compilerLoadFailureLogged,
+                                           TRUE, FALSE) == FALSE) {
+                const char *path = attemptedPath[0]
+                    ? attemptedPath
+                    : "Windows system directory\\d3dcompiler_47.dll";
+                gldLogPrintf(GLDLOG_ERROR,
+                             "glslTranspilerInit: failed to load system compiler '%s' (error %lu)",
+                             path, error);
+                gldDiagLog("shader: failed to load system compiler '%s' (error %lu)",
+                           path, error);
+            }
+            __leave;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        compileProc = (PFN_D3DCompile)GetProcAddress(compiler, "D3DCompile");
+        if (!compileProc) {
+            error = GetLastError();
+            if (error == ERROR_SUCCESS)
+                error = ERROR_PROC_NOT_FOUND;
+            if (InterlockedCompareExchange(&s_compilerLoadFailureLogged,
+                                           TRUE, FALSE) == FALSE) {
+                const char *path = compilerPath[0]
+                    ? compilerPath
+                    : "d3dcompiler_47.dll";
+                gldLogPrintf(GLDLOG_ERROR,
+                             "glslTranspilerInit: D3DCompile missing from '%s' (error %lu)",
+                             path, error);
+                gldDiagLog("shader: D3DCompile missing from '%s' (error %lu)",
+                           path, error);
+            }
+            FreeLibrary(compiler);
+            compiler = NULL;
+            __leave;
+        }
+
+        s_hD3DCompiler = compiler;
+        s_pfnD3DCompile = compileProc;
+        InterlockedExchange(&s_compilerLoadFailureLogged, FALSE);
+        InterlockedExchange(&s_bInitialized, TRUE);
+        gldLogPrintf(GLDLOG_INFO,
+                     "glslTranspilerInit: loaded system compiler '%s'",
+                     compilerPath[0] ? compilerPath : "d3dcompiler_47.dll");
+        gldDiagLog("shader: loaded system compiler '%s'",
+                   compilerPath[0] ? compilerPath : "d3dcompiler_47.dll");
+        initialized = TRUE;
+    }
+    __finally {
+        ReleaseSRWLockExclusive(&s_compilerLock);
     }
 
-    s_pfnD3DCompile = (PFN_D3DCompile)GetProcAddress(s_hD3DCompiler, "D3DCompile");
-    if (!s_pfnD3DCompile) {
-        gldLogPrintf(GLDLOG_ERROR, "glslTranspilerInit: D3DCompile not found in d3dcompiler_47.dll\n");
-        FreeLibrary(s_hD3DCompiler);
-        s_hD3DCompiler = NULL;
-        return FALSE;
-    }
-
-    s_bInitialized = TRUE;
-    gldLogPrintf(GLDLOG_INFO, "glslTranspilerInit: d3dcompiler_47.dll loaded successfully\n");
-    return TRUE;
+    return initialized;
 }
 
 void glslTranspilerShutdown(void)
 {
-    if (s_hD3DCompiler) {
-        FreeLibrary(s_hD3DCompiler);
-        s_hD3DCompiler = NULL;
+    AcquireSRWLockExclusive(&s_compilerLock);
+    __try {
+        InterlockedExchange(&s_bInitialized, FALSE);
+        s_pfnD3DCompile = NULL;
+        if (s_hD3DCompiler) {
+            FreeLibrary(s_hD3DCompiler);
+            s_hD3DCompiler = NULL;
+        }
     }
-    s_pfnD3DCompile = NULL;
-    s_bInitialized = FALSE;
+    __finally {
+        ReleaseSRWLockExclusive(&s_compilerLock);
+    }
 }
 
 void glslSetDeviceCaps(const D3DCAPS9 *pCaps)
@@ -362,7 +611,7 @@ static int glslBuildVSLadder(const D3DCAPS9 *caps, const char **ladder, int maxR
     if (maxRungs <= 0)
         return 0;
 
-    /* No caps known — assume the ceiling this transpiler always assumed. */
+    /* No caps known ??? assume the ceiling this transpiler always assumed. */
     if (!caps) {
         ladder[n++] = "vs_3_0";
         return n;
@@ -406,8 +655,8 @@ static int glslBuildPSLadder(const D3DCAPS9 *caps, const char **ladder, int maxR
         if (n < maxRungs) ladder[n++] = "ps_2_0";
     }
     /* ps_1_1 through ps_1_4 are deliberately never appended.  d3dcompiler_47
-     * refuses all four unconditionally — "error X3539: ps_1_x is no longer
-     * supported", hr = E_NOTIMPL — no matter what the shader contains, so a
+     * refuses all four unconditionally ??? "error X3539: ps_1_x is no longer
+     * supported", hr = E_NOTIMPL ??? no matter what the shader contains, so a
      * rung for them would only ever produce a confusing failure instead of the
      * accurate "this device is below what we can target" message. */
 
@@ -420,6 +669,15 @@ static int glslBuildPSLadder(const D3DCAPS9 *caps, const char **ladder, int maxR
 
 BOOL glslTranspileAndCompile(int shaderType, const char *glslSource,
                              void **ppBytecode, DWORD *pBytecodeSize)
+{
+    return glslTranspileAndCompileBound(shaderType, glslSource, NULL, 0,
+                                        ppBytecode, pBytecodeSize);
+}
+
+BOOL glslTranspileAndCompileBound(int shaderType, const char *glslSource,
+                                  const glslAttributeBinding *bindings,
+                                  int bindingCount,
+                                  void **ppBytecode, DWORD *pBytecodeSize)
 {
     char *hlslSource = NULL;
     ID3DBlob *pCode = NULL;
@@ -460,12 +718,26 @@ BOOL glslTranspileAndCompile(int shaderType, const char *glslSource,
      * downstream.  Purely a diagnostic: transpilation and compilation then
      * proceed exactly as they would have. */
     glslDetectUnlowerableConstructs(glslSource);
-    if (!glslDoTranspile(shaderType, glslSource, hlslSource, HLSL_MAX_OUTPUT)) {
+    if (!glslDoTranspile(shaderType, glslSource, bindings, bindingCount,
+                         hlslSource, HLSL_MAX_OUTPUT)) {
         gldDiagLog("GLSL->HLSL: transpilation failed before the compiler was reached "
                    "(%s stage)", shaderType == 0 ? "vertex" : "fragment");
         gldLogPrintf(GLDLOG_ERROR, "glslTranspileAndCompile: GLSL to HLSL transpilation failed\n");
         free(hlslSource);
         return FALSE;
+    }
+    {
+        char match[128];
+        DWORD matchLength = GetEnvironmentVariableA(
+            "GLDIRECT_DUMP_HLSL_MATCH", match, sizeof(match));
+        if (matchLength > 0 && matchLength < sizeof(match) &&
+            strstr(glslSource, match)) {
+            gldDiagLog("GLSL->HLSL: matched '%s' %s HLSL BEGIN\n%s\n"
+                       "GLSL->HLSL: matched '%s' HLSL END",
+                       match,
+                       shaderType == GLSL_SHADER_VERTEX ? "vertex" : "pixel",
+                       hlslSource, match);
+        }
     }
     caps = s_bDeviceCapsValid ? &s_deviceCaps : NULL;
     rungCount = (shaderType == GLSL_SHADER_VERTEX)
@@ -511,7 +783,7 @@ BOOL glslTranspileAndCompile(int shaderType, const char *glslSource,
             /* A compiled rung still has to clear the ceiling in bytecode, not
              * just in name.  d3dcompiler_47 stamps vs_2_a/ps_2_a output with a
              * 2.1 version token, and a device reporting a 2.0 ceiling refuses
-             * that at CreateVertexShader/CreatePixelShader time — the very
+             * that at CreateVertexShader/CreatePixelShader time ??? the very
              * rejection this ladder exists to avoid.  So an overshooting rung
              * counts as a failed rung whenever there is a lower one to fall
              * to; on the last rung it is kept, since something the device may
@@ -544,7 +816,7 @@ BOOL glslTranspileAndCompile(int shaderType, const char *glslSource,
         }
 
         if (rung + 1 >= rungCount)
-            break;      /* last rung — fall through to the full failure report */
+            break;      /* last rung ??? fall through to the full failure report */
 
         /* Another rung left: drop this rung's diagnostics and try lower.  Only
          * the final rung's error text is worth keeping, since it is the one
@@ -562,6 +834,18 @@ BOOL glslTranspileAndCompile(int shaderType, const char *glslSource,
                        rungCount, profile);
         if (pErrors) {
             const char *errMsg = (const char *)pErrors->lpVtbl->GetBufferPointer(pErrors);
+            const char *fatal = errMsg ? strstr(errMsg, "error X") : NULL;
+            if (fatal) {
+                char fatalLine[768];
+                size_t fatalLen = 0;
+                while (fatal[fatalLen] && fatal[fatalLen] != '\r' &&
+                       fatal[fatalLen] != '\n' &&
+                       fatalLen + 1 < sizeof(fatalLine))
+                    ++fatalLen;
+                memcpy(fatalLine, fatal, fatalLen);
+                fatalLine[fatalLen] = '\0';
+                gldDiagLog("D3DCompile first fatal diagnostic: %s", fatalLine);
+            }
             /* The compiler's own text says which line and construct it rejected;
              * without it every failure looks alike and the only way forward is
              * guesswork. Truncated because a bad translation can produce
@@ -582,13 +866,23 @@ BOOL glslTranspileAndCompile(int shaderType, const char *glslSource,
          * diagnostic into a guess.  A shader that overruns even this bound is
          * far past anything the SM3 profiles can compile anyway.  gldDiagLog
          * vfprintf's straight to the file, so there is no intermediate buffer
-         * this width has to fit inside. */
-        gldDiagLog("D3DCompile: rejected HLSL follows ---\n%.65000s\n--- end HLSL", hlslSource);
-        /* The HLSL alone only shows the symptom.  When the fault is in the
-         * translation rather than in the shader, the input GLSL is what names
-         * the construct that was mishandled, and an application's GLSL is not
-         * recoverable from anywhere else afterwards. */
-        gldDiagLog("D3DCompile: input GLSL follows ---\n%.65000s\n--- end GLSL", glslSource);
+         * this width has to fit inside.
+         *
+         * Both full-text dumps are gated on verbose diagnostics.  They were
+         * always-on once, and a title whose shaders repeatedly fall back to
+         * software GL (a normal, expected situation) grew gldirect_diag.log
+         * to multiple gigabytes in a single session â€” ~130 KB of source text
+         * per failed compile.  The always-on line that names the failure and
+         * profile is written before this point; these two dumps are the
+         * deep-dive, which is exactly what verbose mode is for. */
+        if (gldDiagVerboseGet()) {
+            gldDiagLog("D3DCompile: rejected HLSL follows ---\n%.65000s\n--- end HLSL", hlslSource);
+            /* The HLSL alone only shows the symptom.  When the fault is in the
+             * translation rather than in the shader, the input GLSL is what names
+             * the construct that was mishandled, and an application's GLSL is not
+             * recoverable from anywhere else afterwards. */
+            gldDiagLog("D3DCompile: input GLSL follows ---\n%.65000s\n--- end GLSL", glslSource);
+        }
         free(hlslSource);
         return FALSE;
     }
@@ -953,7 +1247,7 @@ static char *glslSkipWhitespace(const char *p)
 }
 
 /*
- * glslSkipDeclQualifiers — step past anything that may sit in front of a
+ * glslSkipDeclQualifiers ??? step past anything that may sit in front of a
  * declaration's storage qualifier.
  *
  * GLSL 1.30+ lets a layout block and the interpolation/auxiliary qualifiers
@@ -1109,7 +1403,7 @@ static void glslReplaceAll(char *text, const char *oldStr, const char *newStr)
 }
 
 /*
- * glslReplaceWordNotCalled — glslReplaceWord, except that an occurrence which
+ * glslReplaceWordNotCalled ??? glslReplaceWord, except that an occurrence which
  * is immediately followed (past spaces and tabs) by '(' is left alone.
  *
  * Exists for exactly one word.  "texture" is both a perfectly ordinary GLSL
@@ -1258,16 +1552,16 @@ static const char *glslReservedWordRenameOf(const char *name)
  * function of that name:
  *
  *   - the GLSL builtins glslApplyFunctionReplacements matches.  A user
- *     function called "textureLod" is rewritten *at its own definition* —
+ *     function called "textureLod" is rewritten *at its own definition* ???
  *     glslApplyTextureLodRewrite's fallback branch fires because a definition
- *     header does not parse as a 3-argument call — producing HLSL like
+ *     header does not parse as a 3-argument call ??? producing HLSL like
  *     "float4 tex2Dlod( sampler2D sampler, ... )".
  *   - the HLSL names those become.  Same outcome by a different route: the
  *     definition survives intact and shadows the intrinsic.
  *   - the rest of the SM1-3 intrinsic set.  D3DCompile tolerates a shadowing
  *     definition right up until it is reachable from main() and refers to
  *     itself, at which point it is "error X3500: recursive functions not
- *     allowed" — so the same shader compiles or does not depending on whether
+ *     allowed" ??? so the same shader compiles or does not depending on whether
  *     the wrapper is dead code, which is not a distinction worth relying on.
  *
  * Renaming is uniform: every occurrence of the name becomes _glsl_userfn_<name>
@@ -1280,6 +1574,8 @@ static const char *const kGlslCollisionNames[] = {
     "mix", "fract", "mod", "inversesqrt", "dFdx", "dFdy",
     "texture2D", "textureCube", "texture3D", "textureLod",
     "texelFetch", "textureSize", "texture", "atan",
+    "lessThan", "greaterThan", "lessThanEqual", "greaterThanEqual",
+    "equal", "notEqual",
     /* HLSL-side names they become */
     "lerp", "frac", "fmod", "rsqrt", "ddx", "ddy",
     "tex2D", "texCUBE", "tex3D", "tex2Dlod", "atan2",
@@ -1291,6 +1587,8 @@ static const char *const kGlslCollisionNames[] = {
     "refract", "round", "saturate", "sign", "sin", "sincos", "smoothstep",
     "sqrt", "step", "tan", "tanh", "tex1D", "tex2Dbias", "tex2Dgrad",
     "tex2Dproj", "transpose", "trunc",
+    "tex1Dproj", "tex3Dproj", "tex1Dbias", "tex3Dbias", "texCUBEbias",
+    "tex1Dlod", "tex3Dlod", "texCUBElod",
     NULL
 };
 
@@ -1365,7 +1663,7 @@ static void glslStripPrecisionQualifiers(char *src)
 }
 
 /*
- * glslStripLayoutQualifiers — parse and remove layout(location=N) qualifiers.
+ * glslStripLayoutQualifiers ??? parse and remove layout(location=N) qualifiers.
  * Stores the location value in the vars array for later semantic assignment.
  */
 static void glslStripLayoutQualifiers(char *src, glslVarDecl *vars, int *pVarCount)
@@ -1394,6 +1692,63 @@ static void glslStripLayoutQualifiers(char *src, glslVarDecl *vars, int *pVarCou
         while (start <= paren) { *start = ' '; start++; }
         p = paren + 1;
     }
+}
+
+/*
+ * glslJoinContinuationLines -- collapse multi-line statements onto one line.
+ *
+ * GLSL treats newlines as whitespace, so a statement can span multiple lines:
+ *
+ *     vec3 ambientLight = vec3( 0.0 )
+ *     + max( ... )
+ *     + max( ... );
+ *
+ * The transpiler's line-oriented passes (glslRemoveDeclarationLines, etc.)
+ * operate on individual lines and can accidentally blank the head of such a
+ * multi-line statement, orphaning the continuation lines.  Joining all
+ * continuation lines onto the head eliminates the class entirely: every
+ * expression becomes a single line that no pass can partially delete.
+ *
+ * A continuation is any line whose last non-whitespace character is not a
+ * statement terminator (';', '{', '}').  Blank lines are left alone.
+ * Runs in-place: write pointer never exceeds read pointer.
+ */
+static void glslJoinContinuationLines(char *src)
+{
+    char *rd = src;
+    char *wr = src;
+
+    while (*rd) {
+        char *nl = strchr(rd, '\n');
+        char *last;
+
+        if (!nl) {
+            /* Last line -- copy verbatim. */
+            while (*rd) *wr++ = *rd++;
+            break;
+        }
+
+        /* Find the last non-space/tab before the newline. */
+        last = nl - 1;
+        while (last >= rd && (*last == ' ' || *last == '\t'))
+            last--;
+
+        if (last < rd || *last == ';' || *last == '{' || *last == '}') {
+            /* Blank line or line ending with a terminator -- keep as-is. */
+            int len = (int)(nl - rd) + 1;     /* include '\n' */
+            memcpy(wr, rd, (size_t)len);
+            wr += len;
+            rd = nl + 1;
+        } else {
+            /* Continuation -- join with the next line (replace '\n' with ' '). */
+            int len = (int)(nl - rd);
+            memcpy(wr, rd, (size_t)len);
+            wr += len;
+            *wr++ = ' ';
+            rd = nl + 1;
+        }
+    }
+    *wr = '\0';
 }
 
 
@@ -1497,13 +1852,13 @@ static int glslConstructorArgCount(const char *args, int len)
 }
 
 /*
- * glslRewriteVectorSplats — turn a one-argument vector constructor into a cast.
+ * glslRewriteVectorSplats ??? turn a one-argument vector constructor into a cast.
  *
  * GLSL lets a vector constructor take a single value: vec4(x) splats a scalar
  * across all four components and vec3(v) truncates a wider vector.  HLSL has no
  * such rule.  Its constructors take exactly as many components as the type has,
  * so float4(dot(a, b)) is "error X3014: incorrect number of arguments to
- * numeric-type constructor" — which is what every DP3/DP4/DPH/RCP/RSQ/EX2/LG2/
+ * numeric-type constructor" ??? which is what every DP3/DP4/DPH/RCP/RSQ/EX2/LG2/
  * SIN/COS/POW an ARB program lowers to was hitting, and what any hand-written
  * GLSL that says vec4(0.0) would hit too.
  *
@@ -1626,7 +1981,7 @@ static void glslRewriteVectorSplats(char *text, int textSize)
  * GLSL spells matrix arithmetic with the ordinary operators; HLSL spells the
  * same arithmetic with mul() and gives '*' the component-wise meaning instead.
  * So "uMVP * aPos" is a matrix product in one language and a component-wise
- * multiply in the other — which is why it arrives as "error X3020: type
+ * multiply in the other ??? which is why it arrives as "error X3020: type
  * mismatch" the moment the operand shapes stop agreeing, and would silently
  * compute the wrong thing whenever they happen to agree.
  *
@@ -1649,13 +2004,13 @@ static const char *const kGlslMatrixTypes[] = {
 };
 
 /*
- * glslCollectMatrixSymbols — the names this file is willing to treat as
+ * glslCollectMatrixSymbols ??? the names this file is willing to treat as
  * matrices.
  *
  * There is no type system here, so the set is whatever a "matN name" spelling
  * appears for anywhere in the source: uniform declarations, local declarations,
  * and function parameters all match the same pattern.  Anything reached
- * indirectly — a struct field, a helper's return value — is simply not
+ * indirectly ??? a struct field, a helper's return value ??? is simply not
  * recognised and keeps today's untouched '*', which is a compile failure rather
  * than a silent miscompile.
  */
@@ -1736,7 +2091,7 @@ static BOOL glslSpanIsMatrix(const char *text, int a, int b,
     len = b - a;
     if (len <= 0) return FALSE;
 
-    /* A mul() this same rewrite produced on an earlier pass — that is how
+    /* A mul() this same rewrite produced on an earlier pass ??? that is how
      * chains like "uProj * uView * aPos" reassociate correctly. */
     if (len > 4 && strncmp(text + a, "mul", 3) == 0 &&
         *glslSkipWhitespace(text + a + 3) == '(')
@@ -1784,7 +2139,7 @@ static BOOL glslSpanIsNumericLiteral(const char *text, int a, int b)
 /*
  * Walk backwards from `end` over one postfix expression (identifier, call,
  * subscript, member chain).  Returns its first index, or -1 when there is no
- * operand there — an operator, an open bracket, a statement boundary.
+ * operand there ??? an operator, an open bracket, a statement boundary.
  */
 static int glslScanOperandBackward(const char *text, int end)
 {
@@ -1874,12 +2229,12 @@ static int glslScanOperandForward(const char *text, int start)
 }
 
 /*
- * glslRewriteMatrixProducts — turn "A * B" into "mul(A, B)" whenever either
+ * glslRewriteMatrixProducts ??? turn "A * B" into "mul(A, B)" whenever either
  * operand is a recognised matrix.
  *
  * Bounded multi-pass, one rewrite per pass, in the same spirit as
  * glslRewriteVectorSplats: rewriting the leftmost product and re-scanning is
- * what makes a chain reassociate the way GLSL's left-associative '*' does —
+ * what makes a chain reassociate the way GLSL's left-associative '*' does ???
  * "uProj * uView * aPos" becomes mul(uProj, uView) * aPos and then
  * mul(mul(uProj, uView), aPos).  A pass that runs out of buffer abandons the
  * whole rewrite rather than writing back a partial one.
@@ -1957,7 +2312,7 @@ static void glslRewriteMatrixProducts(char *text, int textSize,
 }
 
 /*
- * glslRewriteMatrixDiagonal — matN(x) builds a diagonal matrix in GLSL.
+ * glslRewriteMatrixDiagonal ??? matN(x) builds a diagonal matrix in GLSL.
  *
  * This is the case glslRewriteVectorSplats deliberately refuses: an HLSL cast
  * (float4x4)x replicates x into all sixteen components, which compiles and is
@@ -2079,7 +2434,7 @@ copyChar:
 }
 
 /*
- * glslApplyTextureLodRewrite — rewrite textureLod using the declared sampler
+ * glslApplyTextureLodRewrite ??? rewrite textureLod using the declared sampler
  * dimensionality. SM3 carries explicit LOD in the final coordinate component.
  */
 static void glslApplyTextureLodRewrite(char *text,
@@ -2180,6 +2535,36 @@ static void glslApplyTextureLodRewrite(char *text,
                             {
                                 const char *samplerType = glslSamplerType(
                                     uniforms, uniformCount, args[0]);
+                                if (!samplerType) {
+                                    /* Helper parameter: the declared dimension
+                                     * sits in the nearest preceding function
+                                     * header. */
+                                    static const char *const dims[] = {
+                                        "sampler1D", "sampler2D",
+                                        "sampler3D", "samplerCube", "samplerCUBE" };
+                                    const char *start = found;
+                                    const char *q;
+                                    int di;
+                                    while (start > text && start[-1] != '}') start--;
+                                    q = found;
+                                    while (q > start) {
+                                        q--;
+                                        for (di = 0; di < 5; ++di) {
+                                            size_t len = strlen(dims[di]);
+                                            if ((size_t)(found - q) >= len &&
+                                                !strncmp(q, dims[di], len) &&
+                                                (q == text ||
+                                                 !(isalnum((unsigned char)q[-1]) ||
+                                                   q[-1] == '_')) &&
+                                                !(isalnum((unsigned char)q[len]) ||
+                                                  q[len] == '_')) {
+                                                samplerType = dims[di];
+                                                break;
+                                            }
+                                        }
+                                        if (samplerType) break;
+                                    }
+                                }
                                 const char *intrinsic = glslTextureIntrinsic(
                                     samplerType, TRUE, FALSE);
                                 if (samplerType && strstr(samplerType, "1D"))
@@ -2310,7 +2695,43 @@ static int glslSplitCallArgs(const char *text, int openIdx, int closeIdx,
  * inventing a wrong translation). */
 typedef int (*glslCallEmitFn)(char *dst, int dstRoom, char **args, int argCount,
                               glslTexDimSet *texDim,
-                              const glslVarDecl *uniforms, int uniformCount);
+                              const glslVarDecl *uniforms, int uniformCount,
+                              const char *textBase, const char *callSite);
+
+/*
+ * GLSL comparison intrinsics ??? lessThan/greaterThan/lessThanEqual/
+ * greaterThanEqual/equal/notEqual ??? have no HLSL names, but the relational
+ * operators HLSL does have are componentwise on vectors and yield a bool
+ * vector, which is exactly the type any()/all() consume.  So lessThan(a, b)
+ * becomes (a < b) and its siblings map 1:1.  Two-argument form only, which is
+ * the whole GLSL set.
+ */
+static int glslEmitCompare(char *dst, int dstRoom, char **args, int argCount,
+                           const char *op)
+{
+    int off;
+    if (argCount != 2 || dstRoom < 16) return -1;
+    off = sprintf(dst, "(%s %s %s)", args[0], op, args[1]);
+    return off <= dstRoom ? off : -1;
+}
+
+#define GLSL_COMPARE_EMIT(fn, op) \
+static int fn(char *dst, int dstRoom, char **args, int argCount, \
+              glslTexDimSet *texDim, const glslVarDecl *uniforms, \
+              int uniformCount, const char *textBase, const char *callSite) \
+{ \
+    (void)texDim; (void)uniforms; (void)uniformCount; (void)textBase; (void)callSite; \
+    return glslEmitCompare(dst, dstRoom, args, argCount, op); \
+}
+
+GLSL_COMPARE_EMIT(glslEmitLessThan,         "<")
+GLSL_COMPARE_EMIT(glslEmitGreaterThan,      ">")
+GLSL_COMPARE_EMIT(glslEmitLessThanEqual,    "<=")
+GLSL_COMPARE_EMIT(glslEmitGreaterThanEqual, ">=")
+GLSL_COMPARE_EMIT(glslEmitEqual,            "==")
+GLSL_COMPARE_EMIT(glslEmitNotEqual,         "!=")
+
+#undef GLSL_COMPARE_EMIT
 
 /*
  * Rewrite every call to `funcName` in `text` through `emit`.
@@ -2321,7 +2742,7 @@ typedef int (*glslCallEmitFn)(char *dst, int dstRoom, char **args, int argCount,
  * abandons the whole rewrite and leaves `text` alone rather than writing back
  * a half-rewritten shader.
  */
-static void glslRewriteCall(char *text, const char *funcName,
+static void glslRewriteCall(char *text, int textSize, const char *funcName,
                             glslCallEmitFn emit, glslTexDimSet *texDim,
                             const glslVarDecl *uniforms, int uniformCount)
 {
@@ -2384,7 +2805,7 @@ static void glslRewriteCall(char *text, const char *funcName,
 
             if (argCount > 0)
                 written = emit(dst, (int)(buf + bufLen - 1 - dst), args, argCount,
-                               texDim, uniforms, uniformCount);
+                               texDim, uniforms, uniformCount, text, found);
 
             if (written >= 0) {
                 dst += written;
@@ -2400,6 +2821,12 @@ static void glslRewriteCall(char *text, const char *funcName,
     }
 
     *dst = '\0';
+    /* A rewrite that outgrew its target is discarded whole rather than
+     * copied truncated past the end of `text` ??? the sibling rewrites apply
+     * the same rule (glslApplyTextureLodRewrite, glslRewriteMatrixDiagonal).
+     * Without it an expanding rewrite against a large shader body would
+     * strcpy past the heap block `text` lives in. */
+    if ((int)(dst - buf) >= textSize) { free(buf); return; }
     strcpy(text, buf);
     free(buf);
 }
@@ -2413,13 +2840,15 @@ static void glslRewriteCall(char *text, const char *funcName,
  * constant. */
 static int glslEmitTexelFetch(char *dst, int dstRoom, char **args, int argCount,
                               glslTexDimSet *texDim,
-                              const glslVarDecl *uniforms, int uniformCount)
+                              const glslVarDecl *uniforms, int uniformCount,
+                              const char *textBase, const char *callSite)
 {
     const char *lod = (argCount == 3) ? args[2] : "0";
     int need;
 
     (void)uniforms;
     (void)uniformCount;
+    (void)callSite; (void)textBase;
     if (argCount != 2 && argCount != 3) return -1;
     if (!glslIsPlainIdentifier(args[0]))  return -1;   /* cannot name a uniform after it */
 
@@ -2440,10 +2869,12 @@ static int glslEmitTexelFetch(char *dst, int dstRoom, char **args, int argCount,
  * size rather than failing to compile. */
 static int glslEmitTextureSize(char *dst, int dstRoom, char **args, int argCount,
                                glslTexDimSet *texDim,
-                               const glslVarDecl *uniforms, int uniformCount)
+                               const glslVarDecl *uniforms, int uniformCount,
+                               const char *textBase, const char *callSite)
 {
     (void)uniforms;
     (void)uniformCount;
+    (void)callSite; (void)textBase;
     if (argCount != 1 && argCount != 2) return -1;
     if (!glslIsPlainIdentifier(args[0])) return -1;
     if (dstRoom < (int)strlen(args[0]) + 32) return -1;
@@ -2454,15 +2885,66 @@ static int glslEmitTextureSize(char *dst, int dstRoom, char **args, int argCount
 
 static int glslEmitTexture(char *dst, int dstRoom, char **args, int argCount,
                            glslTexDimSet *texDim,
-                           const glslVarDecl *uniforms, int uniformCount)
+                           const glslVarDecl *uniforms, int uniformCount,
+                           const char *textBase, const char *callSite)
 {
     const char *samplerType;
     const char *intrinsic;
     int need;
 
     (void)texDim;
+    (void)callSite; (void)textBase;
     if (argCount != 2 && argCount != 3) return -1;
     samplerType = glslSamplerType(uniforms, uniformCount, args[0]);
+    if (!samplerType) {
+        /* Not a uniform ??? a helper parameter.  The nearest '}' before the
+         * call closes the previous function (or the start of the buffer);
+         * this helper's header, with its sampler parameter type, lies
+         * between that brace and the call site.  Scan that window; the
+         * declared dimension is authoritative there, unlike a bare swizzle
+         * count, which cannot tell tex3D from texCUBE (both take .xyz). */
+        static const char *const dims[] = { "sampler1D", "sampler2D",
+                                            "sampler3D", "samplerCube", "samplerCUBE",
+                                            "sampler" };
+        const char *start = callSite;
+        const char *p;
+        while (start > textBase && start[-1] != '}') start--;
+        p = callSite;
+        while (p > start) {
+            int i;
+            p--;
+            for (i = 0; i < (int)(sizeof(dims) / sizeof(dims[0])); ++i) {
+                size_t len = strlen(dims[i]);
+                if ((size_t)(callSite - p) >= len &&
+                    !strncmp(p, dims[i], len) &&
+                    (p == textBase ||
+                     !(isalnum((unsigned char)p[-1]) || p[-1] == '_')) &&
+                    !(isalnum((unsigned char)p[len]) || p[len] == '_')) {
+                    samplerType = dims[i];
+                    break;
+                }
+            }
+            if (samplerType) break;
+        }
+        if (!samplerType) {
+            /* Not found ??? fall back to the coordinate swizzle's component
+             * count: tex2D helpers pass .xy, texCUBE/tex3D helpers .xyz. */
+            const char *sw = args[1];
+            int comps = 0;
+            const char *dot = NULL;
+            while (*sw) {
+                if (*sw == '.') dot = sw;
+                sw++;
+            }
+            if (dot) {
+                const char *q = dot + 1;
+                while (*q == 'x' || *q == 'y' || *q == 'z' || *q == 'w') { comps++; q++; }
+            }
+            if (comps == 1)      samplerType = "sampler1D";
+            else if (comps >= 3) samplerType = "samplerCube";
+            else                 samplerType = "sampler2D";
+        }
+    }
     intrinsic = glslTextureIntrinsic(samplerType, FALSE, argCount == 3);
     need = (int)strlen(intrinsic) + (int)strlen(args[0]) +
            (int)strlen(args[1]) + 32;
@@ -2484,24 +2966,165 @@ static int glslEmitTexture(char *dst, int dstRoom, char **args, int argCount,
                    intrinsic, args[0], args[1], args[2]);
 }
 
-static void glslApplyTexelFetchRewrite(char *text, glslTexDimSet *texDim)
+static void glslApplyTexelFetchRewrite(char *text, int textSize, glslTexDimSet *texDim)
 {
-    glslRewriteCall(text, "texelFetch", glslEmitTexelFetch, texDim, NULL, 0);
+    glslRewriteCall(text, textSize, "texelFetch", glslEmitTexelFetch, texDim, NULL, 0);
 }
 
-static void glslApplyTextureSizeRewrite(char *text, glslTexDimSet *texDim)
+static void glslApplyTextureSizeRewrite(char *text, int textSize, glslTexDimSet *texDim)
 {
-    glslRewriteCall(text, "textureSize", glslEmitTextureSize, texDim, NULL, 0);
+    glslRewriteCall(text, textSize, "textureSize", glslEmitTextureSize, texDim, NULL, 0);
 }
 
-static void glslApplyTextureRewrite(char *text, glslTexDimSet *texDim,
+static void glslApplyTextureRewrite(char *text, int textSize, glslTexDimSet *texDim,
                                     const glslVarDecl *uniforms, int uniformCount)
 {
-    glslRewriteCall(text, "texture", glslEmitTexture, texDim,
+    glslRewriteCall(text, textSize, "texture", glslEmitTexture, texDim,
                     uniforms, uniformCount);
 }
 
-static void glslApplyFunctionReplacements(char *text, glslTexDimSet *texDim,
+static int glslEmitTextureProj(char *dst, int dstRoom, char **args, int argCount,
+                               glslTexDimSet *texDim,
+                               const glslVarDecl *uniforms, int uniformCount,
+                               const char *textBase, const char *callSite)
+{
+    const char *samplerType;
+    const char *intrinsic;
+    int need;
+
+    (void)texDim;
+    if (argCount != 2) return -1;
+    /* GLSL textureProj dispatch: sampler1D takes vec2, sampler2D vec3,
+     * sampler3D/samplerCube vec4.  The sampler argument is usually a helper
+     * parameter (all proj helpers in the corpus are dead code: never called),
+     * so look the dimension up in the helper's own header, which is the
+     * nearest preceding "sampler#D" token before the call site in the text
+     * buffer.  When the sampler is a declared uniform, its type is
+     * authoritative. */
+    samplerType = glslSamplerType(uniforms, uniformCount, args[0]);
+    if (!samplerType) {
+        static const char *const dims[] = { "sampler1D", "sampler2D",
+                                            "sampler3D", "samplerCube", "samplerCUBE" };
+        /* The nearest '}' before the call closes the previous function (or
+         * the start of the buffer); this helper's header, with its sampler
+         * parameter type, lies between that brace and the call site.  Scan
+         * that window only, so an unrelated sampler in an earlier helper
+         * cannot be mistaken for this one's. */
+        const char *start = callSite;
+        const char *p;
+        while (start > textBase && start[-1] != '}') start--;
+        p = callSite;
+        while (p > start) {
+            int i;
+            p--;
+            for (i = 0; i < 5; ++i) {
+                size_t len = strlen(dims[i]);
+                if ((size_t)(callSite - p) >= len &&
+                    !strncmp(p, dims[i], len) &&
+                    (p == textBase ||
+                     !(isalnum((unsigned char)p[-1]) || p[-1] == '_')) &&
+                    !(isalnum((unsigned char)p[len]) || p[len] == '_')) {
+                    samplerType = dims[i];
+                    break;
+                }
+            }
+            if (samplerType) break;
+        }
+        if (!samplerType) samplerType = "sampler2D";
+        fprintf(stderr, "DEBUG proj: arg=%s -> %s\n", args[0], samplerType);
+    }
+    if (strstr(samplerType, "1D"))         intrinsic = "tex1Dproj";
+    else if (strstr(samplerType, "3D"))    intrinsic = "tex3Dproj";
+    else if (strstr(samplerType, "Cube") ||
+             strstr(samplerType, "CUBE"))  intrinsic = "texCUBEproj";
+    else                                   intrinsic = "tex2Dproj";
+
+    if (!strcmp(intrinsic, "tex2Dproj")) {
+        /* HLSL tex2Dproj takes float4 and divides by w; GLSL's float3 form
+         * divides by z, hence float4(xy, 1, z).  When the coordinate is
+         * already 4 components (e.g. a samplerCubeShadow helper), leave it. */
+        need = (int)strlen(intrinsic) + (int)strlen(args[0]) +
+               2 * (int)strlen(args[1]) + 40;
+        if (dstRoom < need) return -1;
+        return sprintf(dst, "tex2Dproj(%s, float4(((%s).xy), 1, ((%s).z)))",
+                       args[0], args[1], args[1]);
+    }
+    if (!strcmp(intrinsic, "tex1Dproj")) {
+        /* HLSL tex1Dproj takes float4 and divides by w; GLSL's vec2 form
+         * divides by y, hence float4(x, 0, 0, y). */
+        need = (int)strlen(intrinsic) + (int)strlen(args[0]) +
+               2 * (int)strlen(args[1]) + 40;
+        if (dstRoom < need) return -1;
+        return sprintf(dst, "tex1Dproj(%s, float4(((%s).x), 0, 0, ((%s).y)))",
+                       args[0], args[1], args[1]);
+    }
+    need = (int)strlen(intrinsic) + (int)strlen(args[0]) +
+           (int)strlen(args[1]) + 16;
+    if (dstRoom < need) return -1;
+    return sprintf(dst, "%s(%s, %s)", intrinsic, args[0], args[1]);
+}
+
+/*
+ * Rewrite user-defined clip() helpers to call the HLSL clip() intrinsic.
+ *
+ * GLSL has no standard clip(); engines ship their own:
+ *
+ *     void clip( float v ) { if ( v < 0.0 ) { discard; } }
+ *     void clip( vec4 v )  { if ( any( v < vec4( 0.0 ) ) ) { discard; } }
+ *
+ * which is exactly HLSL's clip(x): discard the fragment when any component of
+ * x is negative.  And vs_3_0 has no discard instruction at all, so the helper
+ * body must become the intrinsic for vertex shaders to compile.  The match
+ * targets the intrinsic's own body shape after type replacement, i.e.
+ *
+ *     void _glsl_userfn_clip( float4 v ) {
+ *         if ( any( (v < ((float4)( 0.0 )) ) ) ) { discard; } }
+ *
+ * and rewrites the statement to `clip( v );`.  Only the helper-function
+ * spelling (_glsl_userfn_clip) is touched â€” a hand-written discard elsewhere
+ * in a fragment shader keeps its meaning.
+ */
+static void glslRewriteClipHelpers(char *text)
+{
+    char *hit = text;
+    if (!text) return;
+    while ((hit = strstr(hit, "_glsl_userfn_clip(")) != NULL) {
+        char *body = strchr(hit, '{');
+        char *p1, *end;
+        char param[GLSL_MAX_NAME_LEN];
+        int len;
+        if (!body) break;
+        p1 = hit + strlen("_glsl_userfn_clip");
+        p1 = strchr(p1, '(');
+        if (!p1) break;
+        p1++;
+        while (*p1 == ' ') p1++;
+        /* Skip the parameter type to reach the name: "float4 v". */
+        end = p1;
+        while (*end && *end != ',' && *end != ')' && *end != ' ') end++;
+        p1 = end;
+        while (*p1 == ' ') p1++;
+        end = p1;
+        while (*end && *end != ',' && *end != ')' && *end != ' ') end++;
+        len = (int)(end - p1);
+        if (len <= 0 || len >= GLSL_MAX_NAME_LEN) break;
+        memcpy(param, p1, (size_t)len);
+        param[len] = '\0';
+        /* Replace every "discard;" inside this helper with "clip( param );".
+         * The wrapping "if ( v < 0.0 )" becomes redundant â€” clip() tests the
+         * same condition â€” but it is harmless, so leave it. */
+        while ((p1 = strstr(body, "discard;")) != NULL) {
+            char replacement[GLSL_MAX_NAME_LEN + 16];
+            int repLen = sprintf(replacement, "clip( %s );", param);
+            int tailLen = (int)strlen(p1 + 8);
+            memmove(p1 + repLen, p1 + 8, (size_t)tailLen + 1);
+            memcpy(p1, replacement, (size_t)repLen);
+        }
+        hit = body;
+    }
+}
+
+static void glslApplyFunctionReplacements(char *text, int textSize, glslTexDimSet *texDim,
                                            const glslVarDecl *uniforms,
                                            int uniformCount)
 {
@@ -2513,28 +3136,50 @@ static void glslApplyFunctionReplacements(char *text, glslTexDimSet *texDim,
     glslReplaceWord(text, "dFdx",           "ddx");
     glslReplaceWord(text, "dFdy",           "ddy");
 
-    /* Texture sampling — order matters: specific names before generic */
+    /* A user-defined clip() â€” the GLSL ARB_clip_volume-style helper some
+     * engines ship as "void clip( vecN v ) { if ( v < 0 ) { discard; } }" â€”
+     * is semantically identical to HLSL's clip() intrinsic, which is also
+     * the only form vs_3_0 accepts (discard itself has no vertex-shader
+     * instruction).  Rewrite the helper body to call the intrinsic so both
+     * profiles compile. */
+    glslRewriteClipHelpers(text);
+
+    /* Texture sampling ??? order matters: specific names before generic */
     glslReplaceWord(text, "texture2D",      "tex2D");
     glslReplaceWord(text, "textureCube",    "texCUBE");
     glslReplaceWord(text, "texture3D",      "tex3D");
+    glslReplaceWord(text, "textureGrad",    "tex2Dgrad");
 
-    /* textureLod needs argument rewriting — do it before generic "texture" */
+    /* textureLod needs argument rewriting ??? do it before generic "texture" */
     glslApplyTextureLodRewrite(text, uniforms, uniformCount);
+    glslRewriteCall(text, textSize, "textureProj", glslEmitTextureProj,
+                    texDim, uniforms, uniformCount);
 
     /* texelFetch/textureSize likewise, and they also register the samplers
      * that need a synthesized dimension uniform. */
-    glslApplyTexelFetchRewrite(text, texDim);
-    glslApplyTextureSizeRewrite(text, texDim);
+    glslApplyTexelFetchRewrite(text, textSize, texDim);
+    glslApplyTextureSizeRewrite(text, textSize, texDim);
 
     /* Generic texture() dispatches by the declared sampler dimensionality. */
-    glslApplyTextureRewrite(text, texDim, uniforms, uniformCount);
+    glslApplyTextureRewrite(text, textSize, texDim, uniforms, uniformCount);
 
     /* atan(y, x) -> atan2(y, x) */
     glslReplaceWord(text, "atan",           "atan2");
+
+    /* Comparison intrinsics: GLSL names HLSL does not have.  Relational
+     * operators are componentwise on vectors in HLSL and the result feeds
+     * any()/all() as GLSL intends.  After the word-for-word renames above,
+     * because these names cannot survive verbatim either. */
+    glslRewriteCall(text, textSize, "lessThan",         glslEmitLessThan, texDim, uniforms, uniformCount);
+    glslRewriteCall(text, textSize, "greaterThan",      glslEmitGreaterThan, texDim, uniforms, uniformCount);
+    glslRewriteCall(text, textSize, "lessThanEqual",    glslEmitLessThanEqual, texDim, uniforms, uniformCount);
+    glslRewriteCall(text, textSize, "greaterThanEqual", glslEmitGreaterThanEqual, texDim, uniforms, uniformCount);
+    glslRewriteCall(text, textSize, "equal",            glslEmitEqual, texDim, uniforms, uniformCount);
+    glslRewriteCall(text, textSize, "notEqual",         glslEmitNotEqual, texDim, uniforms, uniformCount);
 }
 
 /*
- * glslReplaceBuiltinVars — replace GLSL built-in variables with
+ * glslReplaceBuiltinVars ??? replace GLSL built-in variables with
  * HLSL equivalents. The actual struct member names are set up
  * during shader wrapping; here we just do the text substitution
  * for the main body.
@@ -2545,10 +3190,43 @@ static void glslReplaceBuiltinVars(char *text, int shaderType)
         glslReplaceWord(text, "gl_Position",    "_glsl_out.pos");
         glslReplaceWord(text, "gl_PointSize",   "_glsl_out.psize");
         glslReplaceWord(text, "gl_VertexID",    "_glsl_in.vertexId");
+
+        /* GLSL 1.x compatibility-profile vertex inputs.  The Draw* paths
+         * already submit an FVF containing POSITION, NORMAL, COLOR0/1 and
+         * TEXCOORD0/1, so these aliases expose that same stream to translated
+         * shaders instead of leaving the built-in names for D3DCompile to
+         * reject.  D3D expands XYZ/FLOAT2 declarations to float4 inputs using
+         * the conventional w=1 defaults. */
+        glslReplaceWord(text, "gl_Vertex",              "_glsl_in.glVertex");
+        glslReplaceWord(text, "gl_Normal",              "_glsl_in.glNormal");
+        glslReplaceWord(text, "gl_Color",               "_glsl_in.glColor");
+        glslReplaceWord(text, "gl_SecondaryColor",      "_glsl_in.glSecondaryColor");
+        glslReplaceWord(text, "gl_MultiTexCoord0",      "_glsl_in.glMultiTexCoord0");
+        glslReplaceWord(text, "gl_MultiTexCoord1",      "_glsl_in.glMultiTexCoord1");
+        glslReplaceWord(text, "gl_ModelViewProjectionMatrix", "_glsl_builtinMVP");
+        glslReplaceWord(text, "gl_ModelViewMatrix",     "_glsl_builtinModelView");
+        glslReplaceWord(text, "gl_ProjectionMatrix",    "_glsl_builtinProjection");
     } else {
         glslReplaceWord(text, "gl_FragColor",   "_glsl_fragColor");
-        glslReplaceWord(text, "gl_FragCoord",   "_glsl_in.fragCoord");
         glslReplaceWord(text, "gl_FrontFacing", "_glsl_in.frontFacing");
+
+        /* In ps_3_0, VPOS (vPos) only exposes .xy — the z and w components
+         * are not available (error X5631).  Rewrite any .z or .w swizzle on
+         * gl_FragCoord to safe constants before the general word replacement
+         * maps the whole identifier onto the struct member.
+         *
+         *   gl_FragCoord.z  → 0.5  (mid-range depth approximation)
+         *   gl_FragCoord.w  → 1.0  (reciprocal clip-w for non-persp is 1)
+         *
+         * The .xy swizzle and bare uses are left for the general replacement
+         * that follows.  The order matters: compound .zw first, then single
+         * .z/.w, then the general word rename. */
+        glslReplaceAll(text, "gl_FragCoord.zw", "float2(0.5, 1.0)");
+        glslReplaceAll(text, "gl_FragCoord.z",  "0.5");
+        glslReplaceAll(text, "gl_FragCoord.w",  "1.0");
+        /* VPOS itself is only float2 in ps_3_0.  Bare vec4 uses read the
+         * synthesized local emitted by glslBuildPixelShader instead. */
+        glslReplaceWord(text, "gl_FragCoord",   "_glsl_fragCoord");
     }
 
     /* gl_FragData[N] -> _glsl_fragData[N] (handled in pixel shader wrapper) */
@@ -2561,7 +3239,7 @@ static void glslReplaceBuiltinVars(char *text, int shaderType)
 /**********************************************************************/
 
 /*
- * glslTryParseLocation — attempt to parse layout(location=N) from a line.
+ * glslTryParseLocation ??? attempt to parse layout(location=N) from a line.
  * Returns the location value, or -1 if not found.
  */
 static int glslTryParseLocation(const char *line)
@@ -2579,12 +3257,12 @@ static int glslTryParseLocation(const char *line)
 }
 
 /*
- * glslParseUIntToken — read a whole token as an unsigned decimal or 0x-hex
+ * glslParseUIntToken ??? read a whole token as an unsigned decimal or 0x-hex
  * integer.  Succeeds only when the token is *entirely* consumed, so "4" and
  * "0x10u" resolve and "4 + N", "N" and "" do not.
  *
  * Deliberately stricter than atoi, which is what this replaces: atoi("N")
- * answers 0, and 0 is the same value that means "not an array" — that is the
+ * answers 0, and 0 is the same value that means "not an array" ??? that is the
  * whole shape of the silent miscompile being closed here.
  */
 static BOOL glslParseUIntToken(const char *tok, int *pValue)
@@ -2629,13 +3307,13 @@ static BOOL glslParseUIntToken(const char *tok, int *pValue)
 }
 
 /*
- * glslCollectDefines — gather object-like "#define NAME <integer>" lines.
+ * glslCollectDefines ??? gather object-like "#define NAME <integer>" lines.
  *
  * Scoped to what an array uniform's extent can be spelled as, and no further:
  * function-like macros are skipped, and so is any value that is not wholly an
  * integer literal.  Resolving defines anywhere else in a shader is a separate
- * and much wider gap — #define lines do not survive into the emitted HLSL at
- * all — and widening this table would not close it.
+ * and much wider gap ??? #define lines do not survive into the emitted HLSL at
+ * all ??? and widening this table would not close it.
  */
 static int glslCollectDefines(const char *src, glslDefine *out, int maxOut)
 {
@@ -2701,8 +3379,90 @@ static int glslCollectDefines(const char *src, glslDefine *out, int maxOut)
     return count;
 }
 
+/* Collect only a single numeric token.  This closes the shipped-shader case
+ * without pretending to be a complete C preprocessor: a value containing an
+ * operator, identifier or function call is intentionally rejected. */
+static int glslCollectObjectDefines(const char *src, glslObjectDefine *out,
+                                    int maxOut)
+{
+    int count = 0;
+    const char *lineStart = src;
+
+    if (!src || !out || maxOut <= 0) return 0;
+
+    while (lineStart && *lineStart) {
+        const char *lineEnd = strchr(lineStart, '\n');
+        char lineBuf[1024], nameBuf[GLSL_MAX_NAME_LEN], valueBuf[64];
+        int lineLen = lineEnd ? (int)(lineEnd - lineStart)
+                              : (int)strlen(lineStart);
+        int nameLen = 0, valueLen = 0, i;
+        char *p, *end;
+        BOOL duplicate = FALSE;
+
+        if (lineLen >= (int)sizeof(lineBuf)) lineLen = (int)sizeof(lineBuf) - 1;
+        memcpy(lineBuf, lineStart, (size_t)lineLen);
+        lineBuf[lineLen] = '\0';
+        lineStart = lineEnd ? lineEnd + 1 : NULL;
+
+        p = glslSkipWhitespace(lineBuf);
+        if (*p != '#') continue;
+        p = glslSkipWhitespace(p + 1);
+        if (strncmp(p, "define", 6) != 0 || !glslIsWordBoundary(p[6])) continue;
+        p = glslSkipWhitespace(p + 6);
+        if (!isalpha((unsigned char)*p) && *p != '_') continue;
+        while ((isalnum((unsigned char)*p) || *p == '_') &&
+               nameLen < GLSL_MAX_NAME_LEN - 1)
+            nameBuf[nameLen++] = *p++;
+        nameBuf[nameLen] = '\0';
+        if (*p == '(') continue;                 /* function-like macro */
+
+        p = glslSkipWhitespace(p);
+        if (!*p) continue;
+        (void)strtod(p, &end);
+        if (end == p) continue;
+        while (*end == 'f' || *end == 'F' || *end == 'u' || *end == 'U' ||
+               *end == 'l' || *end == 'L')
+            end++;
+        while (*end == ' ' || *end == '\t' || *end == '\r') end++;
+        if (*end && strncmp(end, "//", 2) != 0 && strncmp(end, "/*", 2) != 0)
+            continue;
+
+        valueLen = (int)(end - p);
+        while (valueLen > 0 && (p[valueLen - 1] == ' ' ||
+                                p[valueLen - 1] == '\t' ||
+                                p[valueLen - 1] == '\r'))
+            valueLen--;
+        if (valueLen <= 0 || valueLen >= (int)sizeof(valueBuf)) continue;
+        memcpy(valueBuf, p, (size_t)valueLen);
+        valueBuf[valueLen] = '\0';
+
+        for (i = 0; i < count; ++i) {
+            if (!strcmp(out[i].name, nameBuf)) {
+                strcpy(out[i].replacement, valueBuf);
+                duplicate = TRUE;
+                break;
+            }
+        }
+        if (!duplicate && count < maxOut) {
+            strcpy(out[count].name, nameBuf);
+            strcpy(out[count].replacement, valueBuf);
+            count++;
+        }
+    }
+    return count;
+}
+
+static void glslApplyObjectDefines(char *text,
+                                   const glslObjectDefine *defines, int count)
+{
+    int i;
+    if (!text || !defines) return;
+    for (i = 0; i < count; ++i)
+        glslReplaceWord(text, defines[i].name, defines[i].replacement);
+}
+
 /*
- * glslParseDeclarations — scan GLSL source for attribute, varying, uniform,
+ * glslParseDeclarations ??? scan GLSL source for attribute, varying, uniform,
  * in, and out declarations. Populates the provided arrays.
  *
  * `defines` (nullable) resolves an array extent written as a macro name.
@@ -2714,6 +3474,182 @@ static int glslCollectDefines(const char *src, glslDefine *out, int maxOut)
  *
  * Returns the total number of declarations found.
  */
+/*
+ * glslFlattenUniformBlocks ??? rewrite uniform block declarations
+ *
+ *   uniform matrices_ubo { vec4 matrices[768]; };
+ *   uniform name { vec4 a; mat3 b[2]; } instance;
+ *
+ * into plain uniform declarations of the block's members.  D3D9 has no uniform
+ * buffers, so the block wrapper is dropped and every member is promoted to a
+ * top-level uniform under its own name.  The block name and any instance name
+ * are discarded ??? the application cannot query a member through an instance
+ * here anyway, and the wrapper's GL entry points answer UBO queries with the
+ * software path the block binding is tracked in.
+ *
+ * The input is parsed once, depth-counted, so "type member[N];" lists with
+ * commas, multiple members and stray whitespace all come out right.
+ */
+static void glslFlattenUniformBlocks(char *dst, int dstSize, const char *src)
+{
+    const char *p = src;
+    int off = 0;
+
+    dst[0] = '\0';
+    if (!src) return;
+
+    while (*p) {
+        const char *uni = strstr(p, "uniform");
+        const char *after;
+        const char *idEnd;
+        const char *scan;
+        int depth;
+
+        if (!uni) {
+            int rem = (int)strlen(p);
+            if (off + rem + 1 >= dstSize) break;
+            memcpy(dst + off, p, (size_t)rem);
+            off += rem;
+            break;
+        }
+        if (uni != p && !glslIsWordBoundary(uni[-1])) {
+            int step = (int)(uni - p) + 1;
+            if (off + step >= dstSize) break;
+            memcpy(dst + off, p, (size_t)step);
+            off += step;
+            p = uni + 1;
+            continue;
+        }
+
+        after = glslSkipWhitespace(uni + 7);
+        idEnd = after;
+        while (*idEnd == '_' || isalnum((unsigned char)*idEnd)) idEnd++;
+        if (idEnd == after || !glslIsWordBoundary(*idEnd)) {
+            int step = (int)(uni - p) + 1;
+            if (off + step >= dstSize) break;
+            memcpy(dst + off, p, (size_t)step);
+            off += step;
+            p = uni + 1;
+            continue;
+        }
+        after = glslSkipWhitespace(idEnd);
+        if (*after != '{') {
+            /* Plain uniform; copy the whole statement through its terminating
+             * ';' (parens/brackets depth-counted, so "uniform vec4 m[3];" and
+             * "uniform vec4 v = vec4( 1.0 );" come out intact) and move on. */
+            const char *semi = after;
+            int d = 0;
+            for (; *semi; semi++) {
+                if (*semi == '(' || *semi == '[') d++;
+                else if (*semi == ')' || *semi == ']') { if (d > 0) d--; }
+                else if (*semi == ';' && d == 0) break;
+            }
+            if (*semi == ';') {
+                int step = (int)(semi - p) + 1;
+                if (off + step >= dstSize) break;
+                memcpy(dst + off, p, (size_t)step);
+                off += step;
+                p = semi + 1;
+            } else {
+                /* No ';' before EOF; copy the rest through and stop. */
+                int rem = (int)strlen(p);
+                if (off + rem + 1 >= dstSize) break;
+                memcpy(dst + off, p, (size_t)rem);
+                off += rem;
+                break;
+            }
+            continue;
+        }
+
+        /* It is a block.  Keep the text before the block, find the matching
+         * '}' with brace counting, then promote the members. */
+        {
+            int step = (int)(uni - p);
+            if (off + step >= dstSize) break;
+            memcpy(dst + off, p, (size_t)step);
+            off += step;
+        }
+        depth = 0;
+        scan = after;
+        while (*scan) {
+            if (*scan == '{') depth++;
+            else if (*scan == '}') {
+                depth--;
+                if (depth == 0) break;
+            }
+            scan++;
+        }
+        if (*scan != '}') {
+            /* Unterminated block; copy the rest through and stop. */
+            int rem = (int)strlen(scan);
+            if (off + rem + 1 >= dstSize) break;
+            memcpy(dst + off, scan, (size_t)rem);
+            off += rem;
+            break;
+        }
+
+        /* Emit each member as "uniform <member>;".  Members are terminated by
+         * ';' at nesting depth 0 inside the braces. */
+        {
+            const char *mStart = after + 1;
+            const char *mCur = mStart;
+            while (mCur < scan) {
+                const char *semi = mCur;
+                int d = 0;
+                for (; semi < scan && *semi; semi++) {
+                    if (*semi == '(' || *semi == '[' || *semi == '{') d++;
+                    else if (*semi == ')' || *semi == ']' || *semi == '}') d--;
+                    else if (*semi == ';' && d == 0) break;
+                }
+                if (semi >= scan) break;
+
+                {
+                    const char *ms = glslSkipWhitespace(mCur);
+                    const char *me = semi;
+                    while (me > ms && (me[-1] == ' ' || me[-1] == '\t' ||
+                                       me[-1] == '\n' || me[-1] == '\r'))
+                        me--;
+                    if (me > ms) {
+                        int len = (int)(me - ms);
+                        if (off + len + 12 >= dstSize) { mCur = semi + 1; break; }
+                        memcpy(dst + off, "uniform ", 8);
+                        off += 8;
+                        memcpy(dst + off, ms, (size_t)len);
+                        off += len;
+                        dst[off++] = ';';
+                        dst[off++] = '\n';
+                    }
+                }
+                mCur = semi + 1;
+            }
+        }
+
+        /* Skip the closing brace, any instance name (and array suffix), and
+         * the terminating ';'. */
+        after = glslSkipWhitespace(scan + 1);
+        {
+            const char *instEnd = after;
+            while (*instEnd == '_' || isalnum((unsigned char)*instEnd)) instEnd++;
+            if (instEnd != after) {
+                after = glslSkipWhitespace(instEnd);
+                if (*after == '[') {
+                    int d = 0;
+                    while (*after) {
+                        if (*after == '[') d++;
+                        else if (*after == ']') { d--; if (d == 0) { after++; break; } }
+                        after++;
+                    }
+                    after = glslSkipWhitespace(after);
+                }
+            }
+        }
+        if (*after == ';') after++;
+        p = after;
+    }
+
+    if (off < dstSize) dst[off] = '\0';
+}
+
 static int glslParseDeclarations(const char *src, int shaderType,
                                  glslVarDecl *attributes, int *pAttrCount,
                                  glslVarDecl *varyings, int *pVaryCount,
@@ -2734,9 +3670,13 @@ static int glslParseDeclarations(const char *src, int shaderType,
 
     if (!src) return 0;
     sourceLength = (int)strlen(src);
-    statementSource = (char *)malloc((size_t)sourceLength + 1);
+    statementSource = (char *)malloc((size_t)sourceLength * 2 + 1);
     if (!statementSource) return 0;
-    memcpy(statementSource, src, (size_t)sourceLength + 1);
+
+    /* Uniform blocks first: their members must read as plain uniforms below,
+     * and the block's own line is otherwise discarded as a function body. */
+    glslFlattenUniformBlocks(statementSource, sourceLength * 2 + 1, src);
+    sourceLength = (int)strlen(statementSource);
 
     /* Declarations are statements, not lines. Minified game shaders routinely
      * put several globals before main() on one physical line. Turn top-level
@@ -2826,7 +3766,7 @@ static int glslParseDeclarations(const char *src, int shaderType,
         }
 
         /* Remove semicolons and array brackets for parsing.  Any layout(...)
-         * block is already behind `trimmed` — glslSkipDeclQualifiers stepped
+         * block is already behind `trimmed` ??? glslSkipDeclQualifiers stepped
          * over it before the storage qualifier was matched. */
         {
             char *semi = strchr(trimmed, ';');
@@ -2836,7 +3776,7 @@ static int glslParseDeclarations(const char *src, int shaderType,
         /* Excise an array suffix like [4] before tokenizing, wherever it sits.
          *
          * The bracket must not be left for strtok to find.  "uniform vec4
-         * _va_ [4];" — the spelling a real shipped shader used — tokenizes as
+         * _va_ [4];" ??? the spelling a real shipped shader used ??? tokenizes as
          * "_va_" and "[4]", and the name branch below stops at the name and
          * never reads the second token, so the extent was silently lost and
          * the uniform emitted as a scalar.  With the bracket gone up front,
@@ -2890,7 +3830,7 @@ static int glslParseDeclarations(const char *src, int shaderType,
             continue;
 
         /* Resolve the extent.  A literal first (the common case), then an
-         * object-like #define, and otherwise nothing — an array uniform whose
+         * object-like #define, and otherwise nothing ??? an array uniform whose
          * extent is unknown cannot be emitted, because emitting it as a scalar
          * compiles (HLSL reads foo[0..3] on a scalar float4 as a swizzle) and
          * silently returns the wrong values for every element. */
@@ -3107,7 +4047,7 @@ static int glslCollectFragmentOutputs(const char *src,
 /**********************************************************************/
 
 /*
- * glslExtractMainBody — extract the body of void main() { ... }
+ * glslExtractMainBody ??? extract the body of void main() { ... }
  * from the GLSL source. Strips the function signature and outer braces.
  */
 static void glslExtractMainBody(const char *src, char *body, int bodySize)
@@ -3160,7 +4100,7 @@ static void glslExtractMainBody(const char *src, char *body, int bodySize)
 }
 
 /*
- * glslRemoveDeclarationLines — blank out attribute/varying/uniform/in/out
+ * glslRemoveDeclarationLines ??? blank out attribute/varying/uniform/in/out
  * declaration lines from the source so they don't appear in the main body.
  * Also removes the void main() wrapper.
  */
@@ -3195,11 +4135,11 @@ static void glslRemoveDeclarationLines(char *src)
 /**********************************************************************/
 
 /*
- * glslGetSemanticForAttr — determine the HLSL semantic for a vertex
+ * glslGetSemanticForAttr ??? determine the HLSL semantic for a vertex
  * shader input attribute based on its name and location.
  */
 /*
- * glslExplicitSemantic — a variable whose name contains "_SEM_<SEMANTIC>"
+ * glslExplicitSemantic ??? a variable whose name contains "_SEM_<SEMANTIC>"
  * names its HLSL semantic outright.
  *
  * Generated shaders (arb_asm_translator.c) need inputs and interpolators
@@ -3227,14 +4167,27 @@ static const char *glslGetSemanticForAttr(const glslVarDecl *attr, int index)
         if (explicitSem) return explicitSem;
     }
 
-    /* If location is specified, use TEXCOORD[N] (location 0 can be POSITION) */
+    /* Match the conventional GL attribute aliases to the declaration consumed
+     * by gl_impl.c.  id Tech binds UV/tangent at 8/9 and colors at 3/4; using
+     * declaration-order TEXCOORD indices makes a valid draw read the wrong
+     * stream fields. */
     if (attr->location >= 0) {
-        if (attr->location == 0) {
-            /* Common convention: location 0 = position */
-            return "POSITION";
+        switch (attr->location) {
+        case 0: return "POSITION";
+        case 1: return "TEXCOORD0";
+        case 2: return "NORMAL";
+        case 3: return "COLOR0";
+        case 4: return "COLOR1";
+        case 5: return "TEXCOORD2";
+        case 8: return "TEXCOORD0";
+        case 9: return "TEXCOORD1";
+        case 10: return "TEXCOORD3";
+        case 6: return "TEXCOORD2";
+        case 7: return "TEXCOORD3";
+        default:
+            sprintf(semBuf, "TEXCOORD%d", attr->location);
+            return semBuf;
         }
-        sprintf(semBuf, "TEXCOORD%d", attr->location);
-        return semBuf;
     }
 
     /* Heuristic: guess from name */
@@ -3245,9 +4198,16 @@ static const char *glslGetSemanticForAttr(const glslVarDecl *attr, int index)
     if (strstr(attr->name, "ormal") || strstr(attr->name, "norm")) {
         return "NORMAL";
     }
+    if (strstr(attr->name, "angent") || strstr(attr->name, "tangent"))
+        return "TEXCOORD1";
+    if (strstr(attr->name, "exCoord") || strstr(attr->name, "excoord") ||
+        strstr(attr->name, "texcoord") || strstr(attr->name, "texCoord"))
+        return "TEXCOORD0";
     if (strstr(attr->name, "olor") || strstr(attr->name, "col")) {
-        sprintf(semBuf, "COLOR%d", index > 0 ? 1 : 0);
-        return semBuf;
+        if (strstr(attr->name, "olor2") || strstr(attr->name, "olor1") ||
+            strstr(attr->name, "Color2") || strstr(attr->name, "Color1"))
+            return "COLOR1";
+        return "COLOR0";
     }
 
     /* Default: TEXCOORD[index] */
@@ -3256,7 +4216,7 @@ static const char *glslGetSemanticForAttr(const glslVarDecl *attr, int index)
 }
 
 /*
- * glslGetSemanticForVarying — determine the HLSL semantic for a
+ * glslGetSemanticForVarying ??? determine the HLSL semantic for a
  * varying (VS output / PS input).
  */
 static const char *glslGetSemanticForVarying(const glslVarDecl *vary, int index)
@@ -3278,7 +4238,7 @@ static const char *glslGetSemanticForVarying(const glslVarDecl *vary, int index)
 }
 
 /*
- * glslBuildVertexShader — construct a complete HLSL vertex shader from
+ * glslBuildVertexShader ??? construct a complete HLSL vertex shader from
  * parsed declarations and the transpiled main body.
  *
  * Output structure:
@@ -3297,6 +4257,9 @@ static void glslBuildVertexShader(const glslVarDecl *attrs, int attrCount,
     int i;
     BOOL usesPointSize = (strstr(mainBody, "_glsl_out.psize") != NULL);
     BOOL pretransformed = (strstr(mainBody, "gldPos_SEM_POSITION") != NULL);
+    BOOL usesBuiltinMVP = (strstr(mainBody, "_glsl_builtinMVP") != NULL);
+    BOOL usesBuiltinModelView = (strstr(mainBody, "_glsl_builtinModelView") != NULL);
+    BOOL usesBuiltinProjection = (strstr(mainBody, "_glsl_builtinProjection") != NULL);
 
     hlslOut[0] = '\0';
 
@@ -3305,6 +4268,12 @@ static void glslBuildVertexShader(const glslVarDecl *attrs, int attrCount,
      * affine clip-space correction which preserves GL's original mapping. */
     if (!pretransformed)
         off += sprintf(hlslOut + off, "float4 _glsl_viewportAdjust;\n");
+    if (usesBuiltinMVP)
+        off += sprintf(hlslOut + off, "float4x4 _glsl_builtinMVP;\n");
+    if (usesBuiltinModelView)
+        off += sprintf(hlslOut + off, "float4x4 _glsl_builtinModelView;\n");
+    if (usesBuiltinProjection)
+        off += sprintf(hlslOut + off, "float4x4 _glsl_builtinProjection;\n");
 
     /* Emit uniforms as globals */
     for (i = 0; i < unifCount; i++) {
@@ -3323,6 +4292,23 @@ static void glslBuildVertexShader(const glslVarDecl *attrs, int attrCount,
         if (glslTexDimHas(texDim, uniforms[i].name))
             off += sprintf(hlslOut + off, "float4 _glsl_texdim_%s;\n", uniforms[i].name);
     }
+    /* A texture helper may query a sampler parameter (commonly named
+     * "image") rather than a global uniform.  It still needs a declaration;
+     * link-time reflection pairs this otherwise-unmatched helper constant to
+     * the program's sampler fallback. */
+    if (texDim) {
+        for (i = 0; i < texDim->count; ++i) {
+            int j, matched = 0;
+            for (j = 0; j < unifCount; ++j)
+                if (strcmp(texDim->names[i], uniforms[j].name) == 0) {
+                    matched = 1;
+                    break;
+                }
+            if (!matched)
+                off += sprintf(hlslOut + off, "float4 _glsl_texdim_%s;\n",
+                               texDim->names[i]);
+        }
+    }
     off += sprintf(hlslOut + off, "\n");
 
     /* Emit VS_INPUT struct */
@@ -3333,6 +4319,18 @@ static void glslBuildVertexShader(const glslVarDecl *attrs, int attrCount,
                        attrs[i].name,
                        glslGetSemanticForAttr(&attrs[i], i));
     }
+    if (strstr(mainBody, "_glsl_in.glVertex"))
+        off += sprintf(hlslOut + off, "    float4 glVertex : POSITION;\n");
+    if (strstr(mainBody, "_glsl_in.glNormal"))
+        off += sprintf(hlslOut + off, "    float3 glNormal : NORMAL;\n");
+    if (strstr(mainBody, "_glsl_in.glColor"))
+        off += sprintf(hlslOut + off, "    float4 glColor : COLOR0;\n");
+    if (strstr(mainBody, "_glsl_in.glSecondaryColor"))
+        off += sprintf(hlslOut + off, "    float4 glSecondaryColor : COLOR1;\n");
+    if (strstr(mainBody, "_glsl_in.glMultiTexCoord0"))
+        off += sprintf(hlslOut + off, "    float4 glMultiTexCoord0 : TEXCOORD0;\n");
+    if (strstr(mainBody, "_glsl_in.glMultiTexCoord1"))
+        off += sprintf(hlslOut + off, "    float4 glMultiTexCoord1 : TEXCOORD1;\n");
     /* gl_VertexID if used */
     if (strstr(mainBody, "_glsl_in.vertexId")) {
         off += sprintf(hlslOut + off, "    int vertexId : SV_VertexID;\n");
@@ -3368,8 +4366,8 @@ static void glslBuildVertexShader(const glslVarDecl *attrs, int attrCount,
      *
      * Zero-initialized, the same way the temp registers and the pixel shader's
      * _glsl_fragColor/_glsl_fragData locals are.  A GLSL (or lowered ARB)
-     * program is free to write only part of a varying — result.texcoord[0].xy,
-     * say — and the copy-out at the end of this function then reads the whole
+     * program is free to write only part of a varying ??? result.texcoord[0].xy,
+     * say ??? and the copy-out at the end of this function then reads the whole
      * vector back, which HLSL rejects as "error X4000: used without having been
      * completely initialized".  Zero is also the right value: GL says the
      * components the program never wrote are undefined, and reading them as
@@ -3408,7 +4406,7 @@ static void glslBuildVertexShader(const glslVarDecl *attrs, int attrCount,
 }
 
 /*
- * glslBuildPixelShader — construct a complete HLSL pixel shader from
+ * glslBuildPixelShader ??? construct a complete HLSL pixel shader from
  * parsed declarations and the transpiled main body.
  *
  * Output structure:
@@ -3451,12 +4449,25 @@ static void glslBuildPixelShader(const glslVarDecl *varyings, int varyCount,
                            glslConvertType(uniforms[i].type), uniforms[i].name);
         }
     }
+    if (texDim) {
+        for (i = 0; i < texDim->count; ++i) {
+            int j, matched = 0;
+            for (j = 0; j < unifCount; ++j)
+                if (strcmp(texDim->names[i], uniforms[j].name) == 0) {
+                    matched = 1;
+                    break;
+                }
+            if (!matched)
+                off += sprintf(hlslOut + off, "float4 _glsl_texdim_%s;\n",
+                               texDim->names[i]);
+        }
+    }
     off += sprintf(hlslOut + off, "\n");
 
     /* Emit PS_INPUT struct */
     off += sprintf(hlslOut + off, "struct PS_INPUT {\n");
     for (i = 0; i < varyCount; i++) {
-        /* Skip fragment outputs — they go in PS_OUTPUT */
+        /* Skip fragment outputs ??? they go in PS_OUTPUT */
         if (strcmp(varyings[i].qualifier, "fragout") == 0)
             continue;
         off += sprintf(hlslOut + off, "    %s %s : %s;\n",
@@ -3464,9 +4475,8 @@ static void glslBuildPixelShader(const glslVarDecl *varyings, int varyCount,
                        varyings[i].name,
                        glslGetSemanticForVarying(&varyings[i], i));
     }
-    if (usesFragCoord) {
-        off += sprintf(hlslOut + off, "    float4 fragCoord : VPOS;\n");
-    }
+    if (usesFragCoord)
+        off += sprintf(hlslOut + off, "    float2 fragCoordXY : VPOS;\n");
     if (usesFrontFacing) {
         off += sprintf(hlslOut + off, "    float frontFacing : VFACE;\n");
     }
@@ -3490,6 +4500,10 @@ static void glslBuildPixelShader(const glslVarDecl *varyings, int varyCount,
         off += sprintf(hlslOut + off, "float4 main(PS_INPUT _glsl_in) : COLOR0 {\n");
         off += sprintf(hlslOut + off, "    float4 _glsl_fragColor = float4(0,0,0,0);\n");
     }
+
+    if (usesFragCoord)
+        off += sprintf(hlslOut + off,
+                       "    float4 _glsl_fragCoord = float4(_glsl_in.fragCoordXY, 0.5, 1.0);\n");
 
     /* Declare local aliases for varyings */
     for (i = 0; i < varyCount; i++) {
@@ -3524,7 +4538,7 @@ static void glslBuildPixelShader(const glslVarDecl *varyings, int varyCount,
 /**********************************************************************/
 
 /*
- * glslDetectFragDataUsage — scan for gl_FragData[N] usage and determine
+ * glslDetectFragDataUsage ??? scan for gl_FragData[N] usage and determine
  * the maximum index used.
  */
 static BOOL glslDetectFragDataUsage(const char *src, int *pMaxIndex)
@@ -3553,7 +4567,7 @@ static BOOL glslDetectFragDataUsage(const char *src, int *pMaxIndex)
 }
 
 /*
- * glslRewriteFragDataAccess — rewrite gl_FragData[N] to _glsl_fragDataN
+ * glslRewriteFragDataAccess ??? rewrite gl_FragData[N] to _glsl_fragDataN
  * for the pixel shader output.
  */
 static void glslRewriteFragDataAccess(char *text, int maxFragData)
@@ -3572,7 +4586,7 @@ static void glslRewriteFragDataAccess(char *text, int maxFragData)
 }
 
 /*
- * glslRecordFnName — add the identifier immediately before `open` to a
+ * glslRecordFnName ??? add the identifier immediately before `open` to a
  * deduplicated name table.  No-ops when the table is absent or full.
  *
  * A definition names a return type before the function name, so an identifier
@@ -3611,7 +4625,7 @@ static void glslRecordFnName(const char *line, const char *open,
 }
 
 /*
- * glslStripHelperFunctions — extract any helper functions defined before main()
+ * glslStripHelperFunctions ??? extract any helper functions defined before main()
  * and return them separately. These need to be emitted before the main function
  * in the HLSL output.
  *
@@ -3623,8 +4637,8 @@ static void glslRecordFnName(const char *line, const char *open,
  * convention) collect the extracted functions' names, deduplicated.  The
  * caller needs them to rename any that would collide with a GLSL or HLSL
  * builtin before the rewrite passes see them.  The heuristic above also
- * matches things that are not function definitions at all — an indented
- * "if (...) {" inside main() among them — so the names it yields are a
+ * matches things that are not function definitions at all ??? an indented
+ * "if (...) {" inside main() among them ??? so the names it yields are a
  * superset; the caller filters by an explicit collision list rather than
  * trusting every captured name to be a function.
  */
@@ -3634,6 +4648,7 @@ static void glslExtractHelperFunctions(const char *src, char *helpers, int helpe
 {
     const char *p = src;
     int off = 0;
+    BOOL seenMain = FALSE;
 
     helpers[0] = '\0';
     if (pFnCount) *pFnCount = 0;
@@ -3656,6 +4671,69 @@ static void glslExtractHelperFunctions(const char *src, char *helpers, int helpe
         memcpy(lineBuf, lineStart, lineLen);
         lineBuf[lineLen] = '\0';
 
+        if (strstr(lineBuf, "void main"))
+            seenMain = TRUE;
+
+        /* File-scope const declarations ("const vec4 foo = vec4(...);") are
+         * used by main() but live outside it, so the main-body extraction
+         * drops them and the declaration-line stripper leaves them behind
+         * as orphan text.  They are real globals HLSL accepts verbatim
+         * (after the type rename), so pull them into the helpers buffer.
+         * Consts that appear inside main()'s body are left alone: the
+         * scan reaches them after the "void main" line, so stop there.
+         *
+         * The declaration is emitted as "static const": a bare global
+         * "const float4 x = ...;" in Shader Model 3 declares an external
+         * constant that must be set per-frame via SetPixelShaderConstantF,
+         * which nothing here does, so the value would be garbage at
+         * runtime (D3DCompile only warns X3207).  "static const" is a
+         * literal the compiler folds in. */
+        {
+            char *tok = glslSkipWhitespace(lineBuf);
+            if (strncmp(tok, "const ", 6) == 0 && strchr(lineBuf, ';') &&
+                !seenMain) {
+                const char *end = lineEnd ? lineEnd : lineStart + strlen(lineStart);
+                int declLen = (int)(end - lineStart);
+                if (off + declLen + 16 < helpersSize) {
+                    memcpy(helpers + off, "static ", 7);
+                    off += 7;
+                    memcpy(helpers + off, lineStart, (size_t)declLen);
+                    off += declLen;
+                    helpers[off++] = '\n';
+                    helpers[off] = '\0';
+                }
+                p = lineEnd ? lineEnd + 1 : p + strlen(p);
+                continue;
+            }
+        }
+
+        /* Control-flow lines that end in '{' are statements, not function
+         * definitions: a "for (float i = 0.0; i < 8.0; i += 1.0) {" line
+         * parses as a fake function header, and the brace scan below would
+         * drag the whole loop body into the helpers buffer, where HLSL has
+         * no place for statements. */
+        {
+            static const char *const kControl[] = {
+                "for", "while", "if", "else", "switch", "do", "return",
+                "case", "break", "continue", "discard", "default",
+                "{", "}", NULL
+            };
+            char *tok = glslSkipWhitespace(lineBuf);
+            int k;
+            BOOL control = FALSE;
+            for (k = 0; kControl[k]; k++) {
+                size_t l = strlen(kControl[k]);
+                if (strncmp(tok, kControl[k], l) == 0 && glslIsWordBoundary(tok[l])) {
+                    control = TRUE;
+                    break;
+                }
+            }
+            if (control) {
+                p = lineEnd ? lineEnd + 1 : p + strlen(p);
+                continue;
+            }
+        }
+
         /* Check if this looks like a function definition (has parens and opening brace) */
         if (strchr(lineBuf, '(') && !strstr(lineBuf, "void main") &&
             !strstr(lineBuf, "attribute ") && !strstr(lineBuf, "varying ") &&
@@ -3666,30 +4744,49 @@ static void glslExtractHelperFunctions(const char *src, char *helpers, int helpe
             if (closeParen) {
                 char *afterParen = glslSkipWhitespace(closeParen + 1);
                 if (*afterParen == '{' || *afterParen == '\0') {
-                    /* This might be a helper function — extract it */
-                    const char *funcStart = lineStart;
-                    const char *braceOpen = strchr(funcStart, '{');
-                    if (braceOpen) {
-                        int depth = 0;
-                        const char *scan = braceOpen;
-                        for (; *scan; scan++) {
-                            if (*scan == '{') depth++;
-                            else if (*scan == '}') {
-                                depth--;
-                                if (depth == 0) {
-                                    int funcLen = (int)(scan - funcStart) + 1;
-                                    if (off + funcLen + 2 < helpersSize) {
-                                        memcpy(helpers + off, funcStart, funcLen);
-                                        off += funcLen;
-                                        helpers[off++] = '\n';
-                                        helpers[off] = '\0';
+                    /* A function header is "type name ( params )" ??? a ';' or
+                     * '=' before the first ')' marks a statement, not a
+                     * definition.  "float4 vpos = in_Position; if( _va_[0 ].x
+                     * > 0 ) {" parses as a fake header, and the brace scan
+                     * below would drag the whole if-block into the helpers
+                     * buffer, where HLSL has no place for statements.
+                     *
+                     * The scan stops at the ')' so a one-line body like
+                     * "{ return color; }" is not mistaken for a statement. */
+                    {
+                        const char *hdr = glslSkipWhitespace(lineBuf);
+                        BOOL stmtLike = FALSE;
+                        while (hdr < closeParen) {
+                            if (*hdr == ';' || *hdr == '=') { stmtLike = TRUE; break; }
+                            hdr++;
+                        }
+                        if (!stmtLike) {
+                        /* This might be a helper function ??? extract it */
+                        const char *funcStart = lineStart;
+                        const char *braceOpen = strchr(funcStart, '{');
+                        if (braceOpen) {
+                            int depth = 0;
+                            const char *scan = braceOpen;
+                            for (; *scan; scan++) {
+                                if (*scan == '{') depth++;
+                                else if (*scan == '}') {
+                                    depth--;
+                                    if (depth == 0) {
+                                        int funcLen = (int)(scan - funcStart) + 1;
+                                        if (off + funcLen + 2 < helpersSize) {
+                                            memcpy(helpers + off, funcStart, funcLen);
+                                            off += funcLen;
+                                            helpers[off++] = '\n';
+                                            helpers[off] = '\0';
+                                        }
+                                        glslRecordFnName(lineBuf, openParen,
+                                                         fnNames, pFnCount, maxFn);
+                                        p = scan + 1;
+                                        goto next_iter;
                                     }
-                                    glslRecordFnName(lineBuf, openParen,
-                                                     fnNames, pFnCount, maxFn);
-                                    p = scan + 1;
-                                    goto next_iter;
                                 }
                             }
+                        }
                         }
                     }
                 }
@@ -3701,8 +4798,1095 @@ next_iter:;
     }
 }
 
+/**********************************************************************/
+/*****            Bitwise operator lowering                        *****/
+/**********************************************************************/
+
 /*
- * glslDetectUnlowerableConstructs — name the GLSL constructs that have no
+ * D3DCompile rejects &, |, ^, ~, << and >> on every Shader Model 3 profile
+ * with "error X3535: Bitwise operations not supported on target ps_3_0",
+ * whatever the operands are.  This section rewrites them into float-domain
+ * arithmetic before D3DCompile sees the text.
+ *
+ * The float domain holds every integer below 2^24 exactly (2^24 itself is the
+ * first integer that rounds), so all results are exact for the values real
+ * shaders use.  The identities are:
+ *
+ *   x & y : sum over the bits both operands set
+ *   x | y : x + y - (x & y)
+ *   x ^ y : x + y - 2 * (x & y)
+ *   ~x    : -x - 1            (exact, GLSL defines bitwise not as -x-1)
+ *   x << y: x * 2^y
+ *   x >> y: floor(x / 2^y)
+ *
+ * When one operand is an integer constant, the & / | / ^ forms collapse onto
+ * a single-operand helper that only tests the bits the constant sets
+ * (_glsl_and_0000FF(a)); constants outside 0..2^24-1 are folded to their low
+ * 24 bits, which is exact for & (the variable operand has no bits above 23)
+ * and the closest representable approximation for | and ^.  Shift counts are
+ * clamped to 24 bits.  The helpers are emitted once, into the helpers buffer,
+ * by glslBitEmitHelpers.
+ *
+ * Not covered, and left to surface as D3DCompile's own error (or, for the
+ * 823-name fallback path, to the software rasterizer):
+ *   - vector operands: the helpers take scalars, so a vector bitwise
+ *     expression becomes an HLSL type error, which is at least honest.
+ *   - compound assignments whose lvalue has side effects (a[i++] |= 2) are
+ *     expanded textually, so the lvalue is evaluated twice.  Simple
+ *     identifiers and array/member lvalues are exact.
+ */
+
+/* glslBitSprintf / glslBitAppendf / glslBitAppendN ??? bounded text building. */
+
+static int glslBitSprintf(char *out, int outSize, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    if (!out || outSize <= 1) return -1;
+    va_start(ap, fmt);
+    n = _vsnprintf(out, outSize - 1, fmt, ap);
+    va_end(ap);
+    if (n < 0 || n >= outSize - 1) return -1;
+    return n;
+}
+
+static int glslBitAppendN(char *out, int outSize, const char *s, int n)
+{
+    int len = (int)strlen(out);
+    if (len + n + 1 > outSize) return -1;
+    memcpy(out + len, s, n);
+    out[len + n] = '\0';
+    return n;
+}
+
+static int glslBitAppendf(char *out, int outSize, const char *fmt, ...)
+{
+    va_list ap;
+    int n, base;
+    if (!out || outSize <= 1) return -1;
+    base = (int)strlen(out);
+    va_start(ap, fmt);
+    n = _vsnprintf(out + base, outSize - 1 - base, fmt, ap);
+    va_end(ap);
+    if (n < 0 || base + n >= outSize - 1) return -1;
+    return n;
+}
+
+/* glslBitSkipSpace ??? whitespace and comments, for token separation. */
+
+static const char *glslBitSkipSpace(const char *p)
+{
+    while (*p) {
+        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') { p++; continue; }
+        if (p[0] == '/' && p[1] == '/') {
+            while (*p && *p != '\n') p++;
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+            if (*p) p += 2;
+            continue;
+        }
+        break;
+    }
+    return p;
+}
+
+/* glslBitIsKeyword ??? is [word, word+len) a GLSL keyword?  Used by the left
+ * walk: a keyword ends an expression, so the rewrite never starts inside a
+ * declaration or a control-flow keyword's operand list. */
+
+static BOOL glslBitIsKeyword(const char *word, int len)
+{
+    static const char *const kWords[] = {
+        "return", "if", "for", "while", "do", "else", "case", "switch",
+        "break", "continue", "discard", "in", "out", "inout", "const",
+        "uniform", "attribute", "varying", "struct", "void",
+        "float", "int", "uint", "bool", "double",
+        "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4",
+        "uvec2", "uvec3", "uvec4", "bvec2", "bvec3", "bvec4",
+        "dvec2", "dvec3", "dvec4",
+        "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4",
+        "mat3x2", "mat3x3", "mat3x4", "mat4x2", "mat4x3", "mat4x4",
+        "sampler1D", "sampler2D", "sampler3D", "samplerCube",
+        "sampler1DShadow", "sampler2DShadow", "samplerCubeShadow",
+        "sampler1DArray", "sampler2DArray", "sampler1DArrayShadow",
+        "sampler2DArrayShadow", "samplerCubeArray", "samplerCubeArrayShadow",
+        "sampler2DMS", "sampler2DMSArray",
+        "isampler1D", "isampler2D", "isampler3D", "isamplerCube",
+        "usampler1D", "usampler2D", "usampler3D", "usamplerCube",
+        "flat", "smooth", "noperspective", "centroid", "invariant",
+        "layout", "precision", "highp", "mediump", "lowp",
+        "true", "false",
+        NULL
+    };
+    int i;
+    if (len <= 0) return FALSE;
+    for (i = 0; kWords[i]; i++) {
+        if ((int)strlen(kWords[i]) == len && memcmp(kWords[i], word, len) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* glslBitParseIntLiteral ??? parse a pure integer literal (decimal or 0x, with
+ * an optional sign and u/l suffixes).  The whole text must be the literal.
+ * Used both to fold constant-only expressions and to specialize the helper
+ * on a constant operand. */
+
+static BOOL glslBitParseIntLiteral(const char *text, long long *pVal)
+{
+    const char *p = text;
+    BOOL neg = FALSE;
+    int base = 10;
+    long long v = 0;
+
+    if (!text || !pVal) return FALSE;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '-') { neg = TRUE; p++; }
+    else if (*p == '+') p++;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }
+    if (!((base == 16 && isxdigit((unsigned char)*p)) ||
+          (base == 10 && isdigit((unsigned char)*p))))
+        return FALSE;
+    while (base == 16 ? isxdigit((unsigned char)*p) : isdigit((unsigned char)*p)) {
+        int d = isdigit((unsigned char)*p)
+              ? (*p - '0')
+              : (tolower((unsigned char)*p) - 'a' + 10);
+        v = v * base + d;
+        p++;
+    }
+    while (*p == 'u' || *p == 'U' || *p == 'l' || *p == 'L') p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '\0') return FALSE;
+    *pVal = neg ? -v : v;
+    return TRUE;
+}
+
+/* glslBitAddConst / glslBitHasConst ??? the constant-helper table. */
+
+static BOOL glslBitAddConst(unsigned int *arr, int *count, unsigned int v)
+{
+    int i;
+    for (i = 0; i < *count; i++)
+        if (arr[i] == v) return TRUE;
+    if (*count >= GLSL_BIT_MAX_LITS) return FALSE;
+    arr[(*count)++] = v;
+    return TRUE;
+}
+
+static BOOL glslBitHasConst(const unsigned int *arr, int count, unsigned int v)
+{
+    int i;
+    for (i = 0; i < count; i++)
+        if (arr[i] == v) return TRUE;
+    return FALSE;
+}
+
+/* glslBitEmitMasked ??? emit _glsl_and_<hex>(operand) (or or/xor), registering
+ * the constant's helper.  Out-of-range constants warn once and use their low
+ * 24 bits; a full constant table falls back to the general helper with the
+ * value as a float literal, which is exact below 2^24. */
+
+static BOOL glslBitEmitMasked(glslBitCtx *ctx, int kind, long long raw,
+                              const char *operand, char *out, int outSize)
+{
+    unsigned int v = (unsigned int)raw & 0xFFFFFFu;
+    char hex[16];
+    const char *fn;
+    unsigned int *arr;
+    int *count;
+
+    if (raw != (long long)v && !ctx->col->warnedRange) {
+        ctx->col->warnedRange = TRUE;
+        gldDiagLog("GLSL->HLSL: bitwise constant %lld carries bits above the "
+                   "24-bit exact-integer ceiling; its low 24 bits are used.",
+                   raw);
+    }
+
+    switch (kind) {
+    case GLSL_BIT_AND:
+        fn = "_glsl_and_"; arr = ctx->col->andConst; count = &ctx->col->andCount;
+        break;
+    case GLSL_BIT_OR:
+        fn = "_glsl_or_";  arr = ctx->col->orConst;  count = &ctx->col->orCount;
+        break;
+    default:
+        fn = "_glsl_xor_"; arr = ctx->col->xorConst; count = &ctx->col->xorCount;
+        break;
+    }
+
+    sprintf(hex, "%06X", v);
+
+    if (!glslBitAddConst(arr, count, v)) {
+        /* constant table full: use the general helper with a float literal */
+        switch (kind) {
+        case GLSL_BIT_AND:
+            ctx->col->hasGeneralAnd = TRUE;
+            return glslBitSprintf(out, outSize, "_glsl_bitand(%s, %u.0)", operand, v) >= 0;
+        case GLSL_BIT_OR:
+            ctx->col->hasGeneralOr = TRUE;
+            ctx->col->hasGeneralAnd = TRUE;
+            return glslBitSprintf(out, outSize, "_glsl_bitor(%s, %u.0)", operand, v) >= 0;
+        default:
+            ctx->col->hasGeneralXor = TRUE;
+            ctx->col->hasGeneralAnd = TRUE;
+            return glslBitSprintf(out, outSize, "_glsl_bitxor(%s, %u.0)", operand, v) >= 0;
+        }
+    }
+
+    /* the or/xor helpers reference the and helper for the same constant */
+    if (kind != GLSL_BIT_AND)
+        glslBitAddConst(ctx->col->andConst, &ctx->col->andCount, v);
+
+    return glslBitSprintf(out, outSize, "%s%s(%s)", fn, hex, operand) >= 0;
+}
+
+/* glslBitOpText ??? the verbatim spelling for the ops SM3 accepts natively. */
+
+static const char *glslBitOpText(int opId)
+{
+    switch (opId) {
+    case GLSL_BIT_LOR: return "||";
+    case GLSL_BIT_LAND: return "&&";
+    case GLSL_BIT_EQ: return "==";
+    case GLSL_BIT_NE: return "!=";
+    case GLSL_BIT_LT: return "<";
+    case GLSL_BIT_GT: return ">";
+    case GLSL_BIT_LE: return "<=";
+    case GLSL_BIT_GE: return ">=";
+    case GLSL_BIT_ADD: return "+";
+    case GLSL_BIT_SUB: return "-";
+    case GLSL_BIT_MUL: return "*";
+    case GLSL_BIT_DIV: return "/";
+    case GLSL_BIT_MOD: return "%";
+    default: return "";
+    }
+}
+
+/* glslBitCombine ??? combine a binary operator's two (already rewritten)
+ * operand texts into the lowered form.  Returns FALSE on buffer overflow.
+ * The default branch is the verbatim spelling for the operators SM3 accepts
+ * natively (||, &&, comparisons, +, -, *, /, %). */
+
+static BOOL glslBitCombine(glslBitCtx *ctx, int opId,
+                           const char *lhs, const char *rhs,
+                           char *out, int outSize)
+{
+    long long v1 = 0, v2 = 0;
+    BOOL c1 = glslBitParseIntLiteral(lhs, &v1);
+    BOOL c2 = glslBitParseIntLiteral(rhs, &v2);
+
+    switch (opId) {
+    case GLSL_BIT_AND:
+        if (c1 && c2)
+            return glslBitSprintf(out, outSize, "%u",
+                ((unsigned int)v1 & 0xFFFFFFu) & ((unsigned int)v2 & 0xFFFFFFu)) >= 0;
+        if (c2) return glslBitEmitMasked(ctx, GLSL_BIT_AND, v2, lhs, out, outSize);
+        if (c1) return glslBitEmitMasked(ctx, GLSL_BIT_AND, v1, rhs, out, outSize);
+        ctx->col->hasGeneralAnd = TRUE;
+        return glslBitSprintf(out, outSize, "_glsl_bitand(%s, %s)", lhs, rhs) >= 0;
+    case GLSL_BIT_OR:
+        if (c1 && c2)
+            return glslBitSprintf(out, outSize, "%u",
+                ((unsigned int)v1 & 0xFFFFFFu) | ((unsigned int)v2 & 0xFFFFFFu)) >= 0;
+        if (c2) return glslBitEmitMasked(ctx, GLSL_BIT_OR, v2, lhs, out, outSize);
+        if (c1) return glslBitEmitMasked(ctx, GLSL_BIT_OR, v1, rhs, out, outSize);
+        ctx->col->hasGeneralOr = TRUE;
+        ctx->col->hasGeneralAnd = TRUE;   /* _glsl_bitor calls _glsl_bitand */
+        return glslBitSprintf(out, outSize, "_glsl_bitor(%s, %s)", lhs, rhs) >= 0;
+    case GLSL_BIT_XOR:
+        if (c1 && c2)
+            return glslBitSprintf(out, outSize, "%u",
+                ((unsigned int)v1 & 0xFFFFFFu) ^ ((unsigned int)v2 & 0xFFFFFFu)) >= 0;
+        if (c2) return glslBitEmitMasked(ctx, GLSL_BIT_XOR, v2, lhs, out, outSize);
+        if (c1) return glslBitEmitMasked(ctx, GLSL_BIT_XOR, v1, rhs, out, outSize);
+        ctx->col->hasGeneralXor = TRUE;
+        ctx->col->hasGeneralAnd = TRUE;   /* _glsl_bitxor calls _glsl_bitand */
+        return glslBitSprintf(out, outSize, "_glsl_bitxor(%s, %s)", lhs, rhs) >= 0;
+    case GLSL_BIT_SHL:
+        if (c1 && c2) {
+            if (v2 < 0 || v2 > 23) return glslBitSprintf(out, outSize, "0") >= 0;
+            return glslBitSprintf(out, outSize, "%lld", v1 << (int)v2) >= 0;
+        }
+        if (c2) {
+            if (v2 < 0 || v2 > 23) return glslBitSprintf(out, outSize, "(0.0)") >= 0;
+            return glslBitSprintf(out, outSize, "(%s * %llu.0)", lhs, 1ULL << (int)v2) >= 0;
+        }
+        ctx->col->hasGeneralShl = TRUE;
+        return glslBitSprintf(out, outSize, "_glsl_shl(%s, %s)", lhs, rhs) >= 0;
+    case GLSL_BIT_SHR:
+        if (c1 && c2) {
+            if (v2 < 0 || v2 > 23 || v1 < 0)
+                return glslBitSprintf(out, outSize, "0") >= 0;
+            return glslBitSprintf(out, outSize, "%lld", v1 >> (int)v2) >= 0;
+        }
+        if (c2) {
+            if (v2 < 0 || v2 > 23) return glslBitSprintf(out, outSize, "(0.0)") >= 0;
+            return glslBitSprintf(out, outSize, "(floor(%s / %llu.0))", lhs, 1ULL << (int)v2) >= 0;
+        }
+        ctx->col->hasGeneralShr = TRUE;
+        return glslBitSprintf(out, outSize, "_glsl_shr(%s, %s)", lhs, rhs) >= 0;
+    case GLSL_BIT_NOT:
+        return glslBitSprintf(out, outSize, "(-(%s) - 1.0)", lhs) >= 0;
+    default:
+        return glslBitSprintf(out, outSize, "%s %s %s", lhs, glslBitOpText(opId), rhs) >= 0;
+    }
+}
+
+/* glslBitOpLen ??? token length of a binary operator. */
+
+static int glslBitOpLen(int opId)
+{
+    switch (opId) {
+    case GLSL_BIT_LOR: case GLSL_BIT_LAND:
+    case GLSL_BIT_EQ: case GLSL_BIT_NE:
+    case GLSL_BIT_LE: case GLSL_BIT_GE:
+    case GLSL_BIT_SHL: case GLSL_BIT_SHR:
+        return 2;
+    default:
+        return 1;
+    }
+}
+
+/* glslBitPeekBinOp ??? the operator the text at p starts with, if it belongs to
+ * exactly this precedence level (levels follow GLSL: 0 = ternary, 1 = ||,
+ * 2 = &&, 3 = |, 4 = ^, 5 = &, 6 = ==/!=, 7 = relational, 8 = shift,
+ * 9 = additive, 10 = multiplicative).  The two-character guards keep &&, ||,
+ * <=, >=, ==, !=, <<, >> and the compound assignments out of each other's
+ * way. */
+
+static int glslBitPeekBinOp(const char *p, int level)
+{
+    switch (level) {
+    case 0: return (p[0] == '?') ? GLSL_BIT_TERN : GLSL_BIT_NONE;
+    case 1: return (p[0] == '|' && p[1] == '|') ? GLSL_BIT_LOR : GLSL_BIT_NONE;
+    case 2: return (p[0] == '&' && p[1] == '&') ? GLSL_BIT_LAND : GLSL_BIT_NONE;
+    case 3: return (p[0] == '|' && p[1] != '|' && p[1] != '=') ? GLSL_BIT_OR : GLSL_BIT_NONE;
+    case 4: return (p[0] == '^' && p[1] != '^' && p[1] != '=') ? GLSL_BIT_XOR : GLSL_BIT_NONE;
+    case 5: return (p[0] == '&' && p[1] != '&' && p[1] != '=') ? GLSL_BIT_AND : GLSL_BIT_NONE;
+    case 6:
+        if (p[0] == '=' && p[1] == '=') return GLSL_BIT_EQ;
+        if (p[0] == '!' && p[1] == '=') return GLSL_BIT_NE;
+        return GLSL_BIT_NONE;
+    case 7:
+        if (p[0] == '<' && p[1] == '=') return GLSL_BIT_LE;
+        if (p[0] == '>' && p[1] == '=') return GLSL_BIT_GE;
+        if (p[0] == '<' && p[1] != '<') return GLSL_BIT_LT;
+        if (p[0] == '>' && p[1] != '>') return GLSL_BIT_GT;
+        return GLSL_BIT_NONE;
+    case 8:
+        if (p[0] == '<' && p[1] == '<' && p[2] != '=') return GLSL_BIT_SHL;
+        if (p[0] == '>' && p[1] == '>' && p[2] != '=') return GLSL_BIT_SHR;
+        return GLSL_BIT_NONE;
+    case 9:
+        if (p[0] == '+') return GLSL_BIT_ADD;
+        if (p[0] == '-') return GLSL_BIT_SUB;
+        return GLSL_BIT_NONE;
+    case 10:
+        if (p[0] == '*') return GLSL_BIT_MUL;
+        if (p[0] == '/') return GLSL_BIT_DIV;
+        if (p[0] == '%') return GLSL_BIT_MOD;
+        return GLSL_BIT_NONE;
+    default:
+        return GLSL_BIT_NONE;
+    }
+}
+
+#define GLSL_BIT_FRAME 2048
+#define GLSL_BIT_TEMP  4096
+
+static BOOL glslBitParseExpr(glslBitCtx *ctx, const char *p, int level,
+                             char *out, int outSize, const char **pEnd);
+
+/* glslBitParsePrimary ??? literal, identifier, or parenthesized expression.
+ * Literals and identifiers are copied verbatim; nested expressions are
+ * parsed (and therefore lowered) recursively. */
+
+static BOOL glslBitParsePrimary(glslBitCtx *ctx, const char *p,
+                                char *out, int outSize, const char **pEnd)
+{
+    const char *q = glslBitSkipSpace(p);
+    char c = *q;
+
+    if (c == '(') {
+        char inner[GLSL_BIT_TEMP];
+        const char *iEnd, *r;
+        if (!glslBitParseExpr(ctx, q + 1, 0, inner, sizeof(inner), &iEnd))
+            return FALSE;
+        r = glslBitSkipSpace(iEnd);
+        if (*r != ')') return FALSE;
+        if (glslBitSprintf(out, outSize, "(%s)", inner) < 0) return FALSE;
+        *pEnd = r + 1;
+        return TRUE;
+    }
+
+    if (isdigit((unsigned char)c) ||
+        (c == '.' && isdigit((unsigned char)q[1]))) {
+        const char *s = q;
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+            s += 2;
+            while (isxdigit((unsigned char)*s)) s++;
+        } else {
+            while (isdigit((unsigned char)*s)) s++;
+            if (*s == '.') { s++; while (isdigit((unsigned char)*s)) s++; }
+            if (*s == 'e' || *s == 'E') {
+                s++;
+                if (*s == '+' || *s == '-') s++;
+                while (isdigit((unsigned char)*s)) s++;
+            }
+        }
+        while (*s == 'u' || *s == 'U' || *s == 'l' || *s == 'L' ||
+               *s == 'f' || *s == 'F') s++;
+        if (s - q >= outSize) return FALSE;
+        memcpy(out, q, s - q);
+        out[s - q] = '\0';
+        *pEnd = s;
+        return TRUE;
+    }
+
+    if (isalpha((unsigned char)c) || c == '_') {
+        const char *s = q;
+        while (isalnum((unsigned char)*s) || *s == '_') s++;
+        if (s - q >= outSize) return FALSE;
+        memcpy(out, q, s - q);
+        out[s - q] = '\0';
+        *pEnd = s;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+/* glslBitParsePostfix ??? primary plus [index], .member, call(args) and
+ * postfix ++/-- chains.  Call arguments and array indices are expressions
+ * in their own right, so bitwise operators inside them are lowered here. */
+
+static BOOL glslBitParsePostfix(glslBitCtx *ctx, const char *p,
+                                char *out, int outSize, const char **pEnd)
+{
+    if (!glslBitParsePrimary(ctx, p, out, outSize, pEnd))
+        return FALSE;
+    p = *pEnd;
+    for (;;) {
+        const char *q = glslBitSkipSpace(p);
+        if (*q == '[') {
+            char idx[GLSL_BIT_FRAME];
+            const char *iEnd, *r;
+            if (!glslBitParseExpr(ctx, q + 1, 0, idx, sizeof(idx), &iEnd))
+                return FALSE;
+            r = glslBitSkipSpace(iEnd);
+            if (*r != ']') return FALSE;
+            if (glslBitAppendf(out, outSize, "[%s]", idx) < 0) return FALSE;
+            p = r + 1;
+        } else if (*q == '.') {
+            const char *s = q + 1;
+            while (isalnum((unsigned char)*s) || *s == '_') s++;
+            if (s == q + 1) return FALSE;
+            if (glslBitAppendf(out, outSize, ".") < 0) return FALSE;
+            if (glslBitAppendN(out, outSize, q + 1, (int)(s - q - 1)) < 0) return FALSE;
+            p = s;
+        } else if (*q == '(') {
+            char args[GLSL_BIT_TEMP];
+            int aLen = 0;
+            const char *a = q + 1;
+            BOOL first = TRUE;
+            BOOL closed = FALSE;
+            args[0] = '\0';
+            for (;;) {
+                const char *ae;
+                a = glslBitSkipSpace(a);
+                if (*a == ')') { p = a + 1; closed = TRUE; break; }
+                if (!first) {
+                    if (*a != ',') return FALSE;
+                    if (aLen + 2 >= (int)sizeof(args)) return FALSE;
+                    args[aLen++] = ',';
+                    args[aLen++] = ' ';
+                    args[aLen] = '\0';
+                    a = glslBitSkipSpace(a + 1);
+                }
+                if (!glslBitParseExpr(ctx, a, 0, args + aLen,
+                                      (int)sizeof(args) - aLen, &ae))
+                    return FALSE;
+                aLen = (int)strlen(args);
+                a = ae;
+                first = FALSE;
+            }
+            if (!closed) return FALSE;
+            if (glslBitAppendf(out, outSize, "(%s)", args) < 0) return FALSE;
+        } else if ((q[0] == '+' && q[1] == '+') ||
+                   (q[0] == '-' && q[1] == '-')) {
+            if (glslBitAppendf(out, outSize, "%c%c", q[0], q[1]) < 0)
+                return FALSE;
+            p = q + 2;
+        } else {
+            break;
+        }
+    }
+    *pEnd = p;
+    return TRUE;
+}
+
+/* glslBitParseUnary ??? prefix + - ! ~ ++ -- then the postfix chain.  ~ is the
+ * only prefix operator needing lowering: -(operand) - 1 is exact for every
+ * integer in the float domain. */
+
+static BOOL glslBitParseUnary(glslBitCtx *ctx, const char *p,
+                              char *out, int outSize, const char **pEnd)
+{
+    const char *q = glslBitSkipSpace(p);
+
+    if (q[0] == '~') {
+        char op[GLSL_BIT_FRAME];
+        const char *oEnd;
+        if (!glslBitParseExpr(ctx, q + 1, 12, op, sizeof(op), &oEnd))
+            return FALSE;
+        if (glslBitCombine(ctx, GLSL_BIT_NOT, op, "", out, outSize) < 0)
+            return FALSE;
+        *pEnd = oEnd;
+        return TRUE;
+    }
+    if (q[0] == '+' || q[0] == '-' || q[0] == '!') {
+        char op[GLSL_BIT_FRAME];
+        const char *oEnd;
+        if (!glslBitParseExpr(ctx, q + 1, 12, op, sizeof(op), &oEnd))
+            return FALSE;
+        if (glslBitSprintf(out, outSize, "%c%s", q[0], op) < 0)
+            return FALSE;
+        *pEnd = oEnd;
+        return TRUE;
+    }
+    if ((q[0] == '+' && q[1] == '+') || (q[0] == '-' && q[1] == '-')) {
+        char op[GLSL_BIT_FRAME];
+        const char *oEnd;
+        if (!glslBitParseExpr(ctx, q + 2, 12, op, sizeof(op), &oEnd))
+            return FALSE;
+        if (glslBitSprintf(out, outSize, "%c%c%s", q[0], q[1], op) < 0)
+            return FALSE;
+        *pEnd = oEnd;
+        return TRUE;
+    }
+    return glslBitParseExpr(ctx, q, 12, out, outSize, pEnd);
+}
+
+/* glslBitParseExpr ??? recursive descent over the precedence ladder.  The
+ * caller's out buffer accumulates the rebuilt expression; each binary level
+ * parses its left operand into out, then combines left+operator+right through
+ * glslBitCombine (which lowers the bitwise operators and copies everything
+ * else verbatim).  Returns FALSE on any syntax or buffer failure. */
+
+static BOOL glslBitParseExpr(glslBitCtx *ctx, const char *p, int level,
+                             char *out, int outSize, const char **pEnd)
+{
+    if (level >= 13)
+        return glslBitParsePrimary(ctx, p, out, outSize, pEnd);
+    if (level == 12)
+        return glslBitParsePostfix(ctx, p, out, outSize, pEnd);
+    if (level == 11)
+        return glslBitParseUnary(ctx, p, out, outSize, pEnd);
+
+    if (!glslBitParseExpr(ctx, p, level + 1, out, outSize, pEnd))
+        return FALSE;
+    p = *pEnd;
+
+    for (;;) {
+        int opId;
+        const char *q = glslBitSkipSpace(p);
+        if (!*q) break;
+        opId = glslBitPeekBinOp(q, level);
+        if (!opId) break;
+
+        if (level == 0 && opId == GLSL_BIT_TERN) {
+            char trueBuf[GLSL_BIT_FRAME], falseBuf[GLSL_BIT_FRAME];
+            char tmp[GLSL_BIT_TEMP];
+            const char *tEnd, *c, *fEnd;
+            if (!glslBitParseExpr(ctx, q + 1, 0, trueBuf, sizeof(trueBuf), &tEnd))
+                return FALSE;
+            c = glslBitSkipSpace(tEnd);
+            if (*c != ':') return FALSE;
+            if (!glslBitParseExpr(ctx, c + 1, 0, falseBuf, sizeof(falseBuf), &fEnd))
+                return FALSE;
+            if (glslBitSprintf(tmp, sizeof(tmp), "%s ? %s : %s",
+                               out, trueBuf, falseBuf) < 0)
+                return FALSE;
+            if ((int)strlen(tmp) + 1 > outSize) return FALSE;
+            strcpy(out, tmp);
+            p = fEnd;
+            break;
+        }
+
+        {
+            char rhsBuf[GLSL_BIT_FRAME], tmp[GLSL_BIT_TEMP];
+            const char *rEnd;
+            if (!glslBitParseExpr(ctx, q + glslBitOpLen(opId), level,
+                                  rhsBuf, sizeof(rhsBuf), &rEnd))
+                return FALSE;
+            if (!glslBitCombine(ctx, opId, out, rhsBuf, tmp, sizeof(tmp)))
+                return FALSE;
+            if ((int)strlen(tmp) + 1 > outSize) return FALSE;
+            strcpy(out, tmp);
+            p = rEnd;
+        }
+    }
+    *pEnd = p;
+    return TRUE;
+}
+
+/* glslBitWalkLeft ??? find where the expression containing the operator at
+ * 'pos' starts.  Walks left across identifiers, calls, member access and
+ * parenthesized groups; stops at statement-level punctuation, keywords,
+ * relational/logical operators (which bind looser than the bitwise ones),
+ * binary arithmetic operators and comments.  Unary + and - (and therefore
+ * the ++/-- pair) are not stops: they belong to the expression. */
+
+static int glslBitWalkLeft(const char *text, int pos)
+{
+    int depth = 0;
+    int q = pos - 1;
+
+    while (q >= 0) {
+        char c = text[q];
+
+        if (c == ')') { depth++; q--; continue; }
+        if (c == '(') {
+            if (depth == 0) return q + 1;
+            depth--; q--; continue;
+        }
+        if (depth > 0) { q--; continue; }
+
+        if (c == ';' || c == '{' || c == '}' || c == ',' ||
+            c == '=' || c == '?' || c == ':')
+            return q + 1;
+
+        if (c == '&' && (text[q + 1] == '&' || (q > 0 && text[q - 1] == '&')))
+            return q + 1;
+        if (c == '|' && (text[q + 1] == '|' || (q > 0 && text[q - 1] == '|')))
+            return q + 1;
+
+        if (c == '/' && (text[q + 1] == '/' || text[q - 1] == '/')) {
+            while (q >= 0 && text[q] != '\n') q--;
+            continue;
+        }
+        if ((c == '/' && text[q + 1] == '*') || (c == '*' && text[q + 1] == '/')) {
+            int r = q;
+            while (r > 0 && !(text[r - 1] == '/' && text[r] == '*')) r--;
+            q = r - 1;
+            continue;
+        }
+
+        if (c == '<' && (text[q + 1] == '<' || (q > 0 && text[q - 1] == '<'))) {
+            q--; continue;
+        }
+        if (c == '>' && (text[q + 1] == '>' || (q > 0 && text[q - 1] == '>'))) {
+            q--; continue;
+        }
+        if (c == '<' || c == '>')
+            return q + 1;
+
+        if (c == '+' || c == '-') {
+            int r = q - 1;
+            while (r >= 0 && (text[r] == ' ' || text[r] == '\t' ||
+                              text[r] == '\r' || text[r] == '\n'))
+                r--;
+            if (r >= 0 && (isalnum((unsigned char)text[r]) ||
+                           text[r] == ')' || text[r] == ']'))
+                return q + 1;   /* binary: binds looser than bitwise */
+            q--; continue;      /* unary: belongs to the expression */
+        }
+        if (c == '*' || c == '/' || c == '%')
+            return q + 1;
+
+        if (c == ' ') {
+            int ws = q - 1;
+            while (ws >= 0 && (isalnum((unsigned char)text[ws]) || text[ws] == '_'))
+                ws--;
+            if (glslBitIsKeyword(text + ws + 1, q - ws - 1))
+                return q;
+            q--;
+            continue;
+        }
+
+        q--;
+    }
+    return 0;
+}
+
+/* glslBitProcess ??? one operator found by the scanner.  Parses the left
+ * operand (up to the operator) and the right operand (from after it),
+ * combines them, and splices the result back into the buffer.  Returns the
+ * next scan position, or -1 to leave the text untouched. */
+
+static int glslBitProcess(glslBitCtx *ctx, char *text, int textSize,
+                          int pos, int opId, int opLen)
+{
+    const char *t = text;
+    int level;
+
+    switch (opId) {
+    case GLSL_BIT_AND: level = 5; break;
+    case GLSL_BIT_OR:  level = 3; break;
+    case GLSL_BIT_XOR: level = 4; break;
+    case GLSL_BIT_SHL:
+    case GLSL_BIT_SHR: level = 8; break;
+    default:           level = 0; break;
+    }
+
+    if (opId == GLSL_BIT_NOT) {
+        const char *opP = glslBitSkipSpace(t + pos + 1);
+        char *opBuf, *combined;
+        const char *opEnd;
+        int spanStart = pos, spanEnd, cLen, delta;
+
+        opBuf = (char *)malloc((textSize - (int)(opP - t)) * 4 + 128);
+        if (!opBuf) return -1;
+        if (!glslBitParseExpr(ctx, opP, 11, opBuf,
+                              (textSize - (int)(opP - t)) * 4 + 128, &opEnd) ||
+            opEnd == opP) {
+            free(opBuf);
+            return -1;
+        }
+        combined = (char *)malloc((int)strlen(opBuf) + 64);
+        if (!combined) { free(opBuf); return -1; }
+        if (!glslBitCombine(ctx, GLSL_BIT_NOT, opBuf, "", combined,
+                            (int)strlen(opBuf) + 64)) {
+            free(opBuf); free(combined); return -1;
+        }
+        spanEnd = (int)(opEnd - t);
+        cLen = (int)strlen(combined);
+        delta = cLen - (spanEnd - spanStart);
+        if (delta > 0 && spanEnd + delta > textSize) {
+            free(opBuf); free(combined); return -1;
+        }
+        memmove(text + spanStart + cLen, text + spanEnd, strlen(text + spanEnd) + 1);
+        memcpy(text + spanStart, combined, cLen);
+        free(opBuf); free(combined);
+        return spanStart + cLen;
+    }
+
+    if (opId == GLSL_BIT_AND_EQ || opId == GLSL_BIT_OR_EQ ||
+        opId == GLSL_BIT_XOR_EQ || opId == GLSL_BIT_SHL_EQ ||
+        opId == GLSL_BIT_SHR_EQ) {
+        /* compound assignment:  lhs <op>= rhs  ->  lhs = lhs <op> rhs */
+        int baseOp;
+        int L = glslBitWalkLeft(text, pos);
+        int spanStart;
+        char *lhsBuf, *rhsBuf, *combined, *result;
+        const char *lhsEnd, *pe, *rhsP, *rhsEnd;
+        int spanEnd, cLen, rLen, delta;
+
+        switch (opId) {
+        case GLSL_BIT_AND_EQ: baseOp = GLSL_BIT_AND; break;
+        case GLSL_BIT_OR_EQ:  baseOp = GLSL_BIT_OR;  break;
+        case GLSL_BIT_XOR_EQ: baseOp = GLSL_BIT_XOR; break;
+        case GLSL_BIT_SHL_EQ: baseOp = GLSL_BIT_SHL; break;
+        default:              baseOp = GLSL_BIT_SHR; break;
+        }
+        if (L > pos) return -1;
+        /* The walk can stop on a keyword or '=' with whitespace between it
+         * and the expression; keep that whitespace out of the replaced span
+         * ("return a & 3;" must stay "return _glsl_and_3(a);", not
+         * "return_glsl_and_3(a);"). */
+        spanStart = L;
+        while (text[spanStart] == ' ' || text[spanStart] == '\t' ||
+               text[spanStart] == '\r' || text[spanStart] == '\n')
+            spanStart++;
+        lhsBuf = (char *)malloc((pos - L) * 4 + 128);
+        if (!lhsBuf) return -1;
+        if (!glslBitParseExpr(ctx, t + L, 0, lhsBuf, (pos - L) * 4 + 128, &lhsEnd)) {
+            free(lhsBuf); return -1;
+        }
+        pe = glslBitSkipSpace(lhsEnd);
+        if (pe != t + pos) { free(lhsBuf); return -1; }
+        rhsP = glslBitSkipSpace(t + pos + opLen);
+        if (!*rhsP) { free(lhsBuf); return -1; }
+        rhsBuf = (char *)malloc((textSize - (int)(rhsP - t)) * 4 + 128);
+        if (!rhsBuf) { free(lhsBuf); return -1; }
+        if (!glslBitParseExpr(ctx, rhsP, 0, rhsBuf,
+                              (textSize - (int)(rhsP - t)) * 4 + 128, &rhsEnd)) {
+            free(lhsBuf); free(rhsBuf); return -1;
+        }
+        combined = (char *)malloc((pos - L) * 4 + (int)strlen(rhsBuf) + 256);
+        if (!combined) { free(lhsBuf); free(rhsBuf); return -1; }
+        if (!glslBitCombine(ctx, baseOp, lhsBuf, rhsBuf, combined,
+                            (pos - L) * 4 + (int)strlen(rhsBuf) + 256)) {
+            free(lhsBuf); free(rhsBuf); free(combined); return -1;
+        }
+        rLen = (int)strlen(combined);
+        result = (char *)malloc((int)strlen(lhsBuf) + rLen + 16);
+        if (!result) { free(lhsBuf); free(rhsBuf); free(combined); return -1; }
+        if (glslBitSprintf(result, (int)strlen(lhsBuf) + rLen + 16,
+                           "%s = %s", lhsBuf, combined) < 0) {
+            free(lhsBuf); free(rhsBuf); free(combined); free(result); return -1;
+        }
+        spanStart = L;
+        while (text[spanStart] == ' ' || text[spanStart] == '\t' ||
+               text[spanStart] == '\r' || text[spanStart] == '\n')
+            spanStart++;
+        spanEnd = (int)(rhsEnd - t);
+        cLen = (int)strlen(result);
+        delta = cLen - (spanEnd - spanStart);
+        if (delta > 0 && spanEnd + delta > textSize) {
+            free(lhsBuf); free(rhsBuf); free(combined); free(result); return -1;
+        }
+        memmove(text + spanStart + cLen, text + spanEnd, strlen(text + spanEnd) + 1);
+        memcpy(text + spanStart, result, cLen);
+        free(lhsBuf); free(rhsBuf); free(combined); free(result);
+        return spanStart + cLen;
+    }
+
+    /* simple binary operator */
+    {
+        int L = glslBitWalkLeft(text, pos);
+        int spanStart;
+        char *lhsBuf, *rhsBuf, *combined;
+        const char *lhsEnd, *pe, *rhsP, *rhsEnd;
+        int spanEnd, cLen, delta;
+
+        if (L > pos) return -1;
+        /* see the compound path above: keep the walk's leading whitespace */
+        spanStart = L;
+        while (text[spanStart] == ' ' || text[spanStart] == '\t' ||
+               text[spanStart] == '\r' || text[spanStart] == '\n')
+            spanStart++;
+        lhsBuf = (char *)malloc((pos - L) * 4 + 128);
+        if (!lhsBuf) return -1;
+        if (!glslBitParseExpr(ctx, t + L, level + 1, lhsBuf,
+                              (pos - L) * 4 + 128, &lhsEnd)) {
+            free(lhsBuf); return -1;
+        }
+        pe = glslBitSkipSpace(lhsEnd);
+        if (pe != t + pos) { free(lhsBuf); return -1; }
+        rhsP = glslBitSkipSpace(t + pos + opLen);
+        if (!*rhsP) { free(lhsBuf); return -1; }
+        rhsBuf = (char *)malloc((textSize - (int)(rhsP - t)) * 4 + 128);
+        if (!rhsBuf) { free(lhsBuf); return -1; }
+        if (!glslBitParseExpr(ctx, rhsP, level, rhsBuf,
+                              (textSize - (int)(rhsP - t)) * 4 + 128, &rhsEnd)) {
+            free(lhsBuf); free(rhsBuf); return -1;
+        }
+        combined = (char *)malloc((pos - L) * 4 + (int)strlen(rhsBuf) + 256);
+        if (!combined) { free(lhsBuf); free(rhsBuf); return -1; }
+        if (!glslBitCombine(ctx, opId, lhsBuf, rhsBuf, combined,
+                            (pos - L) * 4 + (int)strlen(rhsBuf) + 256)) {
+            free(lhsBuf); free(rhsBuf); free(combined); return -1;
+        }
+        spanStart = L;
+        while (text[spanStart] == ' ' || text[spanStart] == '\t' ||
+               text[spanStart] == '\r' || text[spanStart] == '\n')
+            spanStart++;
+        spanEnd = (int)(rhsEnd - t);
+        cLen = (int)strlen(combined);
+        delta = cLen - (spanEnd - spanStart);
+        if (delta > 0 && spanEnd + delta > textSize) {
+            free(lhsBuf); free(rhsBuf); free(combined); return -1;
+        }
+        memmove(text + spanStart + cLen, text + spanEnd, strlen(text + spanEnd) + 1);
+        memcpy(text + spanStart, combined, cLen);
+        free(lhsBuf); free(rhsBuf); free(combined);
+        return spanStart + cLen;
+    }
+}
+
+/* glslRewriteBitwise ??? scan a buffer for bitwise operators (outside comments)
+ * and lower each one.  Successful replacements splice in the rewritten text;
+ * failures are left verbatim and warn once, so a genuinely unlowerable
+ * construct still reaches D3DCompile with its own error message. */
+
+static void glslRewriteBitwise(char *text, int textSize, glslBitCollector *col)
+{
+    glslBitCtx ctx;
+    int i = 0;
+
+    ctx.col = col;
+    ctx.failed = FALSE;
+
+    while (text[i]) {
+        char c = text[i];
+        int opId = 0, opLen = 0, newPos;
+
+        if (c == '/' && text[i + 1] == '/') {
+            while (text[i] && text[i] != '\n') i++;
+            continue;
+        }
+        if (c == '/' && text[i + 1] == '*') {
+            i += 2;
+            while (text[i] && !(text[i] == '*' && text[i + 1] == '/')) i++;
+            if (text[i]) i += 2;
+            continue;
+        }
+
+        if (c == '&') {
+            if (text[i + 1] == '=') { opId = GLSL_BIT_AND_EQ; opLen = 2; }
+            else if (text[i + 1] != '&') { opId = GLSL_BIT_AND; opLen = 1; }
+        } else if (c == '|') {
+            if (text[i + 1] == '=') { opId = GLSL_BIT_OR_EQ; opLen = 2; }
+            else if (text[i + 1] != '|') { opId = GLSL_BIT_OR; opLen = 1; }
+        } else if (c == '^') {
+            if (text[i + 1] == '=') { opId = GLSL_BIT_XOR_EQ; opLen = 2; }
+            else if (text[i + 1] != '^') { opId = GLSL_BIT_XOR; opLen = 1; }
+        } else if (c == '~') {
+            opId = GLSL_BIT_NOT; opLen = 1;
+        } else if (c == '<' && text[i + 1] == '<') {
+            if (text[i + 2] == '=') { opId = GLSL_BIT_SHL_EQ; opLen = 3; }
+            else { opId = GLSL_BIT_SHL; opLen = 2; }
+        } else if (c == '>' && text[i + 1] == '>') {
+            if (text[i + 2] == '=') { opId = GLSL_BIT_SHR_EQ; opLen = 3; }
+            else { opId = GLSL_BIT_SHR; opLen = 2; }
+        }
+
+        if (opId) {
+            newPos = glslBitProcess(&ctx, text, textSize, i, opId, opLen);
+            if (newPos > i) { i = newPos; continue; }
+            if (!ctx.failed && !glslBitNearUintLiteral(text, i)) {
+                ctx.failed = TRUE;
+                if (!col->warnedFallback) {
+                    col->warnedFallback = TRUE;
+                    gldDiagLog("GLSL->HLSL: a bitwise expression was not "
+                               "lowered (complex or vector operand); leaving "
+                               "it for D3DCompile to report.");
+                }
+            }
+        }
+        i++;
+    }
+}
+
+/* A u/U suffix on an integer literal marks a uint-typed expression.  SM3
+ * compiles uint bitwise operators natively and exactly, so an expression the
+ * lowering left alone because of such a literal needs no warning: D3DCompile
+ * will not report anything and the native result is correct. */
+static BOOL glslBitNearUintLiteral(const char *text, int pos)
+{
+    int lo = pos - 64, hi = pos + 64;
+    int j;
+
+    if (lo < 0) lo = 0;
+    for (j = lo; text[j] && j < hi; j++) {
+        if (text[j] == 'u' || text[j] == 'U') {
+            if (j > lo && text[j - 1] >= '0' && text[j - 1] <= '9')
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* glslBitEmitHelpers ??? append exactly the helper functions the rewritten
+ * text calls to the helpers buffer.  All are float-domain bit arithmetic:
+ * the general forms handle any operand below 2^24, the constant-specialized
+ * forms only test the bits their constant sets. */
+
+static void glslBitEmitHelpers(glslBitCollector *col, char *helpers, int helpersSize)
+{
+    char tmp[16384];
+    int n = 0;
+    int i;
+
+    if (col->hasGeneralAnd || col->hasGeneralOr || col->hasGeneralXor) {
+        n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n,
+            "float _glsl_bitand(float a, float b)\n"
+            "{\n"
+            "    float r = 0.0;\n");
+        for (i = 0; i < 24; i++) {
+            unsigned long long p1 = 1ULL << i;
+            unsigned long long p2 = 1ULL << (i + 1);
+            n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n,
+                "    r += %llu.0 * (floor(a / %llu.0) - 2.0 * floor(a / %llu.0)) * "
+                "(floor(b / %llu.0) - 2.0 * floor(b / %llu.0));\n",
+                p1, p1, p2, p1, p2);
+        }
+        n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n,
+            "    return r;\n"
+            "}\n");
+        if (col->hasGeneralOr) {
+            n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n,
+                "float _glsl_bitor(float a, float b)\n"
+                "{\n"
+                "    return a + b - _glsl_bitand(a, b);\n"
+                "}\n");
+        }
+        if (col->hasGeneralXor) {
+            n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n,
+                "float _glsl_bitxor(float a, float b)\n"
+                "{\n"
+                "    return a + b - 2.0 * _glsl_bitand(a, b);\n"
+                "}\n");
+        }
+    }
+    if (col->hasGeneralShl) {
+        n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n,
+            "float _glsl_shl(float a, float b)\n"
+            "{\n"
+            "    return a * pow(2.0, min(b, 24.0));\n"
+            "}\n");
+    }
+    if (col->hasGeneralShr) {
+        n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n,
+            "float _glsl_shr(float a, float b)\n"
+            "{\n"
+            "    return floor(a / pow(2.0, min(b, 24.0)));\n"
+            "}\n");
+    }
+
+    for (i = 0; i < col->andCount; i++) {
+        unsigned int v = col->andConst[i];
+        char hex[16];
+        int b;
+        sprintf(hex, "%06X", v);
+        n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n,
+            "float _glsl_and_%s(float a)\n"
+            "{\n"
+            "    float r = 0.0;\n", hex);
+        for (b = 0; b < 24; b++) {
+            if (!((v >> b) & 1u)) continue;
+            n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n,
+                "    r += %llu.0 * (floor(a / %llu.0) - 2.0 * floor(a / %llu.0));\n",
+                1ULL << b, 1ULL << b, 1ULL << (b + 1));
+        }
+        n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n, "    return r;\n}\n");
+    }
+    for (i = 0; i < col->orCount; i++) {
+        char hex[16];
+        sprintf(hex, "%06X", col->orConst[i]);
+        n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n,
+            "float _glsl_or_%s(float a)\n"
+            "{\n"
+            "    return a + %u.0 - _glsl_and_%s(a);\n"
+            "}\n", hex, col->orConst[i], hex);
+    }
+    for (i = 0; i < col->xorCount; i++) {
+        char hex[16];
+        sprintf(hex, "%06X", col->xorConst[i]);
+        n += glslBitSprintf(tmp + n, (int)sizeof(tmp) - n,
+            "float _glsl_xor_%s(float a)\n"
+            "{\n"
+            "    return a + %u.0 - 2.0 * _glsl_and_%s(a);\n"
+            "}\n", hex, col->xorConst[i], hex);
+    }
+
+    if (n <= 0) return;
+
+    {
+        int hLen = (int)strlen(helpers);
+        if (n + hLen + 2 >= helpersSize) {
+            gldDiagLog("GLSL->HLSL: bitwise helper functions exceed the helper "
+                       "buffer; the shader will fail at D3DCompile.");
+            return;
+        }
+        /* The generated helpers must precede the shader's own functions:
+         * D3DCompile on SM3 profiles cannot resolve a call to a function
+         * defined later in the file (X3004), and the user's helper functions
+         * are exactly what now calls them.  Prepend, keeping the buffer's
+         * own functions after. */
+        memmove(helpers + n + 1, helpers, hLen + 1);
+        memcpy(helpers, tmp, n);
+        helpers[n] = '\n';
+        helpers[n + hLen + 1] = '\0';
+    }
+}
+
+/*
+ * glslDetectUnlowerableConstructs ??? name the GLSL constructs that have no
  * Shader Model 3 lowering at all, once each, before the compiler gets to them.
  *
  * This changes nothing about what compiles.  Transpilation and D3DCompile run
@@ -3712,13 +5896,16 @@ next_iter:;
  * by then the reason has usually turned into a syntax error some distance from
  * the GLSL that caused it.
  *
- * Bitwise operators head the list because they look the most fixable and are
- * not: D3DCompile rejects &, |, ^, ~, << and >> with "error X3535: Bitwise
- * operations not supported on target ps_3_0" on every SM3 profile, whatever the
- * operands are.  Emulating them means decomposing values bit by bit in the
- * float domain, against a 24-bit exact-integer ceiling — a separate feature,
- * not attempted here.  (Plain int/uint arithmetic is fine and needs nothing:
- * D3DCompile lowers +, -, *, / and % to float operations itself.)
+ * Bitwise operators used to head this list: D3DCompile rejects &, |, ^, ~,
+ * << and >> on every SM3 profile (error X3535).  They are lowered now, by
+ * glslRewriteBitwise, into float-domain bit arithmetic that is exact below
+ * the 2^24 ceiling.  What is *not* lowered ??? vector operands (the helper
+ * functions are scalar, so the rewritten code fails D3DCompile with a type
+ * error) and compound assignments with side-effecting lvalues (expanded
+ * textually, evaluating the lvalue twice) ??? is a narrow enough gap that the
+ * compiler's own message still names the spot.  (Plain int/uint arithmetic is
+ * fine and needs nothing: D3DCompile lowers +, -, *, / and % to float
+ * operations itself.)
  *
  * The list is not exhaustive and is not meant to be.  Anything it misses still
  * produces D3DCompile's own error text, exactly as before.
@@ -3750,7 +5937,6 @@ static BOOL glslHasWordPrefix(const char *src, const char *prefix)
 
 static void glslDetectUnlowerableConstructs(const char *src)
 {
-    static BOOL warnedBitwise = FALSE;
     static BOOL warnedBuffer  = FALSE;
     static BOOL warnedImage   = FALSE;
     static BOOL warnedAtomic  = FALSE;
@@ -3769,31 +5955,6 @@ static void glslDetectUnlowerableConstructs(const char *src)
     int i;
 
     if (!src) return;
-
-    if (!warnedBitwise) {
-        const char *p;
-        const char *hit = NULL;
-        for (p = src; *p && !hit; p++) {
-            switch (*p) {
-            /* && and || are distinct tokens; a lone & or | can only be
-             * bitwise, GLSL has no third meaning for either. */
-            case '&': if (p[1] != '&' && !(p != src && p[-1] == '&')) hit = "&"; break;
-            case '|': if (p[1] != '|' && !(p != src && p[-1] == '|')) hit = "|"; break;
-            case '^': hit = "^ or ^^"; break;
-            case '~': hit = "~"; break;
-            case '<': if (p[1] == '<') hit = "<<"; break;
-            case '>': if (p[1] == '>') hit = ">>"; break;
-            default: break;
-            }
-        }
-        if (hit) {
-            warnedBitwise = TRUE;
-            gldDiagLog("GLSL->HLSL: shader uses the bitwise operator '%s'. D3DCompile "
-                       "rejects bitwise operations on every Shader Model 3 profile "
-                       "(error X3535) and no lowering for them exists here, so this "
-                       "shader cannot compile. Plain integer +,-,*,/,%% are fine.", hit);
-        }
-    }
 
     if (!warnedBuffer && glslHasWord(src, "buffer")) {
         warnedBuffer = TRUE;
@@ -3834,7 +5995,7 @@ static void glslDetectUnlowerableConstructs(const char *src)
 }
 
 /*
- * glslDoTranspile — the main transpilation pipeline.
+ * glslDoTranspile ??? the main transpilation pipeline.
  *
  * Steps:
  *   1. Copy and preprocess the GLSL source
@@ -3845,7 +6006,13 @@ static void glslDetectUnlowerableConstructs(const char *src)
  *   6. Replace built-in variables
  *   7. Build the complete HLSL shader with structs and entry point
  */
+/* Debug aid: in verbose mode, dump the single source line containing the
+ * first "ambientLight" mention.  Used to find which pipeline pass deletes the
+ * head of a multi-line `vec3 x = vec3(0.0) + ...` initializer: one line per
+ * stage per shader, and the stage where the head vanishes is the culprit. */
 static BOOL glslDoTranspile(int shaderType, const char *glslSource,
+                            const glslAttributeBinding *bindings,
+                            int bindingCount,
                             char *hlslOut, int hlslBufSize)
 {
     char *workBuf = NULL;
@@ -3869,8 +6036,11 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
     int fnCount = 0;
     glslDefine defines[GLSL_MAX_DEFINES];
     int defineCount = 0;
+    glslObjectDefine objectDefines[GLSL_MAX_DEFINES];
+    int objectDefineCount = 0;
     BOOL unresolvedArray = FALSE;
     int idx;
+    glslBitCollector bitCol;
 
     texDim.count = 0;
 
@@ -3930,6 +6100,8 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
     /* Integer #defines, read from the untouched source: an array uniform is
      * as likely to be sized by a macro as by a literal. */
     defineCount = glslCollectDefines(glslSource, defines, GLSL_MAX_DEFINES);
+    objectDefineCount = glslCollectObjectDefines(
+        glslSource, objectDefines, GLSL_MAX_DEFINES);
 
     /* Parse declarations from original source (before stripping) */
     glslParseDeclarations(workBuf, shaderType,
@@ -3938,9 +6110,25 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
                           uniforms, &unifCount,
                           defines, defineCount, &unresolvedArray);
 
+    /* glBindAttribLocation is a link-time input. Apply it after parsing so
+     * the HLSL input declaration is compiled with the semantic belonging to
+     * the application's real array index. */
+    if (shaderType == GLSL_SHADER_VERTEX && bindings && bindingCount > 0) {
+        int a, b;
+        for (a = 0; a < attrCount; ++a) {
+            for (b = bindingCount - 1; b >= 0; --b) {
+                if (bindings[b].name &&
+                    strcmp(attributes[a].name, bindings[b].name) == 0) {
+                    attributes[a].location = bindings[b].location;
+                    break;
+                }
+            }
+        }
+    }
+
     /* An array whose extent could not be resolved stops here.  Carrying on
-     * would emit the uniform as a scalar, which D3DCompile *accepts* — it
-     * reads foo[0..3] on a scalar float4 as a component swizzle — so the
+     * would emit the uniform as a scalar, which D3DCompile *accepts* ??? it
+     * reads foo[0..3] on a scalar float4 as a component swizzle ??? so the
      * shader would compile and then read the wrong values for every element
      * with nothing to show for it.  glslParseDeclarations has already named
      * the offending declaration in the diagnostic log. */
@@ -3959,6 +6147,17 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
     glslStripPrecisionQualifiers(workBuf);
     glslStripLayoutQualifiers(workBuf, NULL, NULL);
 
+    /* Join continuation lines: GLSL allows newlines inside expressions, so
+     * a multi-line statement like
+     *   vec3 ambientLight = vec3( 0.0 )
+     *   + max( ... )
+     *   + max( ... );
+     * has its head line blanked by glslRemoveDeclarationLines, which only
+     * blanks complete lines that match a declaration pattern.  Collapsing
+     * all continuation lines onto the head makes every statement occupy a
+     * single line, so no pass can partially delete it. */
+    glslJoinContinuationLines(workBuf);
+
     /* Remove declaration lines */
     glslRemoveDeclarationLines(workBuf);
 
@@ -3976,11 +6175,17 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
         return FALSE;
     }
 
+    /* #define lines were blanked with the other preprocessor directives.
+     * Substitute the safe scalar subset into executable text before any
+     * lowering pass needs to understand the surrounding expression. */
+    glslApplyObjectDefines(mainBody, objectDefines, objectDefineCount);
+    glslApplyObjectDefines(helpers, objectDefines, objectDefineCount);
+
     /* Move any user-defined function whose name is also a GLSL or HLSL builtin
      * out of the way, before a single rewrite pass has looked at the body.
      *
      * Order is the whole point.  Run afterwards, the function-name rewrites
-     * would have already mangled the user function's own definition — a
+     * would have already mangled the user function's own definition ??? a
      * "vec4 textureLod(sampler2D s, vec2 uv, float lod) {" header does not
      * parse as a 3-argument call, so glslApplyTextureLodRewrite takes its
      * fallback branch and renames the definition to tex2Dlod, shadowing the
@@ -3994,13 +6199,30 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
             continue;
 
         sprintf(renamed, "_glsl_userfn_%s", fnNames[idx]);
-        gldDiagLog("GLSL->HLSL: shader defines its own '%s', which is also a "
-                   "builtin this translation rewrites; renamed to '%s' so the "
-                   "definition survives and the builtin stays reachable.",
-                   fnNames[idx], renamed);
+        /* Per-shader detail, one line per collision: gated on verbose like
+         * every other per-call diagnostic, because a title whose shaders
+         * routinely shadow a builtin would otherwise write this same line
+         * for every shader it compiles. */
+        gldDiagLogV("GLSL->HLSL: shader defines its own '%s', which is also a "
+                    "builtin this translation rewrites; renamed to '%s' so the "
+                    "definition survives and the builtin stays reachable.",
+                    fnNames[idx], renamed);
         glslReplaceWord(mainBody, fnNames[idx], renamed);
         glslReplaceWord(helpers,  fnNames[idx], renamed);
     }
+
+
+    /* Step 4.5: Lower bitwise operators to Shader Model 3 arithmetic.
+     * Runs on the GLSL spelling, before the type and function replacement
+     * passes below can touch the text: &, |, ^, ~, << and >> become
+     * float-domain bit arithmetic, exact below the 2^24 ceiling, with
+     * constant-specialized helpers for the common masks.  The generated
+     * helper functions are appended to the helpers buffer by
+     * glslBitEmitHelpers after the shader is built, so no later rewrite
+     * pass can touch them. */
+    memset(&bitCol, 0, sizeof(bitCol));
+    glslRewriteBitwise(mainBody, HLSL_MAX_OUTPUT / 2, &bitCol);
+    glslRewriteBitwise(helpers, HLSL_MAX_OUTPUT / 4, &bitCol);
 
     /* Step 5: Apply type replacements to main body and helpers.
      * The splat rewrite has to run first: it works on the GLSL spelling and
@@ -4012,11 +6234,17 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
     /* The two matrix rewrites also work on the GLSL spelling, and both run
      * before the rename for the same reason.  The symbol set is collected from
      * the original source, which still holds the declarations the body's
-     * matrix names come from — glslRemoveDeclarationLines has blanked them out
+     * matrix names come from ??? glslRemoveDeclarationLines has blanked them out
      * of workBuf by now.  Diagonal constructors go first so that a
      * "mat4(1.0) * v" is already a recognisable matrix constructor by the time
      * the product rewrite looks at it. */
     matCount = glslCollectMatrixSymbols(glslSource, matNames, GLSL_MAX_VARS);
+    if (strstr(glslSource, "gl_ModelViewProjectionMatrix") && matCount < GLSL_MAX_VARS)
+        strcpy(matNames[matCount++], "gl_ModelViewProjectionMatrix");
+    if (strstr(glslSource, "gl_ModelViewMatrix") && matCount < GLSL_MAX_VARS)
+        strcpy(matNames[matCount++], "gl_ModelViewMatrix");
+    if (strstr(glslSource, "gl_ProjectionMatrix") && matCount < GLSL_MAX_VARS)
+        strcpy(matNames[matCount++], "gl_ProjectionMatrix");
 
     /* The symbol set comes off the original source, which still spells a
      * matrix named after an HLSL reserved word ("mat4 matrix;") the way the
@@ -4040,8 +6268,20 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
     glslApplyTypeReplacements(helpers);
 
     /* Step 6: Apply function replacements */
-    glslApplyFunctionReplacements(mainBody, &texDim, uniforms, unifCount);
-    glslApplyFunctionReplacements(helpers, &texDim, uniforms, unifCount);
+    glslApplyFunctionReplacements(mainBody, HLSL_MAX_OUTPUT / 2, &texDim, uniforms, unifCount);
+    glslApplyFunctionReplacements(helpers, HLSL_MAX_OUTPUT / 4, &texDim, uniforms, unifCount);
+
+    /* idTech's tex2Ddepth helper is used from data-dependent SSR loops.  An
+     * implicit-gradient tex2D in such a loop makes the SM3 compiler attempt to
+     * unroll an unbounded iteration count and reject the shader (X3570).  A
+     * depth lookup is intentionally mip zero, and ps_3_0 permits tex2Dlod in
+     * dynamic flow, so make that semantic explicit without changing ordinary
+     * colour texture sampling elsewhere in the shader. */
+    if (shaderType == GLSL_SHADER_PIXEL && strstr(helpers, "tex2Ddepth")) {
+        glslReplaceAll(helpers,
+            "return _glsl_userfn_tex2D( image, texcoord ).x;",
+            "return tex2Dlod( image, float4( texcoord.x, texcoord.y, 0.0, 0.0 ) ).x;");
+    }
 
     /* Step 7: Replace built-in variables */
     glslReplaceBuiltinVars(mainBody, shaderType);
@@ -4093,6 +6333,9 @@ static BOOL glslDoTranspile(int shaderType, const char *glslSource,
                              usesFragCoord, usesFrontFacing,
                              &texDim);
     }
+
+    /* Append the bitwise helper functions, if the rewrite needed any. */
+    glslBitEmitHelpers(&bitCol, helpers, HLSL_MAX_OUTPUT / 4);
 
     /* Insert helper functions before the main function */
     if (helpers[0] != '\0') {

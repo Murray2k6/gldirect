@@ -913,7 +913,10 @@ int WINAPI DllMain(
 			break;
 		}
 
-		// A real unload: the device would outlive the DLL that owns it.
+		/* A real unload can only reach here if no WGL call started Tracy.  Once
+		 * profiling starts the module is process-pinned, because joining a
+		 * profiler worker here would deadlock under the loader lock. */
+		// The device would outlive an unprofiled DLL that owns it.
 		gldExitDriver();
 		break;
 	}

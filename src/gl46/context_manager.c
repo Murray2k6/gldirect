@@ -45,6 +45,7 @@
 #include "gld_context.h"
 #include "gld_globals.h"
 #include "gld_diag.h"
+#include "gld_profile.h"
 #include "gl_impl.h"
 #include "glsl_to_hlsl.h"
 #include "pixel_format_provider.h"
@@ -143,6 +144,13 @@ static int s_deviceSwapInterval = -1;
 // window then select one with depth and stencil; without noticing that the
 // device keeps the bootstrap's configuration for the whole session.
 static int s_devicePixelFormat  = -1;
+
+// Last back buffer dimensions reported to Present.  Used to detect a window
+// resize that requires a device Reset: the bootstrap window is small (304x201
+// for Wolfenstein) but the real game window is 1920x1080.  Without tracking
+// this the device keeps the bootstrap dimensions and the game renders black.
+static UINT s_lastPresentWidth  = 0;
+static UINT s_lastPresentHeight = 0;
 
 // ***********************************************************************
 // Initialize the D3D9 layer for the GL46 backend.
@@ -249,6 +257,25 @@ void gldShutdownContext46(void)
      * leak and go fix the crash. */
     gldDiagLog("GL46: shutdown starting (device=%p, d3d9=%p)",
                (void *)gl46Globals.pDev, (void *)gl46Globals.pD3D);
+
+    /* DXVK Remix initialises its Vulkan bridge the first time this process
+     * calls Direct3DCreate9 and never allows a second one: a later
+     * gldCreateContext46 would re-run gldInitContext46, hit the bridge a
+     * second time, and terminate the process without raising any exception
+     * for the fault reporter to see.  Contexts after the first must therefore
+     * reach the Reset-and-reuse path in gldCreateContext46, which needs the
+     * device and interface to survive this call.  They are released by the
+     * operating system at process exit instead; keeping them costs nothing
+     * but a few pages. */
+    if (gl46Globals.bRemixDetected &&
+        GetEnvironmentVariableA("GLDIRECT_REMIX_FINAL_TEARDOWN", NULL, 0) == 0) {
+        gldDiagLog("GL46: shutdown skipped - DXVK Remix bridge is one-shot, "
+                   "device and interface kept for context reuse");
+        return;
+    }
+    if (gl46Globals.bRemixDetected)
+        gldDiagLog("GL46: explicit final Remix teardown requested; context reuse "
+                   "is disabled after this point");
 
     if (gl46Globals.pDev) {
         ULONG refs;
@@ -460,7 +487,41 @@ BOOL gldPresentParamsNeedReset46(void)
     if (gldGetSwapInterval46() != s_deviceSwapInterval)
         return TRUE;
 
-    return (gldGetPixelFormat() != s_devicePixelFormat);
+    if (gldGetPixelFormat() != s_devicePixelFormat)
+        return TRUE;
+
+    /* Also trigger a Reset when the window client size has changed since
+     * the last Present.  The bootstrap window is small (304x201) but the
+     * real game window is full-screen resolution; without this check the
+     * device keeps the bootstrap dimensions and the game renders black. */
+    {
+        HWND hWndCurrent = NULL;
+        IDirect3DDevice9 *pDev = gl46Globals.pDev;
+        if (pDev) {
+            /* Retrieve the device's current target window from the swap
+             * chain parameters — but D3D9 has no getter for it.  Use the
+             * GL46 context's active HWND instead.  The context's hWnd is
+             * updated by gldMakeCurrent / gldCreateContext whenever the
+             * app binds a new DC. */
+            extern HGLRC gldGetCurrentContext(void);
+            extern GLD_ctx *gldGetContextAddress(const HGLRC);
+            HGLRC hRC = gldGetCurrentContext();
+            GLD_ctx *ctx = hRC ? gldGetContextAddress(hRC) : NULL;
+            if (ctx && ctx->hWnd && IsWindow(ctx->hWnd)) {
+                RECT rc;
+                if (GetClientRect(ctx->hWnd, &rc)) {
+                    UINT curW = (UINT)(rc.right - rc.left);
+                    UINT curH = (UINT)(rc.bottom - rc.top);
+                    if (curW > 0 && curH > 0 &&
+                        (curW != s_lastPresentWidth || curH != s_lastPresentHeight)) {
+                        return TRUE;
+                    }
+                }
+            }
+        }
+    }
+
+    return FALSE;
 }
 
 // ***********************************************************************
@@ -475,6 +536,22 @@ void gldNotePresentParamsApplied46(void)
      */
     s_deviceSwapInterval = gldGetSwapInterval46();
     s_devicePixelFormat  = gldGetPixelFormat();
+
+    /* Record the current window size so gldPresentParamsNeedReset46 can
+     * detect the next size change. */
+    {
+        extern HGLRC gldGetCurrentContext(void);
+        extern GLD_ctx *gldGetContextAddress(const HGLRC);
+        HGLRC hRC = gldGetCurrentContext();
+        GLD_ctx *ctx = hRC ? gldGetContextAddress(hRC) : NULL;
+        if (ctx && ctx->hWnd && IsWindow(ctx->hWnd)) {
+            RECT rc;
+            if (GetClientRect(ctx->hWnd, &rc)) {
+                s_lastPresentWidth  = (UINT)(rc.right - rc.left);
+                s_lastPresentHeight = (UINT)(rc.bottom - rc.top);
+            }
+        }
+    }
 }
 
 // ***********************************************************************
@@ -529,6 +606,10 @@ HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor)
     BOOL                    bDesktopFallback;
     RECT                    rcClient;
     BOOL                    bGotClientRect;
+
+    GLD_PROFILE_ZONE_BEGIN(profileZone, "D3D9 context create/reset");
+
+    __try {
 
     // Load D3D9 if not already loaded
     if (!gl46Globals.fnDirect3DCreate9) {
@@ -723,6 +804,9 @@ HGLRC gldCreateContext46(HDC hDC, GLint *pMajor, GLint *pMinor)
     if (pMinor) *pMinor = 6;
 
     return (HGLRC)(INT_PTR)1;
+    } __finally {
+        GLD_PROFILE_ZONE_END(profileZone);
+    }
 }
 
 // ***********************************************************************

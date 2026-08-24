@@ -127,7 +127,12 @@ void gldLogMessage(
 		return;
 
 	if (severity >= gldDebugLevel) {
-		sprintf(buf, "GLD: (%s) %s", gldLogSeverityMessages[severity], message);
+		/* _snprintf, not sprintf: `message` can carry long driver
+		 * descriptions and log lines, and an unbounded write past this
+		 * stack buffer is a stack-corruption fault waiting for one. */
+		_snprintf(buf, sizeof(buf) - 1, "GLD: (%s) %s",
+		          gldLogSeverityMessages[severity], message);
+		buf[sizeof(buf) - 1] = '\0';
 		fputs(buf, fpGLDLog); // Write string to file
 		fflush(fpGLDLog);     // Flush every line so a crash doesn't lose output
 		OutputDebugString(buf); // Echo to debugger
@@ -156,9 +161,11 @@ void gldLogError(
 	char dxErrStr[1024];
 	_gldDriver.GetDXErrorString(hResult, &dxErrStr[0], sizeof(dxErrStr));
 	if (FAILED(hResult)) {
-		sprintf(gldLogbuf, "GLD: %s %8x:[ %s ]\n", message, hResult, dxErrStr);
+		_snprintf(gldLogbuf, sizeof(gldLogbuf) - 2, "GLD: %s %8x:[ %s ]\n",
+		          message, hResult, dxErrStr);
 	} else
-		sprintf(gldLogbuf, "GLD: %s\n", message);
+		_snprintf(gldLogbuf, sizeof(gldLogbuf) - 2, "GLD: %s\n", message);
+	gldLogbuf[sizeof(gldLogbuf) - 2] = '\0';
 	gldLogMessage(severity, gldLogbuf);
 }
 
@@ -172,7 +179,12 @@ void gldLogPrintf(
 	va_list args;
 
 	va_start(args, message);
-	vsprintf(gldLogbuf, message, args);
+	/* _vsnprintf, not vsprintf: the log buffer is 1024 bytes and a long
+	 * shader or extension string in a formatted line would otherwise run
+	 * straight past it into whatever static follows.  One byte of slack is
+	 * kept for the trailing newline. */
+	_vsnprintf(gldLogbuf, sizeof(gldLogbuf) - 2, message, args);
+	gldLogbuf[sizeof(gldLogbuf) - 2] = '\0';
 	va_end(args);
 
 	lstrcat(gldLogbuf, "\n");
@@ -194,11 +206,21 @@ void gldLogPathOption(
 	LPSTR szPath)
 {
 	char szPathName[_MAX_PATH];
+	int n;
 
-	strcpy(szPathName, szPath);
-    strcat(szPathName, "\\");
-    strcat(szPathName, szGLDLogName);
-    strcpy(szGLDLogName, szPathName);
+	if (!szPath)
+		return;
+
+	/* Bound: szPath comes from external configuration and is not
+	 * guaranteed to fit a path buffer. */
+	n = (int)strlen(szPath);
+	if (n > (int)sizeof(szPathName) - (int)sizeof(GLDLOG_FILENAME) - 2)
+		n = (int)sizeof(szPathName) - (int)sizeof(GLDLOG_FILENAME) - 2;
+	memcpy(szPathName, szPath, (size_t)n);
+	szPathName[n] = '\0';
+	strcat(szPathName, "\\");
+	strcat(szPathName, szGLDLogName);
+	strcpy(szGLDLogName, szPathName);
 }
 
 // ***********************************************************************

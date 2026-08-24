@@ -34,6 +34,8 @@
 #include "display_list_emulator.h"
 #include "error_handler.h"
 #include "gld_log.h"
+#include "gld_diag.h"
+#include "gl_state.h"
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
@@ -62,6 +64,21 @@ static GLuint   s_nextListName = 1;
 /*---------------------- Internal helper functions ----------------------*/
 
 /*
+ * Record a GL error without clobbering one already pending.  The GL error
+ * contract is first-error-wins until glGetError clears it; a display list
+ * fault must be visible to the application through glGetError, or the
+ * application silently continues with a list that was never compiled and
+ * the fault shows up as wrong geometry instead of an error.
+ */
+static void dlSetError(GLenum error)
+{
+    GLS_State *s = glsGetState();
+
+    if (s && s->lastError == GL_NO_ERROR)
+        s->lastError = (GLenum_t)error;
+}
+
+/*
  * Find the slot index for a given list ID.
  * Returns -1 if not found.
  */
@@ -70,11 +87,15 @@ static int sFindListSlot(GLuint listId)
     int start = (int)(listId % GLD_DL_MAX_LISTS);
     int i;
 
+    /* Linear probe: an empty slot terminates the chain.  A tombstone (freed
+     * by gldDeleteLists46) does not: entries inserted behind it are still
+     * reachable only by probing through it, and treating it as a chain end
+     * would silently lose every list stored after a deleted one. */
     for (i = 0; i < GLD_DL_MAX_LISTS; i++) {
         int idx = (start + i) % GLD_DL_MAX_LISTS;
         if (s_lists[idx].inUse && s_lists[idx].listId == listId)
             return idx;
-        if (FALSE && !s_lists[idx].inUse && s_lists[idx].listId == 0)
+        if (!s_lists[idx].inUse && !s_lists[idx].tombstone)
             return -1;  /* Empty slot — list doesn't exist */
     }
     return -1;
@@ -119,6 +140,7 @@ static void sFreeListSlot(int slot)
     s_lists[slot].cmdCapacity = 0;
     s_lists[slot].inUse = FALSE;
     s_lists[slot].listId = 0;
+    s_lists[slot].tombstone = TRUE;  /* keep the probe chain intact */
 }
 
 /*
@@ -164,29 +186,28 @@ void gldNewList46(GLuint listId, GLenum mode)
     int slot;
 
     if (listId == 0) {
-        gldLogPrintf(GLDLOG_ERROR,
-            "gldNewList46: list ID 0 is reserved");
+        dlSetError(GL_INVALID_VALUE);
+        gldFlagFault("display-list", "glNewList(0) (GL_INVALID_VALUE)");
         return;
     }
 
     if (s_recording) {
-        gldLogPrintf(GLDLOG_ERROR,
-            "gldNewList46: already recording list %u", s_recordingListId);
+        dlSetError(GL_INVALID_OPERATION);
+        gldFlagFault("display-list", "nested glNewList while compiling a list (GL_INVALID_OPERATION)");
         return;
     }
 
     if (mode != GL_COMPILE && mode != GL_COMPILE_AND_EXECUTE) {
-        gldLogPrintf(GLDLOG_ERROR,
-            "gldNewList46: invalid mode 0x%04X", (unsigned)mode);
+        dlSetError(GL_INVALID_ENUM);
+        gldFlagFault("display-list", "glNewList with invalid mode (GL_INVALID_ENUM)");
         return;
     }
 
     /* Find or allocate a slot */
     slot = sAllocListSlot(listId);
     if (slot < 0) {
-        gldLogPrintf(GLDLOG_ERROR,
-            "gldNewList46: display list table full (%d lists)",
-            GLD_DL_MAX_LISTS);
+        dlSetError(GL_OUT_OF_MEMORY);
+        gldFlagFault("display-list", "glNewList table full (GL_OUT_OF_MEMORY)");
         return;
     }
 
@@ -224,8 +245,8 @@ void gldNewList46(GLuint listId, GLenum mode)
 void gldEndList46(void)
 {
     if (!s_recording) {
-        gldLogPrintf(GLDLOG_WARN,
-            "gldEndList46: not currently recording");
+        dlSetError(GL_INVALID_OPERATION);
+        gldFlagFault("display-list", "glEndList without glNewList (GL_INVALID_OPERATION)");
         return;
     }
 
@@ -247,21 +268,23 @@ void gldCallList46(GLuint listId)
     GLD_displayList *dl;
     int i;
 
-    if (listId == 0)
+    if (listId == 0) {
+        dlSetError(GL_INVALID_VALUE);
+        gldFlagFault("display-list", "glCallList(0) (GL_INVALID_VALUE)");
         return;
+    }
 
     /* Check nesting depth */
     if (s_nestingDepth >= GLD_DL_MAX_NESTING) {
-        gldLogPrintf(GLDLOG_ERROR,
-            "gldCallList46: nesting depth exceeded (%d)",
-            GLD_DL_MAX_NESTING);
+        dlSetError(GL_STACK_OVERFLOW);
+        gldFlagFault("display-list", "glCallList nesting exceeded (GL_STACK_OVERFLOW)");
         return;
     }
 
     slot = sFindListSlot(listId);
     if (slot < 0) {
-        gldLogPrintf(GLDLOG_WARN,
-            "gldCallList46: list %u not found", listId);
+        dlSetError(GL_INVALID_VALUE);
+        gldFlagFault("display-list", "glCallList of a list that does not exist (GL_INVALID_VALUE)");
         return;
     }
 
@@ -289,8 +312,8 @@ void gldDeleteLists46(GLuint base, GLsizei range)
     GLsizei i;
 
     if (range < 0) {
-        gldLogPrintf(GLDLOG_ERROR,
-            "gldDeleteLists46: negative range %d", range);
+        dlSetError(GL_INVALID_VALUE);
+        gldFlagFault("display-list", "glDeleteLists with negative range (GL_INVALID_VALUE)");
         return;
     }
 
@@ -337,8 +360,8 @@ GLuint gldGenLists46(GLsizei range)
         }
     }
 
-    gldLogPrintf(GLDLOG_ERROR,
-        "gldGenLists46: unable to allocate %d contiguous list names", range);
+    gldFlagFault("display-list", "glGenLists unable to allocate a contiguous range");
+    dlSetError(GL_OUT_OF_MEMORY);
     return 0;
 }
 
@@ -380,6 +403,8 @@ BOOL gldDLRecordCommand(GLD_dlCommandFunc func,
         cmd->argData = (unsigned char *)malloc((size_t)argSize);
         if (!cmd->argData) {
             memset(cmd, 0, sizeof(*cmd));
+            dlSetError(GL_OUT_OF_MEMORY);
+            gldFlagFault("display-list", "command recording allocation failed (GL_OUT_OF_MEMORY)");
             return FALSE;
         }
         memcpy(cmd->argData, argData, (size_t)argSize);

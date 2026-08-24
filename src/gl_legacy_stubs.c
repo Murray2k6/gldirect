@@ -15,6 +15,7 @@
 
 /* Include the GL state implementation functions */
 #include "gl46/gl_impl.h"
+#include "gld_diag.h"
 
 /* We intentionally do NOT include glad/gl.h here to avoid macro conflicts.
  * GLAD defines glXxx as macros expanding to glad_glXxx function pointers,
@@ -55,6 +56,12 @@ typedef void GLvoid;
  * These are exported by opengl32.def
  *---------------------------------------------------------------------------*/
 
+/* Signed-normalisation per the GL 1.x spec: the most negative value maps to
+ * exactly -1.0 (e.g. -128/127 is out of range and must clamp). */
+static GLfloat _gllNormByte(GLbyte v)   { return (v == -128)             ? -1.0f : v / 127.0f; }
+static GLfloat _gllNormShort(GLshort v) { return (v == -32768)           ? -1.0f : v / 32767.0f; }
+static GLfloat _gllNormInt(GLint v)     { return (v == -2147483647 - 1)  ? -1.0f : v / 2147483647.0f; }
+
 void APIENTRY glAccum(GLenum op, GLfloat value) { _glsAccum(op, value); }
 void APIENTRY glAlphaFunc(GLenum func, GLfloat ref) { _glsAlphaFunc(func, ref); }
 void APIENTRY glBegin(GLenum mode) { _glsBegin(mode); }
@@ -65,35 +72,35 @@ void APIENTRY glClearAccum(GLfloat r, GLfloat g, GLfloat b, GLfloat a) { _glsCle
 void APIENTRY glClearIndex(GLfloat c) { _glsClearIndex(c); }
 void APIENTRY glClipPlane(GLenum plane, const GLdouble *equation) { _glsClipPlane(plane, equation); }
 
-void APIENTRY glColor3b(GLbyte r, GLbyte g, GLbyte b) { _glsColor4f(r/127.0f, g/127.0f, b/127.0f, 1.0f); }
+void APIENTRY glColor3b(GLbyte r, GLbyte g, GLbyte b) { _glsColor4f(_gllNormByte(r), _gllNormByte(g), _gllNormByte(b), 1.0f); }
 void APIENTRY glColor3d(GLdouble r, GLdouble g, GLdouble b) { _glsColor4f((float)r, (float)g, (float)b, 1.0f); }
 void APIENTRY glColor3f(GLfloat r, GLfloat g, GLfloat b) { _glsColor3f(r, g, b); }
-void APIENTRY glColor3i(GLint r, GLint g, GLint b) { _glsColor4f(r/2147483647.0f, g/2147483647.0f, b/2147483647.0f, 1.0f); }
-void APIENTRY glColor3s(GLshort r, GLshort g, GLshort b) { _glsColor4f(r/32767.0f, g/32767.0f, b/32767.0f, 1.0f); }
+void APIENTRY glColor3i(GLint r, GLint g, GLint b) { _glsColor4f(_gllNormInt(r), _gllNormInt(g), _gllNormInt(b), 1.0f); }
+void APIENTRY glColor3s(GLshort r, GLshort g, GLshort b) { _glsColor4f(_gllNormShort(r), _gllNormShort(g), _gllNormShort(b), 1.0f); }
 void APIENTRY glColor3ub(GLubyte r, GLubyte g, GLubyte b) { _glsColor3ub(r, g, b); }
 void APIENTRY glColor3ui(GLuint r, GLuint g, GLuint b) { _glsColor4f(r/4294967295.0f, g/4294967295.0f, b/4294967295.0f, 1.0f); }
 void APIENTRY glColor3us(GLushort r, GLushort g, GLushort b) { _glsColor4f(r/65535.0f, g/65535.0f, b/65535.0f, 1.0f); }
-void APIENTRY glColor4b(GLbyte r, GLbyte g, GLbyte b, GLbyte a) { _glsColor4f(r/127.0f, g/127.0f, b/127.0f, a/127.0f); }
+void APIENTRY glColor4b(GLbyte r, GLbyte g, GLbyte b, GLbyte a) { _glsColor4f(_gllNormByte(r), _gllNormByte(g), _gllNormByte(b), _gllNormByte(a)); }
 void APIENTRY glColor4d(GLdouble r, GLdouble g, GLdouble b, GLdouble a) { _glsColor4f((float)r, (float)g, (float)b, (float)a); }
 void APIENTRY glColor4f(GLfloat r, GLfloat g, GLfloat b, GLfloat a) { _glsColor4f(r, g, b, a); }
-void APIENTRY glColor4i(GLint r, GLint g, GLint b, GLint a) { _glsColor4f(r/2147483647.0f, g/2147483647.0f, b/2147483647.0f, a/2147483647.0f); }
-void APIENTRY glColor4s(GLshort r, GLshort g, GLshort b, GLshort a) { _glsColor4f(r/32767.0f, g/32767.0f, b/32767.0f, a/32767.0f); }
+void APIENTRY glColor4i(GLint r, GLint g, GLint b, GLint a) { _glsColor4f(_gllNormInt(r), _gllNormInt(g), _gllNormInt(b), _gllNormInt(a)); }
+void APIENTRY glColor4s(GLshort r, GLshort g, GLshort b, GLshort a) { _glsColor4f(_gllNormShort(r), _gllNormShort(g), _gllNormShort(b), _gllNormShort(a)); }
 void APIENTRY glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a) { _glsColor4ub(r, g, b, a); }
 void APIENTRY glColor4ui(GLuint r, GLuint g, GLuint b, GLuint a) { _glsColor4f(r/4294967295.0f, g/4294967295.0f, b/4294967295.0f, a/4294967295.0f); }
 void APIENTRY glColor4us(GLushort r, GLushort g, GLushort b, GLushort a) { _glsColor4f(r/65535.0f, g/65535.0f, b/65535.0f, a/65535.0f); }
-void APIENTRY glColor3bv(const GLbyte *v) { if(v) _glsColor4f(v[0]/127.0f, v[1]/127.0f, v[2]/127.0f, 1.0f); }
+void APIENTRY glColor3bv(const GLbyte *v) { if(v) _glsColor4f(_gllNormByte(v[0]), _gllNormByte(v[1]), _gllNormByte(v[2]), 1.0f); }
 void APIENTRY glColor3dv(const GLdouble *v) { if(v) _glsColor4f((float)v[0], (float)v[1], (float)v[2], 1.0f); }
 void APIENTRY glColor3fv(const GLfloat *v) { if(v) _glsColor3f(v[0], v[1], v[2]); }
-void APIENTRY glColor3iv(const GLint *v) { if(v) _glsColor4f(v[0]/2147483647.0f, v[1]/2147483647.0f, v[2]/2147483647.0f, 1.0f); }
-void APIENTRY glColor3sv(const GLshort *v) { if(v) _glsColor4f(v[0]/32767.0f, v[1]/32767.0f, v[2]/32767.0f, 1.0f); }
+void APIENTRY glColor3iv(const GLint *v) { if(v) _glsColor4f(_gllNormInt(v[0]), _gllNormInt(v[1]), _gllNormInt(v[2]), 1.0f); }
+void APIENTRY glColor3sv(const GLshort *v) { if(v) _glsColor4f(_gllNormShort(v[0]), _gllNormShort(v[1]), _gllNormShort(v[2]), 1.0f); }
 void APIENTRY glColor3ubv(const GLubyte *v) { if(v) _glsColor3ub(v[0], v[1], v[2]); }
 void APIENTRY glColor3uiv(const GLuint *v) { if(v) _glsColor4f(v[0]/4294967295.0f, v[1]/4294967295.0f, v[2]/4294967295.0f, 1.0f); }
 void APIENTRY glColor3usv(const GLushort *v) { if(v) _glsColor4f(v[0]/65535.0f, v[1]/65535.0f, v[2]/65535.0f, 1.0f); }
-void APIENTRY glColor4bv(const GLbyte *v) { if(v) _glsColor4f(v[0]/127.0f, v[1]/127.0f, v[2]/127.0f, v[3]/127.0f); }
+void APIENTRY glColor4bv(const GLbyte *v) { if(v) _glsColor4f(_gllNormByte(v[0]), _gllNormByte(v[1]), _gllNormByte(v[2]), _gllNormByte(v[3])); }
 void APIENTRY glColor4dv(const GLdouble *v) { if(v) _glsColor4f((float)v[0], (float)v[1], (float)v[2], (float)v[3]); }
 void APIENTRY glColor4fv(const GLfloat *v) { if(v) _glsColor4f(v[0], v[1], v[2], v[3]); }
-void APIENTRY glColor4iv(const GLint *v) { if(v) _glsColor4f(v[0]/2147483647.0f, v[1]/2147483647.0f, v[2]/2147483647.0f, v[3]/2147483647.0f); }
-void APIENTRY glColor4sv(const GLshort *v) { if(v) _glsColor4f(v[0]/32767.0f, v[1]/32767.0f, v[2]/32767.0f, v[3]/32767.0f); }
+void APIENTRY glColor4iv(const GLint *v) { if(v) _glsColor4f(_gllNormInt(v[0]), _gllNormInt(v[1]), _gllNormInt(v[2]), _gllNormInt(v[3])); }
+void APIENTRY glColor4sv(const GLshort *v) { if(v) _glsColor4f(_gllNormShort(v[0]), _gllNormShort(v[1]), _gllNormShort(v[2]), _gllNormShort(v[3])); }
 void APIENTRY glColor4ubv(const GLubyte *v) { if(v) _glsColor4ub(v[0], v[1], v[2], v[3]); }
 void APIENTRY glColor4uiv(const GLuint *v) { if(v) _glsColor4f(v[0]/4294967295.0f, v[1]/4294967295.0f, v[2]/4294967295.0f, v[3]/4294967295.0f); }
 void APIENTRY glColor4usv(const GLushort *v) { if(v) _glsColor4f(v[0]/65535.0f, v[1]/65535.0f, v[2]/65535.0f, v[3]/65535.0f); }
@@ -131,7 +138,7 @@ GLuint APIENTRY glGenLists(GLsizei range) { return _glsGenLists(range); }
 void APIENTRY glGetClipPlane(GLenum plane, GLdouble *equation) { _glsGetClipPlane(plane, equation); }
 void APIENTRY glGetLightfv(GLenum light, GLenum pname, GLfloat *params) { _glsGetLightfv(light, pname, params); }
 void APIENTRY glGetLightiv(GLenum light, GLenum pname, GLint *params) { _glsGetLightiv(light, pname, params); }
-void APIENTRY glGetMapdv(GLenum target, GLenum query, GLdouble *v) { (void)target; (void)query; if(v) *v = 0.0; }
+void APIENTRY glGetMapdv(GLenum target, GLenum query, GLdouble *v) { _glsGetMapdv(target, query, v); }
 void APIENTRY glGetMapfv(GLenum target, GLenum query, GLfloat *v) { _glsGetMapfv(target, query, v); }
 void APIENTRY glGetMapiv(GLenum target, GLenum query, GLint *v) { _glsGetMapiv(target, query, v); }
 void APIENTRY glGetMaterialfv(GLenum face, GLenum pname, GLfloat *params) { _glsGetMaterialfv(face, pname, params); }
@@ -192,16 +199,16 @@ void APIENTRY glMultMatrixd(const GLdouble *m) { _glsMultMatrixd(m); }
 void APIENTRY glMultMatrixf(const GLfloat *m) { _glsMultMatrixf(m); }
 void APIENTRY glNewList(GLuint list, GLenum mode) { _glsNewList(list, mode); }
 
-void APIENTRY glNormal3b(GLbyte nx, GLbyte ny, GLbyte nz) { _glsNormal3f(nx/127.0f, ny/127.0f, nz/127.0f); }
+void APIENTRY glNormal3b(GLbyte nx, GLbyte ny, GLbyte nz) { _glsNormal3f(_gllNormByte(nx), _gllNormByte(ny), _gllNormByte(nz)); }
 void APIENTRY glNormal3d(GLdouble nx, GLdouble ny, GLdouble nz) { _glsNormal3f((float)nx, (float)ny, (float)nz); }
 void APIENTRY glNormal3f(GLfloat nx, GLfloat ny, GLfloat nz) { _glsNormal3f(nx, ny, nz); }
-void APIENTRY glNormal3i(GLint nx, GLint ny, GLint nz) { _glsNormal3f(nx/2147483647.0f, ny/2147483647.0f, nz/2147483647.0f); }
-void APIENTRY glNormal3s(GLshort nx, GLshort ny, GLshort nz) { _glsNormal3f(nx/32767.0f, ny/32767.0f, nz/32767.0f); }
-void APIENTRY glNormal3bv(const GLbyte *v) { if(v) _glsNormal3f(v[0]/127.0f, v[1]/127.0f, v[2]/127.0f); }
+void APIENTRY glNormal3i(GLint nx, GLint ny, GLint nz) { _glsNormal3f(_gllNormInt(nx), _gllNormInt(ny), _gllNormInt(nz)); }
+void APIENTRY glNormal3s(GLshort nx, GLshort ny, GLshort nz) { _glsNormal3f(_gllNormShort(nx), _gllNormShort(ny), _gllNormShort(nz)); }
+void APIENTRY glNormal3bv(const GLbyte *v) { if(v) _glsNormal3f(_gllNormByte(v[0]), _gllNormByte(v[1]), _gllNormByte(v[2])); }
 void APIENTRY glNormal3dv(const GLdouble *v) { if(v) _glsNormal3f((float)v[0], (float)v[1], (float)v[2]); }
 void APIENTRY glNormal3fv(const GLfloat *v) { if(v) _glsNormal3f(v[0], v[1], v[2]); }
-void APIENTRY glNormal3iv(const GLint *v) { if(v) _glsNormal3f(v[0]/2147483647.0f, v[1]/2147483647.0f, v[2]/2147483647.0f); }
-void APIENTRY glNormal3sv(const GLshort *v) { if(v) _glsNormal3f(v[0]/32767.0f, v[1]/32767.0f, v[2]/32767.0f); }
+void APIENTRY glNormal3iv(const GLint *v) { if(v) _glsNormal3f(_gllNormInt(v[0]), _gllNormInt(v[1]), _gllNormInt(v[2])); }
+void APIENTRY glNormal3sv(const GLshort *v) { if(v) _glsNormal3f(_gllNormShort(v[0]), _gllNormShort(v[1]), _gllNormShort(v[2])); }
 
 void APIENTRY glOrtho(GLdouble l, GLdouble r, GLdouble b, GLdouble t, GLdouble n, GLdouble f) { _glsOrtho(l, r, b, t, n, f); }
 void APIENTRY glPassThrough(GLfloat token) { _glsPassThrough(token); }
@@ -359,7 +366,7 @@ void APIENTRY glGenTexturesEXT(GLsizei n, GLuint *textures) {
 	extern void APIENTRY glGenTextures(GLsizei n, GLuint *textures);
 	glGenTextures(n, textures);
 }
-GLboolean APIENTRY glIsTextureEXT(GLuint texture) { return GL_FALSE; }
+GLboolean APIENTRY glIsTextureEXT(GLuint texture) { return _glsIsTexture(texture); }
 void APIENTRY glPrioritizeTexturesEXT(GLsizei n, const GLuint *textures, const GLfloat *priorities) { _glsPrioritizeTextures(n, textures, priorities); }
 void APIENTRY glCopyTexSubImage3DEXT(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset, GLint x, GLint y, GLsizei width, GLsizei height) { _glsCopyTexSubImage3D(target, level, xoffset, yoffset, zoffset, x, y, width, height); }
 void APIENTRY glTexImage3DEXT(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const GLvoid *pixels) { _glsTexImage3D(target, level, internalformat, width, height, depth, border, format, type, pixels); }
@@ -499,15 +506,29 @@ void APIENTRY glGenTextures(GLsizei n, GLuint *textures) {
 void APIENTRY glGetBooleanv(GLenum pname, GLboolean *params) { _glsGetBooleanv(pname, params); }
 void APIENTRY glGetDoublev(GLenum pname, GLdouble *params) {
     float fv[16] = {0};
-    int i, count = 1;
+    int i, count = 0;
     if (!params) return;
+    /* The count table mirrors exactly what _glsGetFloatv answers, so the
+     * double form can never write more elements than the value source fills.
+     * Unknown pnames write nothing, matching the permissive float path. */
     switch (pname) {
-    case 0x0BA6: case 0x0BA7: case 0x0BA8: count = 16; break;
-    case 0x0B00: case 0x0B03: case 0x0C22: count = 4; break;
+    case 0x0B00: case 0x0B03: case 0x0B04: case 0x0B06: case 0x0B07:
+    case 0x0BA2: case 0x0C10: case 0x0C22: case 0x0B53: case 0x0B66:
+    case 0x0B80: case 0x0DD2: count = 4; break;
     case 0x0B02: count = 3; break;
-    case 0x0B70: case 0x846D: case 0x846E: count = 2; break;
+    case 0x0B70: case 0x0B12: case 0x0B22: case 0x846D: case 0x846E:
+    case 0x0DD0: case 0x0DD3: count = 2; break;
+    case 0x0BA6: case 0x0BA7: case 0x0BA8: count = 16; break;
+    case 0x0B01: case 0x0B05: case 0x0B08: case 0x0B11: case 0x0B13:
+    case 0x0B21: case 0x0B23: case 0x0B62: case 0x0B63: case 0x0B64:
+    case 0x0B73: case 0x0BA3: case 0x0BA4: case 0x0BA5: case 0x0D10:
+    case 0x0D11: case 0x0D12: case 0x0D13: case 0x0D14: case 0x0D15:
+    case 0x0D16: case 0x0D17: case 0x0D18: case 0x0D19: case 0x0D1A:
+    case 0x0D1B: case 0x0D1C: case 0x0D1D: case 0x0D1E: case 0x0D1F:
+    case 0x0DD1: case 0x2503: case 0x2504: case 0x84FF: count = 1; break;
     default: break;
     }
+    if (count == 0) return;
     _glsGetFloatv(pname, fv);
     for (i = 0; i < count; ++i) params[i] = (GLdouble)fv[i];
 }
@@ -522,16 +543,13 @@ void APIENTRY glGetPointerv(GLenum pname, GLvoid **params) { _glsGetPointerv(pna
 const GLubyte * APIENTRY glGetString(GLenum name) {
 	extern const GLubyte* _gldGetStringGeneric(void *ctx, GLenum name);
 	const GLubyte *result = _gldGetStringGeneric(NULL, name);
-	{
-		FILE *f = fopen("gldirect_diag.log", "a");
-		if (f) { fprintf(f, "GL: glGetString(0x%X) -> \"%s\"\n", name, result ? (const char*)result : "NULL"); fflush(f); fclose(f); }
-	}
+	gldDiagLogV("GL: glGetString(0x%X) -> \"%s\"", name, result ? (const char*)result : "NULL");
 	return result;
 }
 void APIENTRY glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid *pixels) { _glsGetTexImage(target, level, format, type, pixels); }
-void APIENTRY glGetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloat *params) { GLint v = 0; if (!params) return; _glsGetTexLevelParameteriv(target, level, pname, &v); *params = (GLfloat)v; }
+void APIENTRY glGetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloat *params) { _glsGetTexLevelParameterfv(target, level, pname, params); }
 void APIENTRY glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *params) { _glsGetTexLevelParameteriv(target, level, pname, params); }
-void APIENTRY glGetTexParameterfv(GLenum target, GLenum pname, GLfloat *params) { GLint v = 0; if (!params) return; _glsGetTexParameteriv(target, pname, &v); *params = (GLfloat)v; }
+void APIENTRY glGetTexParameterfv(GLenum target, GLenum pname, GLfloat *params) { _glsGetTexParameterfv(target, pname, params); }
 void APIENTRY glGetTexParameteriv(GLenum target, GLenum pname, GLint *params) { _glsGetTexParameteriv(target, pname, params); }
 void APIENTRY glHint(GLenum target, GLenum mode) { _glsHint(target, mode); }
 void APIENTRY glIndexPointer(GLenum type, GLsizei stride, const GLvoid *pointer) { _glsIndexPointer(type, stride, pointer); }
